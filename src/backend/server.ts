@@ -36,6 +36,7 @@ import {
     adminOnlyGate,
     allowedAppIdsGate,
     requireAuthGate,
+    requireEmailConfirmedGate,
     requireUserActorGate,
     requireVerifiedGate,
     subdomainGate,
@@ -92,11 +93,11 @@ export class PuterServer {
 
     constructor(
         config: IConfig,
-        clients: typeof puterClients,
-        stores: typeof puterStores,
-        services: typeof puterServices,
-        controllers: typeof puterControllers,
-        drivers: typeof puterDrivers,
+        clients: typeof puterClients = puterClients,
+        stores: typeof puterStores = puterStores,
+        services: typeof puterServices = puterServices,
+        controllers: typeof puterControllers = puterControllers,
+        drivers: typeof puterDrivers = puterDrivers,
     ) {
         this.#config = config;
         // Expose config to the extension API (extension.config)
@@ -123,24 +124,29 @@ export class PuterServer {
 
         this.clients = {} as typeof this.clients;
         for (const [clientName, ClientClass] of Object.entries(clients)) {
+            // @ts-expect-error as any casting to avoid overly complex or circular types
             this.clients[clientName] =
                 typeof ClientClass === 'object'
                     ? ClientClass
                     : (new (ClientClass as any)(this.#config) as any);
+            // @ts-expect-error implicit any casting to avoid overly complex or circular types
             clientsContainers[clientName] = this.clients[clientName];
         }
         for (const [clientName, ClientClass] of Object.entries(
             extensionStore.clients,
         )) {
+            // @ts-expect-error as any casting to avoid overly complex or circular types
             this.clients[clientName] =
                 typeof ClientClass === 'object'
                     ? ClientClass
                     : (new (ClientClass as any)(this.#config) as any);
+            // @ts-expect-error implicit any casting to avoid overly complex or circular types
             clientsContainers[clientName] = this.clients[clientName];
         }
 
         this.stores = {} as typeof this.stores;
         for (const [storeName, StoreClass] of Object.entries(stores)) {
+            // @ts-expect-error as any casting to avoid overly complex or circular types
             this.stores[storeName] =
                 typeof StoreClass === 'object'
                     ? StoreClass
@@ -149,11 +155,13 @@ export class PuterServer {
                           this.clients,
                           this.stores,
                       ) as any);
+            // @ts-expect-error implicit any casting to avoid overly complex or circular types
             storesContainers[storeName] = this.stores[storeName];
         }
         for (const [storeName, StoreClass] of Object.entries(
             extensionStore.stores,
         )) {
+            // @ts-expect-error as any casting to avoid overly complex or circular types
             this.stores[storeName] =
                 typeof StoreClass === 'object'
                     ? StoreClass
@@ -162,11 +170,13 @@ export class PuterServer {
                           this.clients,
                           this.stores,
                       ) as any);
+            // @ts-expect-error implicit any casting to avoid overly complex or circular types
             storesContainers[storeName] = this.stores[storeName];
         }
 
         this.services = {} as typeof this.services;
         for (const [serviceName, ServiceClass] of Object.entries(services)) {
+            // @ts-expect-error as any casting to avoid overly complex or circular types
             this.services[serviceName] =
                 typeof ServiceClass === 'object'
                     ? ServiceClass
@@ -176,11 +186,13 @@ export class PuterServer {
                           this.stores,
                           this.services,
                       ) as any);
+            // @ts-expect-error implicit any casting to avoid overly complex or circular types
             servicesContainers[serviceName] = this.services[serviceName];
         }
         for (const [serviceName, ServiceClass] of Object.entries(
             extensionStore.services,
         )) {
+            // @ts-expect-error as any casting to avoid overly complex or circular types
             this.services[serviceName] =
                 typeof ServiceClass === 'object'
                     ? ServiceClass
@@ -190,6 +202,7 @@ export class PuterServer {
                           this.stores,
                           this.services,
                       ) as any);
+            // @ts-expect-error implicit any casting to avoid overly complex or circular types
             servicesContainers[serviceName] = this.services[serviceName];
         }
 
@@ -234,6 +247,7 @@ export class PuterServer {
                           this.stores,
                           this.services,
                       ) as any);
+            // @ts-expect-error as any casting to avoid overly complex or circular types
             this.drivers[driverKey] = instance;
             driversContainers[driverKey] = instance;
         }
@@ -242,6 +256,7 @@ export class PuterServer {
         for (const [controllerName, ControllerClass] of Object.entries(
             controllers,
         )) {
+            // @ts-expect-error as any casting to avoid overly complex or circular types
             this.controllers[controllerName] =
                 typeof ControllerClass === 'object'
                     ? ControllerClass
@@ -254,14 +269,17 @@ export class PuterServer {
                       ) as any);
             this.#registerControllerRoutes(
                 controllerName,
+                // @ts-expect-error as any casting to avoid overly complex or circular types
                 this.controllers[controllerName],
             );
             controllersContainers[controllerName] =
+                // @ts-expect-error as any casting to avoid overly complex or circular types
                 this.controllers[controllerName];
         }
         for (const [controllerName, ControllerClass] of Object.entries(
             extensionStore.controllers,
         )) {
+            // @ts-expect-error as any casting to avoid overly complex or circular types
             this.controllers[controllerName] =
                 typeof ControllerClass === 'object'
                     ? ControllerClass
@@ -274,25 +292,13 @@ export class PuterServer {
                       ) as any);
             this.#registerControllerRoutes(
                 controllerName,
+                // @ts-expect-error as any casting to avoid overly complex or circular types
                 this.controllers[controllerName],
             );
             controllersContainers[controllerName] =
+                // @ts-expect-error as any casting to avoid overly complex or circular types
                 this.controllers[controllerName];
         }
-
-        // Register extension event listeners. Extensions opted for a
-        // 2-arg `(data, meta)` handler shape; EventClient calls with
-        // `(key, data, meta)`. Drop `key` in the adapter so extension
-        // code stays stable.
-        Object.entries(extensionStore.events).forEach(([event, handlers]) => {
-            handlers.forEach((handler) => {
-                this.clients.event.on(
-                    event,
-                    (_key: string, data: unknown, meta: object) =>
-                        handler(data, meta),
-                );
-            });
-        });
 
         // Extension routes are shaped as `RouteDescriptor`s too, so they
         // flow through the same materializer as controller routes — same
@@ -785,6 +791,15 @@ export class PuterServer {
         );
         if (needsAuth) mwChain.push(requireAuthGate());
 
+        // Default-on email confirmation gate. Every authenticated route
+        // rejects users pending confirmation unless `allowUnconfirmed`
+        // opts out. This prevents unconfirmed accounts from accessing
+        // AI, FS, driver, etc. endpoints while still allowing essential
+        // flows (logout, confirm-email, whoami, save-account, …).
+        if (needsAuth && !opts.allowUnconfirmed) {
+            mwChain.push(requireEmailConfirmedGate());
+        }
+
         // `requireVerified` intentionally does NOT imply `requireUserActor`:
         // FS routes (and similar) want the user's email to be confirmed even
         // when an app acts on the user's behalf. `requireVerifiedGate` reads
@@ -1038,41 +1053,7 @@ export class PuterServer {
                     '************************************************************\n',
                 );
 
-                for (const client of Object.values(
-                    this.clients,
-                ) as WithLifecycle[]) {
-                    if (client.onServerStart) {
-                        await client.onServerStart();
-                    }
-                }
-                for (const store of Object.values(
-                    this.stores,
-                ) as WithLifecycle[]) {
-                    if (store.onServerStart) {
-                        await store.onServerStart();
-                    }
-                }
-                for (const service of Object.values(
-                    this.services,
-                ) as WithLifecycle[]) {
-                    if (service.onServerStart) {
-                        await service.onServerStart();
-                    }
-                }
-                for (const controller of Object.values(
-                    this.controllers,
-                ) as WithLifecycle[]) {
-                    if (controller.onServerStart) {
-                        await controller.onServerStart();
-                    }
-                }
-                for (const driver of Object.values(
-                    this.drivers,
-                ) as WithLifecycle[]) {
-                    if (driver.onServerStart) {
-                        await driver.onServerStart();
-                    }
-                }
+                await this.#fireOnServerStart();
                 console.log('PuterServer has fully booted.');
                 // Auto-launch the browser on dev boot (matches v1 WebServerService).
                 // Opt out via `no_browser_launch: true` in config.
@@ -1090,16 +1071,39 @@ export class PuterServer {
             });
         } else {
             this.#server = {
-                close: (cb) => {
+                close: (cb: (error?: Error) => void | undefined) => {
                     console.debug('PuterServer mock close called');
-                    cb();
+                    cb?.();
                 },
                 closeAllConnections: () => {
                     console.debug(
                         'PuterServer mock closeAllConnections called',
                     );
                 },
-            };
+            } as unknown as http.Server;
+            // Tests still need onServerStart to fire so stores can
+            // bootstrap (e.g. SystemKVStore creates its dynalite table).
+            await this.#fireOnServerStart();
+        }
+    }
+
+    async #fireOnServerStart() {
+        for (const client of Object.values(this.clients) as WithLifecycle[]) {
+            if (client.onServerStart) await client.onServerStart();
+        }
+        for (const store of Object.values(this.stores) as WithLifecycle[]) {
+            if (store.onServerStart) await store.onServerStart();
+        }
+        for (const service of Object.values(this.services) as WithLifecycle[]) {
+            if (service.onServerStart) await service.onServerStart();
+        }
+        for (const controller of Object.values(
+            this.controllers,
+        ) as WithLifecycle[]) {
+            if (controller.onServerStart) await controller.onServerStart();
+        }
+        for (const driver of Object.values(this.drivers) as WithLifecycle[]) {
+            if (driver.onServerStart) await driver.onServerStart();
         }
     }
 

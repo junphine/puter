@@ -32,7 +32,7 @@ Additional settings for the generation request. Available options depend on the 
 
 | Option | Type | Description |
 |--------|------|-------------|
-| `provider` | `String` | TTS provider to use. `'aws-polly'` (default), `'openai'`, `'elevenlabs'` |
+| `provider` | `String` | TTS provider to use. `'aws-polly'` (default), `'openai'`, `'elevenlabs'`, `'gemini'`, `'xai'` |
 | `model` | `String` | Model identifier (provider-specific) |
 | `voice` | `String` | Voice ID used for synthesis (provider-specific) |
 | `test_mode` | `Boolean` | When `true`, returns a sample audio without using credits |
@@ -73,6 +73,32 @@ Available when `provider: 'elevenlabs'`:
 | `voice_settings` | `Object` | Voice tuning options (stability, similarity boost, speed) |
 
 For more details about each option, see the [ElevenLabs API reference](https://elevenlabs.io/docs/api-reference/text-to-speech).
+
+#### Gemini Options
+
+Available when `provider: 'gemini'`:
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `model` | `String` | TTS model. Available: `'gemini-2.5-flash-preview-tts'` (default), `'gemini-2.5-pro-preview-tts'`, `'gemini-3.1-flash-tts-preview'` |
+| `voice` | `String` | Voice name. Defaults to `'Kore'`. Available: `'Zephyr'`, `'Puck'`, `'Charon'`, `'Kore'`, `'Fenrir'`, `'Leda'`, `'Orus'`, `'Aoede'`, `'Callirrhoe'`, `'Autonoe'`, `'Enceladus'`, `'Iapetus'`, `'Umbriel'`, `'Algieba'`, `'Despina'`, `'Erinome'`, `'Algenib'`, `'Rasalgethi'`, `'Laomedeia'`, `'Achernar'`, `'Alnilam'`, `'Schedar'`, `'Gacrux'`, `'Pulcherrima'`, `'Achird'`, `'Zubenelgenubi'`, `'Vindemiatrix'`, `'Sadachbia'`, `'Sadaltager'`, `'Sulafat'` |
+| `instructions` | `String` | Natural language instructions to control speaking style (tone, speed, mood, etc.) |
+
+For more details about Gemini TTS, see the [Google Gemini TTS documentation](https://ai.google.dev/gemini-api/docs/text-to-speech).
+
+#### xAI (Grok) Options
+
+Available when `provider: 'xai'`:
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `voice` | `String` | Voice ID. Available: `'eve'` (default, energetic), `'ara'` (warm), `'rex'` (confident), `'sal'` (smooth), `'leo'` (authoritative) |
+| `language` | `String` | BCP-47 language code. Defaults to `'en'`. Supports `'auto'` for auto-detection and 20+ languages |
+| `output_format` | `String` | Output codec. Available: `'mp3'` (default), `'wav'`, `'pcm'`, `'mulaw'`, `'alaw'` |
+
+Text supports inline speech tags like `[pause]`, `[laugh]` and wrapping tags like `<whisper>text</whisper>` for expressive delivery. Maximum 15,000 characters per request.
+
+For more details, see the [xAI TTS documentation](https://x.ai/news/grok-stt-and-tts-apis).
 
 ## Return value
 
@@ -162,6 +188,55 @@ A `Promise` that resolves to an `HTMLAudioElement`. The element’s `src` points
                     model: "eleven_multilingual_v2",
                     voice: "21m00Tcm4TlvDq8ikWAM",
                     output_format: "mp3_44100_128"
+                }
+            );
+            audio.play();
+        });
+    </script>
+</body>
+</html>
+```
+
+<strong class="example-title">Use Gemini voices</strong>
+
+```html;ai-txt2speech-gemini
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <button id="play">Use Gemini voice</button>
+    <script>
+        document.getElementById('play').addEventListener('click', async ()=>{
+            const audio = await puter.ai.txt2speech(
+                "Hello! This sample uses the Gemini Puck voice.",
+                {
+                    provider: "gemini",
+                    model: "gemini-2.5-flash-preview-tts",
+                    voice: "Puck",
+                    instructions: "Speak in a friendly, upbeat tone."
+                }
+            );
+            audio.play();
+        });
+    </script>
+</body>
+</html>
+```
+
+<strong class="example-title">Use xAI (Grok) voices</strong>
+
+```html;ai-txt2speech-xai
+<html>
+<body>
+    <script src="https://js.puter.com/v2/"></script>
+    <button id="play">Use xAI voice</button>
+    <script>
+        document.getElementById('play').addEventListener('click', async ()=>{
+            const audio = await puter.ai.txt2speech(
+                "Hello! This sample uses the xAI Eve voice.",
+                {
+                    provider: "xai",
+                    voice: "eve",
+                    language: "en"
                 }
             );
             audio.play();

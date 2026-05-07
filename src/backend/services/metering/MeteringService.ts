@@ -18,10 +18,10 @@
  */
 
 import murmurhash from 'murmurhash';
-import { PuterService } from '../types';
 import type { Actor } from '../../core/actor';
 import { isSystemActor } from '../../core/actor';
 import { HttpError } from '../../core/http/HttpError.js';
+import { PuterService } from '../types';
 import {
     DEFAULT_FREE_SUBSCRIPTION,
     DEFAULT_TEMP_SUBSCRIPTION,
@@ -161,6 +161,7 @@ export class MeteringService extends PuterService {
                 {
                     userId: actor.user?.uuid,
                     username: actor.user?.username,
+                    email: actor.user?.email,
                     appId: actor.app?.uid,
                     usageType,
                     usageAmount,
@@ -286,6 +287,7 @@ export class MeteringService extends PuterService {
                 {
                     userId: actor.user?.uuid,
                     username: actor.user?.username,
+                    email: actor.user?.email,
                     appId: actor.app?.uid,
                     error: e as Error,
                     usageType,
@@ -334,6 +336,7 @@ export class MeteringService extends PuterService {
                         {
                             userId: actor.user?.uuid,
                             username: actor.user?.username,
+                            email: actor.user?.email,
                             appId: actor.app?.uid,
                             usageType,
                             usageAmount,
@@ -444,6 +447,7 @@ export class MeteringService extends PuterService {
                 {
                     userId: actor.user?.uuid,
                     username: actor.user?.username,
+                    email: actor.user?.email,
                     appId: actor.app?.uid,
                     error: e as Error,
                     actor,
@@ -693,7 +697,7 @@ export class MeteringService extends PuterService {
             ...this.extraPolicies,
             ...SUB_POLICIES,
             ...(this.config.unlimitedMetering ? [UNLIMITED_SUBSCRIPTION] : []),
-        ];
+        ] as SubscriptionPolicy[];
         return (
             availablePolicies.find((p) => p.id === resolvedUser) ??
             availablePolicies.find((p) => p.id === resolvedDefault)!
@@ -910,6 +914,7 @@ export class MeteringService extends PuterService {
             {
                 userId: actor.user?.uuid,
                 username: actor.user?.username,
+                email: actor.user?.email,
                 appId: actor.app?.uid,
                 usageType: ctx.usageType,
                 usageAmount: ctx.usageAmount,

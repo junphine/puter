@@ -103,7 +103,9 @@ export class AppDriver extends PuterDriver {
 
     async create({ object, options } = {}) {
         if (!object || typeof object !== 'object') {
-            throw new HttpError(400, 'Missing or invalid `object`');
+            throw new HttpError(400, 'Missing or invalid `object`', {
+                legacyCode: 'bad_request',
+            });
         }
         const actor = this.#requireActor();
         this.#requireUserOrAppActor(actor);
@@ -140,7 +142,9 @@ export class AppDriver extends PuterDriver {
                 do {
                     candidate = `${fields.name}-${++n}`;
                     if (n > 50)
-                        throw new HttpError(400, 'Failed to dedupe app name');
+                        throw new HttpError(400, 'Failed to dedupe app name', {
+                            legacyCode: 'bad_request',
+                        });
                 } while (await this.appStore.existsByName(candidate));
                 fields.name = candidate;
             } else {
@@ -174,7 +178,10 @@ export class AppDriver extends PuterDriver {
     async read({ uid, id, params = {}, ...rest } = {}) {
         const actor = this.#requireActor();
         const app = await this.#resolve({ uid, id });
-        if (!app) throw new HttpError(404, 'App not found');
+        if (!app)
+            throw new HttpError(404, 'App not found', {
+                legacyCode: 'not_found',
+            });
 
         await this.#checkReadAccess(app, actor);
 
@@ -279,13 +286,18 @@ export class AppDriver extends PuterDriver {
 
     async update({ uid, id, object } = {}) {
         if (!object || typeof object !== 'object') {
-            throw new HttpError(400, 'Missing or invalid `object`');
+            throw new HttpError(400, 'Missing or invalid `object`', {
+                legacyCode: 'bad_request',
+            });
         }
         const actor = this.#requireActor();
         this.#requireUserOrAppActor(actor);
 
         const app = await this.#resolve({ uid, id });
-        if (!app) throw new HttpError(404, 'App not found');
+        if (!app)
+            throw new HttpError(404, 'App not found', {
+                legacyCode: 'not_found',
+            });
 
         await this.#checkWriteAccess(app, actor);
 
@@ -322,8 +334,9 @@ export class AppDriver extends PuterDriver {
         if (fields.name && fields.name !== app.name) {
             if (await this.appStore.existsByName(fields.name)) {
                 throw new HttpError(
-                    400,
+                    409,
                     'An app with this name already exists',
+                    { legacyCode: 'conflict' },
                 );
             }
         }
@@ -359,10 +372,15 @@ export class AppDriver extends PuterDriver {
         this.#requireUserOrAppActor(actor);
 
         const app = await this.#resolve({ uid, id });
-        if (!app) throw new HttpError(404, 'App not found');
+        if (!app)
+            throw new HttpError(404, 'App not found', {
+                legacyCode: 'not_found',
+            });
 
         if (app.protected) {
-            throw new HttpError(403, 'Cannot delete a protected app');
+            throw new HttpError(403, 'Cannot delete a protected app', {
+                legacyCode: 'forbidden',
+            });
         }
 
         await this.#checkWriteAccess(app, actor);
@@ -495,12 +513,14 @@ export class AppDriver extends PuterDriver {
                         throw new HttpError(
                             400,
                             '`icon` data URL must use an image MIME type',
+                            { legacyCode: 'bad_request' },
                         );
                     }
                 } else if (!isAppIconEndpointUrl(iconStr, this.config)) {
                     throw new HttpError(
                         400,
                         '`icon` must be base64, a data:image/… URL, or an app-icon endpoint URL',
+                        { legacyCode: 'bad_request' },
                     );
                 }
             }
@@ -542,12 +562,18 @@ export class AppDriver extends PuterDriver {
 
     #requireActor() {
         const actor = Context.get('actor');
-        if (!actor) throw new HttpError(401, 'Authentication required');
+        if (!actor)
+            throw new HttpError(401, 'Authentication required', {
+                legacyCode: 'unauthorized',
+            });
         return actor;
     }
 
     #requireUserOrAppActor(actor) {
-        if (!actor.user) throw new HttpError(403, 'User actor required');
+        if (!actor.user)
+            throw new HttpError(403, 'User actor required', {
+                legacyCode: 'forbidden',
+            });
     }
 
     async #resolve({ uid, id }) {
@@ -605,7 +631,7 @@ export class AppDriver extends PuterDriver {
 
     async #checkReadAccess(app, actor) {
         if (await this.#canReadApp(app, actor)) return;
-        throw new HttpError(403, 'Access denied');
+        throw new HttpError(403, 'Access denied', { legacyCode: 'forbidden' });
     }
 
     async #checkWriteAccess(app, actor) {
@@ -624,7 +650,9 @@ export class AppDriver extends PuterDriver {
             );
         }
         if (!hasAccess) {
-            throw new HttpError(403, 'Access denied');
+            throw new HttpError(403, 'Access denied', {
+                legacyCode: 'forbidden',
+            });
         }
     }
 
@@ -870,6 +898,50 @@ export class AppDriver extends PuterDriver {
     }
 
     /**
+     * Read normalized origin-alias groups from config. Each group is a deduped
+     * list of lowercased, trimmed bare hosts. Malformed entries are skipped so
+     * a bad config row doesn't brick app create/update for everyone else.
+     */
+    #getOriginAliasGroups() {
+        const config = this.config ?? {};
+        const raw = config.app_origin_aliases;
+        if (!Array.isArray(raw)) return [];
+
+        const groups = [];
+        for (const group of raw) {
+            if (!Array.isArray(group)) continue;
+            const normalized = [
+                ...new Set(
+                    group
+                        .filter((h) => typeof h === 'string')
+                        .map((h) => h.trim().toLowerCase())
+                        .filter((h) => h.length > 0),
+                ),
+            ];
+            if (normalized.length > 0) groups.push(normalized);
+        }
+        return groups;
+    }
+
+    /**
+     * Return the alias group containing this index_url's host, or null when
+     * the host isn't claimed by any group.
+     */
+    #findOriginAliasGroupForIndexUrl(indexUrl) {
+        if (typeof indexUrl !== 'string' || !indexUrl) return null;
+        let hostname;
+        try {
+            hostname = new URL(indexUrl).hostname.toLowerCase();
+        } catch {
+            return null;
+        }
+        for (const group of this.#getOriginAliasGroups()) {
+            if (group.includes(hostname)) return group;
+        }
+        return null;
+    }
+
+    /**
      * Generate the set of equivalent index_url strings that should
      * collide with a given input. We only collapse trailing-slash and
      * `/index.html` variants — the underlying `apps.index_url` column
@@ -906,13 +978,32 @@ export class AppDriver extends PuterDriver {
     }
 
     async #findIndexUrlConflictRow({ indexUrl, excludeAppId } = {}) {
-        if (!this.#isPuterHostedIndexUrl(indexUrl)) return null;
+        const aliasGroup = this.#findOriginAliasGroupForIndexUrl(indexUrl);
+        if (!this.#isPuterHostedIndexUrl(indexUrl) && !aliasGroup) return null;
 
-        const candidates = this.#buildEquivalentIndexUrlCandidates(indexUrl);
-        if (candidates.length === 0) return null;
-        if (hasIndexUrlUniquenessExemption(candidates)) return null;
+        const candidates = new Set(
+            this.#buildEquivalentIndexUrlCandidates(indexUrl),
+        );
 
-        return this.appStore.findByIndexUrlCandidates(candidates, {
+        // For alias-group hosts, treat the group as a host-level reservation:
+        // any row whose index_url is the root URL of any group member counts
+        // as a conflict, so a single app owns the whole group.
+        if (aliasGroup) {
+            for (const host of aliasGroup) {
+                for (const proto of ['https', 'http']) {
+                    const base = `${proto}://${host}`;
+                    candidates.add(base);
+                    candidates.add(`${base}/`);
+                    candidates.add(`${base}/index.html`);
+                }
+            }
+        }
+
+        if (candidates.size === 0) return null;
+        const candidateList = [...candidates];
+        if (hasIndexUrlUniquenessExemption(candidateList)) return null;
+
+        return this.appStore.findByIndexUrlCandidates(candidateList, {
             excludeAppId,
         });
     }

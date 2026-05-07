@@ -2,11 +2,13 @@ import * as utils from '../lib/utils.js';
 
 const normalizeTTSProvider = (value) => {
     if ( typeof value !== 'string' ) {
-        return 'aws-polly';
+        return null;
     }
     const lower = value.toLowerCase();
     if ( lower === 'openai' ) return 'openai';
     if ( ['elevenlabs', 'eleven', '11labs', '11-labs', 'eleven-labs', 'elevenlabs-tts'].includes(lower) ) return 'elevenlabs';
+    if ( ['gemini', 'google', 'gemini-tts', 'google-tts'].includes(lower) ) return 'gemini';
+    if ( ['xai', 'grok', 'x-ai', 'xai-tts', 'grok-tts'].includes(lower) ) return 'xai';
     if ( lower === 'aws' || lower === 'polly' || lower === 'aws-polly' ) return 'aws-polly';
     return value;
 };
@@ -270,6 +272,14 @@ class AI {
             provider = 'elevenlabs';
         }
 
+        if ( options.engine && normalizeTTSProvider(options.engine) === 'gemini' && !options.provider ) {
+            provider = 'gemini';
+        }
+
+        if ( options.engine && normalizeTTSProvider(options.engine) === 'xai' && !options.provider ) {
+            provider = 'xai';
+        }
+
         if ( provider === 'openai' ) {
             if ( !options.model && typeof options.engine === 'string' ) {
                 options.model = options.engine;
@@ -299,6 +309,25 @@ class AI {
             }
             if ( options.response_format && !options.output_format ) {
                 options.output_format = options.response_format;
+            }
+            delete options.engine;
+        } else if ( provider === 'gemini' ) {
+            if ( !options.model && typeof options.engine === 'string' ) {
+                options.model = options.engine;
+            }
+            if ( ! options.voice ) {
+                options.voice = 'Kore';
+            }
+            if ( ! options.model ) {
+                options.model = 'gemini-2.5-flash-preview-tts';
+            }
+            delete options.engine;
+        } else if ( provider === 'xai' ) {
+            if ( ! options.voice ) {
+                options.voice = 'eve';
+            }
+            if ( ! options.language ) {
+                options.language = 'en';
             }
             delete options.engine;
         } else {
@@ -332,9 +361,13 @@ class AI {
             }
         }
 
-        const driverName = provider === 'openai'
-            ? 'openai-tts'
-            : (provider === 'elevenlabs' ? 'elevenlabs-tts' : 'aws-polly');
+        const driverNameMap = {
+            'openai': 'openai-tts',
+            'elevenlabs': 'elevenlabs-tts',
+            'gemini': 'gemini-tts',
+            'xai': 'xai-tts',
+        };
+        const driverName = driverNameMap[provider] || 'aws-polly';
 
         return await utils.make_driver_method(['source'], 'puter-tts', driverName, 'synthesize', {
             responseType: 'blob',
@@ -535,9 +568,19 @@ class AI {
         const driverArgs = { ...options };
         delete driverArgs.translate;
 
+        const sttProvider = driverArgs.provider;
+        delete driverArgs.provider;
+
+        const sttDriverNameMap = {
+            'xai': 'xai-speech2txt',
+            'grok': 'xai-speech2txt',
+            'x-ai': 'xai-speech2txt',
+        };
+        const sttDriverName = (sttProvider && sttDriverNameMap[sttProvider.toLowerCase()]) || 'openai-speech2txt';
+
         const responseFormat = driverArgs.response_format;
 
-        return await utils.make_driver_method([], 'puter-speech2txt', 'openai-speech2txt', driverMethod, {
+        return await utils.make_driver_method([], 'puter-speech2txt', sttDriverName, driverMethod, {
             test_mode: testMode,
             transform: async (result) => {
                 if ( responseFormat === 'text' && result && typeof result === 'object' && typeof result.text === 'string' ) {
@@ -574,9 +617,21 @@ class AI {
                 params.provider = 'elevenlabs';
             }
 
-            const driverName = provider === 'openai'
-                ? 'openai-tts'
-                : (provider === 'elevenlabs' ? 'elevenlabs-tts' : 'aws-polly');
+            if ( provider === 'gemini' ) {
+                params.provider = 'gemini';
+            }
+
+            if ( provider === 'xai' ) {
+                params.provider = 'xai';
+            }
+
+            const driverNameMap = {
+                'openai': 'openai-tts',
+                'elevenlabs': 'elevenlabs-tts',
+                'gemini': 'gemini-tts',
+                'xai': 'xai-tts',
+            };
+            const driverName = driverNameMap[provider] || 'aws-polly';
 
             return await utils.make_driver_method(['source'], 'puter-tts', driverName, 'list_engines', {
                 responseType: 'text',
@@ -609,9 +664,23 @@ class AI {
                 params.provider = 'elevenlabs';
             }
 
-            const driverName = provider === 'openai'
-                ? 'openai-tts'
-                : (provider === 'elevenlabs' ? 'elevenlabs-tts' : 'aws-polly');
+            if ( provider === 'gemini' ) {
+                params.provider = 'gemini';
+                delete params.engine;
+            }
+
+            if ( provider === 'xai' ) {
+                params.provider = 'xai';
+                delete params.engine;
+            }
+
+            const driverNameMap2 = {
+                'openai': 'openai-tts',
+                'elevenlabs': 'elevenlabs-tts',
+                'gemini': 'gemini-tts',
+                'xai': 'xai-tts',
+            };
+            const driverName = driverNameMap2[provider] || 'aws-polly';
 
             return utils.make_driver_method(['source'], 'puter-tts', driverName, 'list_voices', {
                 responseType: 'text',

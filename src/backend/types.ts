@@ -28,7 +28,26 @@ export interface IAWSCredentials {
 export interface IDynamoConfig {
     aws?: IAWSCredentials;
     endpoint?: string;
+    /**
+     * Filesystem path for the local dynalite store. Defaults to
+     * `./volatile/runtime/puter-ddb`. Pass `':memory:'` (or set
+     * `inMemory: true`) to run dynalite without persistence — the
+     * recommended setup for unit/integration tests.
+     */
     path?: string;
+    /**
+     * Run dynalite in-memory with no on-disk state. Equivalent to
+     * `path: ':memory:'`. Intended for tests so each suite gets a
+     * pristine in-process DynamoDB.
+     */
+    inMemory?: boolean;
+    /**
+     * Create required tables on startup if they don't exist. Off by
+     * default because real-AWS deployments provision tables externally
+     * (Terraform / IaC). Set to `true` when pointing at a local
+     * DynamoDB emulator so self-hosters don't have to bootstrap by hand.
+     */
+    bootstrapTables?: boolean;
 }
 
 export interface IRedisConfig {
@@ -36,6 +55,17 @@ export interface IRedisConfig {
         host: string;
         port: number;
     }>;
+    /**
+     * Use TLS for cluster connections. Defaults to `true` (matches prod
+     * ElastiCache). Set `false` for self-host plain-TCP Valkey/Redis.
+     */
+    tls?: boolean;
+    /**
+     * Use ioredis-mock instead of a real Redis cluster — fully
+     * in-process, no network. Defaults to `true` when `startupNodes`
+     * is empty (so tests with no redis config get a mock for free).
+     * Intended for unit/integration tests.
+     */
     useMock?: boolean;
 }
 
@@ -137,6 +167,12 @@ export interface IOIDCProviderConfig {
     userinfo_endpoint?: string;
     /** Space-separated OAuth scopes. Default depends on provider. */
     scopes?: string;
+    /** Apple Developer Team ID (apple provider only). */
+    team_id?: string;
+    /** Key ID for the Sign in with Apple private key (apple provider only). */
+    key_id?: string;
+    /** PKCS#8 PEM private key content from Apple (apple provider only). */
+    private_key?: string;
     [key: string]: unknown;
 }
 
@@ -227,6 +263,11 @@ export interface IServerHealthConfig {
 }
 
 export interface IS3LocalConfig {
+    /**
+     * Run fauxqs entirely in-memory: random port on `127.0.0.1`, no
+     * `dataDir` / `s3StorageDir`. Intended for tests so each suite
+     * gets a pristine in-process S3.
+     */
     inMemory?: boolean;
     host?: string;
     port?: number;
@@ -237,9 +278,24 @@ export interface IS3LocalConfig {
 export interface IS3RemoteConfig {
     useCredentialChain?: boolean;
     endpoint: string;
+    /**
+     * Endpoint used when generating presigned URLs handed to clients
+     * (browser uploads/downloads). Defaults to `endpoint`. Set this when
+     * the server-side S3 endpoint isn't reachable from the browser — e.g.
+     * self-host with `endpoint: http://s3:9000` (docker-internal) and
+     * `publicEndpoint: http://localhost:9000` (host-published port).
+     */
+    publicEndpoint?: string;
     accessKeyId: string;
     secretAccessKey: string;
     region?: string;
+    /**
+     * Use path-style URLs (`<endpoint>/<bucket>`) instead of virtual-hosted
+     * style (`<bucket>.<endpoint>`). Defaults to AWS SDK's default (virtual-
+     * hosted, which only works on real AWS S3). Set `true` for S3-compatible
+     * servers (RustFS, MinIO, fauxqs) where DNS-style addressing fails.
+     */
+    forcePathStyle?: boolean;
 }
 
 export interface IS3Config {
@@ -250,7 +306,18 @@ export interface IS3Config {
 export interface IDatabaseConfig {
     engine: 'sqlite' | 'mysql';
     // sqlite
+    /**
+     * SQLite database file path. Defaults to `':memory:'` (the
+     * better-sqlite3 in-memory mode), which is also what tests should
+     * use. `inMemory: true` is an explicit alias for the same.
+     */
     path?: string;
+    /**
+     * Force in-memory SQLite (ignores `path`). Equivalent to
+     * `path: ':memory:'`. Intended for tests so each suite gets a
+     * pristine in-process database.
+     */
+    inMemory?: boolean;
     targetVersion?: number;
     // mysql
     host?: string;
@@ -265,6 +332,14 @@ export interface IDatabaseConfig {
         password?: string;
         database?: string;
     };
+    /**
+     * Ordered list of directories whose `.sql` files are run sequentially at
+     * server start (mysql engine only). Files within a directory are sorted
+     * lexically; directories are processed in array order. Files MUST be
+     * idempotent — there is no per-file applied-state tracking.
+     * Relative paths resolve from `process.cwd()`.
+     */
+    migrationPaths?: string[];
 }
 
 /**
@@ -349,6 +424,23 @@ interface IConfigOptional {
     private_app_hosting_domain: string;
     /** Alt private app hosting domain. */
     private_app_hosting_domain_alt: string;
+    /**
+     * Groups of equivalent app index_url hosts. Each group lists hosts that
+     * should resolve to the same canonical app: `appUidFromOrigin` looks up
+     * any DB row whose `index_url` is one of the group's hosts and returns
+     * that row's UID for every host in the group.
+     *
+     * Hosts listed here are also reserved — `apps.create` / `apps.update`
+     * reject any attempt to register a different app under one of these
+     * hosts, so the group is owned by exactly one app row.
+     *
+     * Entries are bare hosts (no scheme), lowercased. Example:
+     *   [
+     *     ["camera.puter.com", "camera.puter.site", "camera.ca"],
+     *     ["player.puter.com", "player.puter.site"],
+     *   ]
+     */
+    app_origin_aliases?: string[][];
     /** When true, accept any Host header value. Dev/testing only. */
     allow_all_host_values: boolean;
     /** When true, accept requests without a Host header. */
@@ -374,6 +466,11 @@ interface IConfigOptional {
     no_browser_launch: boolean;
     /** Disable dev-time frontend webpack watchers. */
     no_devwatch: boolean;
+    /**
+     * Skip first-boot bootstrap of the `admin` user and the credentials
+     * banner that DefaultUserService prints. Intended for tests.
+     */
+    no_default_user: boolean;
     /** Optional dev-time frontend watcher overrides. */
     devwatch: IDevWatcherConfig;
 
