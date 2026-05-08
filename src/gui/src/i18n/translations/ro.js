@@ -85,6 +85,10 @@ const ro = {
         credits: 'Credite',
         current_password: 'Parola Curentă',
         cut: 'Decupează',
+        clock: 'Ora',
+        clock_visible_hide: 'Ascunde - Întotdeauna ascuns',
+        clock_visible_show: 'Afișează - Întotdeauna vizibil',
+        clock_visible_auto: 'Automat - Mod implicit, vizibil doar în modul ecran complet.',
         close_all: 'Închide toate',
         created: 'Creat',
         date_modified: 'Dată modificare',
@@ -337,6 +341,7 @@ const ro = {
         login2fa_recovery_placeholder: 'XXXXXXXX',
 
         change: 'Schimbǎ',
+        clock_visibility: 'Vizibilitatea Ceasului',
         reading: 'Citire %strong%',
         writing: 'Scriere %strong%',
         unzipping: 'Dezarhivare %strong%',

@@ -84,6 +84,10 @@ const da = {
         credits: 'Kreditter',
         current_password: 'Nuværende adgangskode',
         cut: 'Klip',
+        clock: 'Uret',
+        clock_visible_hide: 'Skjul - Altid skjult',
+        clock_visible_show: 'Vis - Altid synlig',
+        clock_visible_auto: 'Auto - Standard, synlig kun i fuld skærm-tilstand.',
         close_all: 'Luk alle',
         created: 'Oprettet',
         date_modified: 'Dato ændret',
@@ -339,6 +343,7 @@ const da = {
         login2fa_recovery_placeholder: 'XXXXXXXX',
 
         change: 'Skift',
+        clock_visibility: 'Ur synlighed',
         reading: 'Læser %strong%',
         writing: 'Skriver %strong%',
         unzipping: 'Udpakker %strong%',
