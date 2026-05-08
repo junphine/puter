@@ -899,7 +899,7 @@ const puterInit = (function () {
                 'color: #000fd8; font-weight: bold; font-size: 14px; font-family: monospace;'
             );
             console.log(
-                '%cSubmit your app to the Puter App Store:\n' +
+                '%cSubmit this app to the Puter App Store:\n' +
                 '%chttps://apps.puter.com/',
                 'color:rgb(0, 57, 137); font-size: 18px; font-weight: bold;',
                 'color: #3b82f6; font-size: 18px; font-weight: bold; text-decoration: underline;'
