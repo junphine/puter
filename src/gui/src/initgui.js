@@ -522,6 +522,24 @@ window.initgui = async function (options) {
     }
 
     //--------------------------------------------------------------------------------------
+    // Early check for fullpage mode from app metadata
+    // If the user navigated to /app/<app_name> and the app has fullpage_on_landing,
+    // set fullpage mode now so we can skip loading the desktop background and items.
+    //--------------------------------------------------------------------------------------
+    if ( !window.is_fullpage_mode && window.url_paths[0]?.toLocaleLowerCase() === 'app' && window.url_paths[1] ) {
+        try {
+            const app_info = await puter.apps.get(window.url_paths[1], { icon_size: 64 });
+            if ( app_info?.metadata?.fullpage_on_landing ) {
+                window.is_fullpage_mode = true;
+                window.taskbar_height = 0;
+                window.app_launched_from_url = app_info;
+            }
+        } catch (e) {
+            // App metadata fetch failed; will retry later in UIDesktop
+        }
+    }
+
+    //--------------------------------------------------------------------------------------
     // Desktop background (early)
     // Set before action=login/signup so OIDC error redirects show the background behind the form.
     // -------------------------------------------------------------------------------------
@@ -860,10 +878,15 @@ window.initgui = async function (options) {
             // Load desktop, only if we're not embedded in a popup and not on the dashboard page
             // -------------------------------------------------------------------------------------
             if ( !window.embedded_in_popup && !window.is_dashboard_mode ) {
-                await window.get_auto_arrange_data();
-                puter.fs.stat({ path: window.desktop_path, consistency: 'eventual' }).then(desktop_fsentry => {
-                    UIDesktop({ desktop_fsentry: desktop_fsentry });
-                });
+                if ( window.is_fullpage_mode ) {
+                    // In fullpage mode, skip loading desktop items and background
+                    UIDesktop({});
+                } else {
+                    await window.get_auto_arrange_data();
+                    puter.fs.stat({ path: window.desktop_path, consistency: 'eventual' }).then(desktop_fsentry => {
+                        UIDesktop({ desktop_fsentry: desktop_fsentry });
+                    });
+                }
             }
             // -------------------------------------------------------------------------------------
             // Dashboard mode
@@ -1409,13 +1432,34 @@ window.initgui = async function (options) {
         }
 
         // -------------------------------------------------------------------------------------
+        // Early check for fullpage mode from app metadata (after login)
+        // -------------------------------------------------------------------------------------
+        if ( !window.is_fullpage_mode && window.url_paths[0]?.toLocaleLowerCase() === 'app' && window.url_paths[1] ) {
+            try {
+                const app_info = await puter.apps.get(window.url_paths[1], { icon_size: 64 });
+                if ( app_info?.metadata?.fullpage_on_landing ) {
+                    window.is_fullpage_mode = true;
+                    window.taskbar_height = 0;
+                    window.app_launched_from_url = app_info;
+                }
+            } catch (e) {
+                // App metadata fetch failed; will retry later in UIDesktop
+            }
+        }
+
+        // -------------------------------------------------------------------------------------
         // Load desktop, if not embedded in a popup and not on the dashboard page
         // -------------------------------------------------------------------------------------
         if ( !window.embedded_in_popup && !window.is_dashboard_mode ) {
-            await window.get_auto_arrange_data();
-            puter.fs.stat({ path: window.desktop_path, consistency: 'eventual' }).then(desktop_fsentry => {
-                UIDesktop({ desktop_fsentry: desktop_fsentry });
-            });
+            if ( window.is_fullpage_mode ) {
+                // In fullpage mode, skip loading desktop items and background
+                UIDesktop({});
+            } else {
+                await window.get_auto_arrange_data();
+                puter.fs.stat({ path: window.desktop_path, consistency: 'eventual' }).then(desktop_fsentry => {
+                    UIDesktop({ desktop_fsentry: desktop_fsentry });
+                });
+            }
         }
         // -------------------------------------------------------------------------------------
         // Dashboard mode: open explorer pointing to home directory

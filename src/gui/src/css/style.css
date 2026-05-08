@@ -1972,20 +1972,6 @@ label {
     box-shadow: rgb(255 255 255 / 44%) 0px 0px 0px 0.5px inset, rgba(0, 0, 0, 0.2) 0px 0px 0px 0.5px, rgba(0, 0, 0, 0.2) 0px 2px 14px;
 }
 
-.show-desktop-btn {
-    color: white;
-    font-size: 11px !important;
-    padding: 2px 5px 2px !important;
-    border: 1px solid;
-    border-radius: 4px;
-    height: 18px !important;
-    width: 110px !important;
-    margin-top: 2px;
-    text-decoration: none;
-    margin-left: 10px !important;
-    font-weight: 500;
-}
-
 .device-phone .toolbar {
     z-index: 1;
 }

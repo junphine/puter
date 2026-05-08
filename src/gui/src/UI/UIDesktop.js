@@ -646,10 +646,10 @@ async function UIDesktop (options) {
     // Desktop
     // If desktop is not in fullpage/embedded mode, we hide it until files and directories are loaded and then fade in the UI
     // This gives a calm and smooth experience for the user
-    h += `<div class="desktop item-container disable-user-select" 
-                data-uid="${options.desktop_fsentry.uid}" 
-                data-sort_by="${!options.desktop_fsentry.sort_by ? 'name' : options.desktop_fsentry.sort_by}" 
-                data-sort_order="${!options.desktop_fsentry.sort_order ? 'asc' : options.desktop_fsentry.sort_order}" 
+    h += `<div class="desktop item-container disable-user-select"
+                data-uid="${options.desktop_fsentry?.uid ?? ''}"
+                data-sort_by="${!options.desktop_fsentry?.sort_by ? 'name' : options.desktop_fsentry.sort_by}"
+                data-sort_order="${!options.desktop_fsentry?.sort_order ? 'asc' : options.desktop_fsentry.sort_order}"
                 data-path="${html_encode(window.desktop_path)}"
             >`;
 
@@ -1261,18 +1261,16 @@ async function UIDesktop (options) {
     // i.e. https://puter.com/app/<app_name>
     //--------------------------------------------------------------------------------------
     if ( window.url_paths[0]?.toLocaleLowerCase() === 'app' && window.url_paths[1] ) {
-        window.app_launched_from_url = window.url_paths[1];
-        // get app metadata
-        try {
-            window.app_launched_from_url = await puter.apps.get(window.url_paths[1], { icon_size: 64 });
-            window.is_fullpage_mode = window.app_launched_from_url.metadata?.fullpage_on_landing ?? window.is_fullpage_mode ?? false;
-
-            // show 'Show Desktop' button
-            if ( window.is_fullpage_mode ) {
-                $('.show-desktop-btn').removeClass('hidden');
+        // If app metadata was already fetched early (for fullpage detection), reuse it
+        if ( !window.app_launched_from_url?.name ) {
+            window.app_launched_from_url = window.url_paths[1];
+            // get app metadata
+            try {
+                window.app_launched_from_url = await puter.apps.get(window.url_paths[1], { icon_size: 64 });
+                window.is_fullpage_mode = window.app_launched_from_url.metadata?.fullpage_on_landing ?? window.is_fullpage_mode ?? false;
+            } catch (e) {
+                console.error('UIDesktop app path launch error', e);
             }
-        } catch (e) {
-            console.error('UIDesktop app path launch error', e);
         }
 
         // get query params, any param that doesn't start with 'puter.' will be passed to the app
@@ -2471,9 +2469,6 @@ window.exit_fullpage_mode = (el_window) => {
 
     // reset dektop height to take into account the taskbar height
     $('.desktop').css('height', `calc(100vh - ${window.taskbar_height + window.toolbar_height}px)`);
-
-    // hide the 'Show Desktop' button in toolbar
-    $('.show-desktop-btn').hide();
 
     // refresh desktop background
     window.refresh_desktop_background();
