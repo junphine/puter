@@ -14,7 +14,7 @@ Generates secrets, writes `.env` + `puter/config/config.json`, downloads `docker
 
 - **Docker** with the `compose` plugin.
 - A **domain** with DNS access — you need a wildcard record (`*.your-domain.com` → server IP). Puter routes by subdomain (`api.<domain>`, `site.<domain>`, `app.<domain>`).
-- Optional: **TLS certs** (or `certbot` to grab them — see Step 4).
+- Optional: **TLS certs** (or `certbot` to grab them — see Step 3).
 
 ## What's running
 
