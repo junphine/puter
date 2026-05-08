@@ -92,7 +92,6 @@ const ig = {
         credits: 'Ebe e si nweta',
         current_password: 'paswọọdụ Ugbu a',
         cut: 'Bee',
-      'Nchekwa onwe - Emepụtara, a na-ahụ ya naanị na ọnọdụ ihuenyo zuru oke.',
         close_all: 'Mechie ha niile',
         created: 'kere',
         date_modified: 'Ụbọchị ịgbanwe',

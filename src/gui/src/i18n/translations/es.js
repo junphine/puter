@@ -101,7 +101,6 @@ const es = {
         credits: 'Creditos',
         current_password: 'Contraseña actual',
         cut: 'Cortar',
-      'Auto - Por defecto, visible solo en modo pantalla completa.',
         close_all: 'Cerrar todo',
         created: 'Creado',
         date_modified: 'Fecha de modificación',

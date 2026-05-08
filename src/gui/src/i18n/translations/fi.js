@@ -111,7 +111,6 @@ const fi = {
         credits: 'Tekijät',
         current_password: 'Nykyinen salasana',
         cut: 'Leikkaa',
-      'Automaattinen - oletus, näkyy vain koko näytön tilassa.',
         close_all: 'Sulje kaikki',
         created: 'Luotu',
         date_modified: 'Muokkauspäivämäärä',

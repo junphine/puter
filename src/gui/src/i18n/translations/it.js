@@ -93,7 +93,6 @@ const it = {
         credits: 'Crediti',
         current_password: 'Password attuale',
         cut: 'Taglia',
-      'Auto - Default, visibile solo in modalità schermo intero',
         close_all: 'Chiudi tutte',
         created: 'Creata',
         date_modified: 'Data ultima modifica',
