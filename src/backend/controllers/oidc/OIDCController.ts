@@ -166,10 +166,19 @@ export class OIDCController extends PuterController {
                     }
                 }
 
+                const rawReferrer = Array.isArray(req.query.referrer)
+                    ? req.query.referrer[0]
+                    : req.query.referrer;
+                const referrer =
+                    rawReferrer != null && rawReferrer !== ''
+                        ? String(rawReferrer)
+                        : null;
+
                 const statePayload: Record<string, unknown> = {
                     provider,
                     redirect_uri: appRedirectUri,
                 };
+                if (referrer) statePayload.referrer = referrer ?? openerOrigin;
                 if (embeddedInPopup && msgId) {
                     statePayload.embedded_in_popup = true;
                     statePayload.msg_id = msgId;
@@ -230,9 +239,11 @@ export class OIDCController extends PuterController {
             }
 
             const { provider, userinfo, stateDecoded } = result;
+
             const resolved = await this.#resolveOrCreateOIDCUser(
                 provider,
                 userinfo,
+                (stateDecoded.referrer as string) ?? null,
             );
             if ('error' in resolved) {
                 console.warn(
@@ -290,9 +301,11 @@ export class OIDCController extends PuterController {
             }
 
             const { provider, userinfo, stateDecoded } = result;
+
             const resolved = await this.#resolveOrCreateOIDCUser(
                 provider,
                 userinfo,
+                (stateDecoded.referrer as string) ?? null,
             );
             if ('error' in resolved) {
                 return res.redirect(
@@ -436,6 +449,7 @@ if (window.opener) {
     async #resolveOrCreateOIDCUser(
         provider: string,
         userinfo: { sub: string; email?: unknown; [k: string]: unknown },
+        referrer?: string | null,
     ): Promise<
         | { error: string }
         | {
@@ -480,6 +494,7 @@ if (window.opener) {
         const outcome = await this.services.oidc.createUserFromOIDC(
             provider,
             userinfo as { sub: string; email?: string },
+            referrer,
         );
         if (!outcome.success || !outcome.user) {
             return { error: outcome.error ?? 'Account creation failed.' };
