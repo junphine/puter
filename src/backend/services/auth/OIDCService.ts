@@ -403,6 +403,7 @@ export class OIDCService extends PuterService {
                 req?.ip ||
                 req?.socket?.remoteAddress ||
                 null,
+            user_agent: req?.headers?.['user-agent'] ?? null,
             email: claims.email ?? '',
             allow: true,
             no_temp_user: false,
