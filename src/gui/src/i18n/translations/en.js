@@ -510,6 +510,7 @@ const en = {
         sign_up_with_google: 'Sign up with Google',
         sign_in_with_apple: 'Sign in with Apple',
         sign_up_with_apple: 'Sign up with Apple',
+        sign_up_with_email: 'Sign up using email',
         oidc_switched_to_login_message: 'You have been logged in to an existing account.',
 
         // Login Window
