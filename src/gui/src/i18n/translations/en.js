@@ -349,7 +349,7 @@ const en = {
         'toolbar.save_account': 'Save Account',
         'toolbar.search': 'Search',
         'toolbar.qrcode': 'QR Code',
-        tos_fineprint: 'By clicking \'Create Free Account\' you agree to Puter\'s {{link=terms}}Terms of Service{{/link}} and {{link=privacy}}Privacy Policy{{/link}}.',
+        tos_fineprint: 'By signing up, you agree to Puter\'s {{link=terms}}Terms of Service{{/link}} and {{link=privacy}}Privacy Policy{{/link}}.',
         transparency: 'Transparency',
         trash: 'Trash',
         two_factor: 'Two Factor Authentication',

@@ -91,8 +91,6 @@ function UIWindowSignup (options) {
             h += '</div>';
         }
 
-        // terms and privacy
-        h += `<p class="signup-terms">${i18n('tos_fineprint', [], false)}</p>`;
         // Create Account
         h += `<button class="signup-btn button button-primary button-block button-normal">${i18n('create_free_account')}</button>`;
         h += '</form>';
@@ -104,6 +102,8 @@ function UIWindowSignup (options) {
         h += `<div class="signup-with-email-wrapper" style="display:none;">`;
         h += `<button class="signup-with-email-btn button button-block button-normal">${i18n('sign_up_with_email')}</button>`;
         h += `</div>`;
+        // terms and privacy
+        h += `<p class="signup-terms">${i18n('tos_fineprint', [], false)}</p>`;
         h += '</div>';
         // login link
         // create account link
