@@ -102,7 +102,6 @@ function UIWindowSignup (options) {
         h += '</div>';
         // "Sign up with email" button, shown only when OIDC providers are available
         h += `<div class="signup-with-email-wrapper" style="display:none;">`;
-        h += `<div style="text-align:center; margin: 10px 0; font-size:13px;">${ i18n('or') }</div>`;
         h += `<button class="signup-with-email-btn button button-block button-normal">${i18n('sign_up_with_email')}</button>`;
         h += `</div>`;
         h += '</div>';
