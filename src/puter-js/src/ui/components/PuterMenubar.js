@@ -114,6 +114,14 @@ class PuterMenubar extends PuterWebComponent {
 
             btn.addEventListener('click', (e) => {
                 e.stopPropagation();
+                // The dropdown closes on outside pointerdown, which fires
+                // before this click. If the user is pressing the same button
+                // that just closed, treat the press as a toggle-close —
+                // don't reopen on the trailing click.
+                if ( this._suppressClickFor === btn ) {
+                    this._suppressClickFor = null;
+                    return;
+                }
                 this.#focusedIndex = index;
                 this.#menubarActive = true;
                 if ( this.#activeButtonEl === btn ) {
@@ -122,6 +130,19 @@ class PuterMenubar extends PuterWebComponent {
                     return;
                 }
                 this._openDropdown(btn, item);
+            });
+
+            // pointerdown on this button while it owns the open dropdown:
+            // mark it so the outside-pointerdown close (about to fire) and
+            // the trailing click don't reopen.
+            btn.addEventListener('pointerdown', () => {
+                if ( this.#activeButtonEl === btn ) {
+                    this._suppressClickFor = btn;
+                    clearTimeout(this._suppressClickTimer);
+                    this._suppressClickTimer = setTimeout(() => {
+                        this._suppressClickFor = null;
+                    }, 400);
+                }
             });
 
             // Hover-switch when a dropdown is already open
@@ -290,11 +311,14 @@ class PuterMenubar extends PuterWebComponent {
             this._deactivateMenubar();
         });
         dropdown.addEventListener('close', () => {
-            // The context menu closes itself on outside click; sync our state
+            // The context menu closes itself on outside click / Escape /
+            // selection. Sync our state and fully deactivate the menubar so
+            // a stray arrow / Enter / Space keypress doesn't re-open it.
             if ( this.#activeDropdown === dropdown ) {
                 buttonEl.classList.remove('active');
                 this.#activeDropdown = null;
                 this.#activeButtonEl = null;
+                this._deactivateMenubar();
             }
         });
         // Keyboard navigate request bubbling from the context menu
@@ -325,6 +349,8 @@ class PuterMenubar extends PuterWebComponent {
 
     disconnectedCallback () {
         this._closeDropdown();
+        clearTimeout(this._suppressClickTimer);
+        this._suppressClickFor = null;
         if ( this._keyHandler ) {
             document.removeEventListener('keydown', this._keyHandler, true);
         }
