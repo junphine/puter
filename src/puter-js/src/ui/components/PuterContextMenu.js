@@ -285,6 +285,14 @@ class PuterContextMenu extends PuterWebComponent {
                 border-radius: 0;
             }
 
+            /* Keyboard shortcuts have no meaning on touch / small-screen
+               devices — hide them so labels can use the full width. */
+            @media (max-width: 480px), (pointer: coarse) {
+                .shortcut {
+                    display: none;
+                }
+            }
+
             :host(.sheet-mode) .menu-item:hover:not(.disabled):not(.divider) {
                 background-color: rgba(0, 122, 255, 0.1);
                 color: inherit;
