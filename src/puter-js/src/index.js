@@ -889,6 +889,11 @@ const puterInit = (function () {
          */
         printDevCTA = function () {
             if ( this.quiet || globalThis.PUTER_QUIET ) return;
+            const isDark = globalThis.matchMedia && globalThis.matchMedia('(prefers-color-scheme: dark)').matches;
+            const asciiColor = isDark ? '#7c8cff' : '#000fd8';
+            const headingColor = isDark ? '#cbd5f5' : 'rgb(0, 57, 137)';
+            const linkColor = isDark ? '#93c5fd' : '#3b82f6';
+            const mutedColor = isDark ? '#64748b' : '#94a3b8';
             console.log(
                 '%c' +
                 ' ____  _   _ _____ _____ ____       _ ____  \n' +
@@ -896,18 +901,18 @@ const puterInit = (function () {
                 '| |_) | | | | | | |  _| | |_) | _  | \\___ \\ \n' +
                 '|  __/| |_| | | | | |___|  _ < | |_| |___) |\n' +
                 '|_|    \\___/  |_| |_____|_| \\_(_)___/|____/ ',
-                'color: #000fd8; font-weight: bold; font-size: 14px; font-family: monospace;'
+                `color: ${asciiColor}; font-weight: bold; font-size: 14px; font-family: monospace;`
             );
             console.log(
                 '%cSubmit this app to the Puter App Store:\n' +
                 '%chttps://apps.puter.com/',
-                'color:rgb(0, 57, 137); font-size: 18px; font-weight: bold;',
-                'color: #3b82f6; font-size: 18px; font-weight: bold; text-decoration: underline;'
+                `color: ${headingColor}; font-size: 18px; font-weight: bold;`,
+                `color: ${linkColor}; font-size: 18px; font-weight: bold; text-decoration: underline;`
             );
             console.log(
                 '%cTo disable this message: %cputer.quiet = true',
-                'color: #94a3b8; font-size: 11px;',
-                'color: #94a3b8; font-size: 11px; font-style: italic;'
+                `color: ${mutedColor}; font-size: 11px;`,
+                `color: ${mutedColor}; font-size: 11px; font-style: italic;`
             );
         };
 
