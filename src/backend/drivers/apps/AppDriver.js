@@ -20,6 +20,10 @@
 import { Context } from '../../core/context.js';
 import { HttpError } from '../../core/http/HttpError.js';
 import {
+    DEFAULT_FREE_SUBSCRIPTION,
+    DEFAULT_TEMP_SUBSCRIPTION,
+} from '../../services/metering/consts.js';
+import {
     ICON_DATA_URL_MIME_ALLOWLIST,
     isAppIconEndpointUrl,
     isRawBase64ImageString,
@@ -91,6 +95,21 @@ export class AppDriver extends PuterDriver {
     // resolve without a translation layer.
     driverName = 'es:app';
     isDefault = true;
+
+    // Inherited from the pre-v2 `temp.es` / `user.es` policies that lived
+    // on permission grants in `hardcoded-permissions.js`. Re-expressed
+    // here as subscription-tier overrides — the metering service maps
+    // anonymous users to `temp_free` and registered users to `user_free`.
+    rateLimit = {
+        default: {
+            limit: 100,
+            window: 10_000,
+            bySubscription: {
+                [DEFAULT_FREE_SUBSCRIPTION]: 100,
+                [DEFAULT_TEMP_SUBSCRIPTION]: 50,
+            },
+        },
+    };
 
     get appStore() {
         return this.stores.app;

@@ -20,9 +20,15 @@
 import { posix as pathPosix } from 'node:path';
 import { Context } from '../../core/context.js';
 import { HttpError } from '../../core/http/HttpError.js';
+import { assertVerifiedEmail } from '../../core/http/verifiedEmail.js';
+import {
+    DEFAULT_FREE_SUBSCRIPTION,
+    DEFAULT_TEMP_SUBSCRIPTION,
+} from '../../services/metering/consts.js';
 import { PuterDriver } from '../types.js';
 import type { Actor } from '../../core/actor.js';
 import type { AclMode } from '../../services/acl/ACLService.js';
+import type { DriverRateLimitConfig } from '../meta.js';
 import type { FSEntry } from '../../stores/fs/FSEntry.js';
 import type { UserRow } from '../../stores/user/UserStore.js';
 import { expandTildePath } from '../../services/fs/resolveNode.js';
@@ -69,6 +75,20 @@ export class SubdomainDriver extends PuterDriver {
     // hardcoded `service:es\Csubdomain:…` permission keys.
     readonly driverName = 'es:subdomain';
     readonly isDefault = true;
+
+    // Mirrors the pre-v2 `temp.es` / `user.es` policies that used to ride
+    // on permission grants. See AppDriver / NotificationDriver for the
+    // same shape — the three crud-q drivers share one envelope.
+    readonly rateLimit: DriverRateLimitConfig = {
+        default: {
+            limit: 100,
+            window: 10_000,
+            bySubscription: {
+                [DEFAULT_FREE_SUBSCRIPTION]: 100,
+                [DEFAULT_TEMP_SUBSCRIPTION]: 50,
+            },
+        },
+    };
 
     // ── Driver methods ──────────────────────────────────────────────
 
@@ -423,13 +443,11 @@ export class SubdomainDriver extends PuterDriver {
      * level so /drivers/call can't bypass the gate the HTTP route enforces.
      */
     #requireVerified(actor: Actor): void {
-        if (!this.config.strict_email_verification_required) return;
-        const user = actor.user;
-        if (!user?.email_confirmed) {
-            throw new HttpError(400, 'Account email is not verified', {
-                legacyCode: 'account_is_not_verified',
-            });
-        }
+        assertVerifiedEmail(
+            Boolean(this.config.strict_email_verification_required),
+            actor.user,
+            400,
+        );
     }
 
     async #hasPermission(actor: Actor, permission: string): Promise<boolean> {
