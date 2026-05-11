@@ -186,10 +186,10 @@ export const requireVerifiedGate = (strictFlag: boolean): RequestHandler => {
             next();
             return;
         }
-        const user = req.actor?.user as Record<string, unknown> | undefined;
+        const user = req.actor?.user;
         if (!user?.email_confirmed) {
             next(
-                new HttpError(400, 'Account email is not verified', {
+                new HttpError(403, 'Account email is not verified', {
                     legacyCode: 'account_is_not_verified',
                 }),
             );
