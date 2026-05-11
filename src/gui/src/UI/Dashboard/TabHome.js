@@ -19,13 +19,6 @@
 
 import UIWindowSaveAccount from '../UIWindowSaveAccount.js';
 
-function getTimeGreeting () {
-    const hour = new Date().getHours();
-    if ( hour < 12 ) return 'Good morning';
-    if ( hour < 17 ) return 'Good afternoon';
-    return 'Good evening';
-}
-
 function buildRecentAppsHTML () {
     let h = '';
 
@@ -121,7 +114,6 @@ const TabHome = {
 
     html () {
         const username = window.user?.username || 'User';
-        const greeting = getTimeGreeting();
         const profilePicture = window.user?.profile?.picture || window.icons['profile.svg'];
 
         let h = '';
@@ -133,9 +125,9 @@ const TabHome = {
         h += '<div class="bento-welcome-pattern"></div>';
         h += '<div class="bento-welcome-content">';
         h += `<div class="bento-welcome-avatar profile-pic" style="background-image: url(${html_encode(profilePicture)})"></div>`;
-        h += `<span class="bento-greeting">${greeting},</span>`;
+        h += `<span class="bento-greeting">${i18n('welcome')},</span>`;
         h += `<h1 class="bento-username username">${html_encode(username)}</h1>`;
-        h += '<p class="bento-tagline">Your personal cloud computer</p>';
+        h += `<p class="bento-tagline">${i18n('your_personal_internet_computer')}</p>`;
         // Show warning if account is temporary/unsaved
         if ( window.user?.is_temp ) {
             h += '<button class="bento-save-account-warning">';
@@ -280,12 +272,17 @@ const TabHome = {
             $el_window.find('.bento-plan-name').text(i18n(planName));
 
             if ( hasSubscription ) {
-                $el_window.find('.bento-plan-badge').text('Active subscription').addClass('active');
-                $el_window.find('.bento-plan-upgrade').hide();
+                $el_window.find('.bento-plan-badge').text('Current').addClass('active');
+                $el_window.find('.bento-plan-upgrade').text('Manage →').show();
             } else {
                 $el_window.find('.bento-plan-badge').text('Upgrade for more features').addClass('free');
                 $el_window.find('.bento-plan-upgrade').show();
             }
+
+            $el_window.find('.bento-plan-upgrade').off('click.billing').on('click.billing', (e) => {
+                e.preventDefault();
+                window.puterLegacyBilling?.openSubscriptionsDialog?.();
+            });
         } catch (e) {
             console.error('Failed to load plan data:', e);
         }
@@ -304,7 +301,10 @@ const TabHome = {
             $el_window.find('.bento-storage-used').text(`${window.byte_format(general_used)} Used`);
             $el_window.find('.bento-storage-capacity').text(window.byte_format(res.capacity));
             $el_window.find('.bento-storage-percent').text(`${usage_percentage}%`);
-            $el_window.find('.bento-storage-bar').css('width', `${usage_percentage}%`);
+            $el_window.find('.bento-storage-bar').css({
+                width: `${usage_percentage}%`,
+                'background-color': window.usage_bar_color(usage_percentage),
+            });
         } catch (e) {
             console.error('Failed to load storage data:', e);
         }
@@ -320,7 +320,10 @@ const TabHome = {
             $el_window.find('.bento-resources-used').text(`${window.number_format(totalUsage / 100_000_000, { decimals: 2, prefix: '$' })} Used`);
             $el_window.find('.bento-resources-capacity').text(window.number_format(monthlyAllowance / 100_000_000, { decimals: 2, prefix: '$' }));
             $el_window.find('.bento-resources-percent').text(`${totalUsagePercentage}%`);
-            $el_window.find('.bento-resources-bar').css('width', `${totalUsagePercentage}%`);
+            $el_window.find('.bento-resources-bar').css({
+                width: `${totalUsagePercentage}%`,
+                'background-color': window.usage_bar_color(totalUsagePercentage),
+            });
         } catch (e) {
             console.error('Failed to load monthly usage data:', e);
         }

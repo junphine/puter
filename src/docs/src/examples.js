@@ -194,6 +194,30 @@ const examples = [
                 source: '/playground/examples/ai-txt2speech-elevenlabs.html',
             },
             {
+                title: 'Text to Speech with Gemini',
+                description: 'Generate speech with Gemini voices using Puter.js AI API. Run and experiment with this TTS example in the playground.',
+                slug: 'ai-txt2speech-gemini',
+                source: '/playground/examples/ai-txt2speech-gemini.html',
+            },
+            {
+                title: 'Text to Speech with xAI (Grok)',
+                description: 'Generate speech with xAI Grok voices using Puter.js AI API. Run and experiment with this TTS example in the playground.',
+                slug: 'ai-txt2speech-xai',
+                source: '/playground/examples/ai-txt2speech-xai.html',
+            },
+            {
+                title: 'List TTS Engines',
+                description: 'Query available TTS engines/models from each provider using puter.ai.txt2speech.listEngines().',
+                slug: 'ai-txt2speech-list-engines',
+                source: '/playground/examples/ai-txt2speech-list-engines.html',
+            },
+            {
+                title: 'List TTS Voices',
+                description: 'Browse available TTS voices from each provider using puter.ai.txt2speech.listVoices().',
+                slug: 'ai-txt2speech-list-voices',
+                source: '/playground/examples/ai-txt2speech-list-voices.html',
+            },
+            {
                 title: 'Voice Changer',
                 description: 'Swap a sample clip into a new voice using Puter.js AI speech-to-speech helpers.',
                 slug: 'ai-voice-changer',
@@ -216,6 +240,12 @@ const examples = [
                 description: 'Transcribe an audio recording into text using Puter.js AI API. Run and experiment with this example directly in the playground.',
                 slug: 'ai-speech2txt',
                 source: '/playground/examples/ai-speech2txt.html',
+            },
+            {
+                title: 'Transcribe with xAI (Grok)',
+                description: 'Transcribe audio using xAI Grok speech-to-text with Puter.js AI API. Run and experiment with this example in the playground.',
+                slug: 'ai-speech2txt-xai',
+                source: '/playground/examples/ai-speech2txt-xai.html',
             },
             {
                 title: 'Text to Video',

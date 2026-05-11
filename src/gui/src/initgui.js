@@ -48,7 +48,6 @@ import { IPCService } from './services/IPCService.js';
 import { LaunchOnInitService } from './services/LaunchOnInitService.js';
 import { LocaleService } from './services/LocaleService.js';
 import { ProcessService } from './services/ProcessService.js';
-import { SettingsService } from './services/SettingsService.js';
 import { ThemeService } from './services/ThemeService.js';
 import { privacy_aware_path } from './util/desktop.js';
 
@@ -92,7 +91,6 @@ const launch_services = async function (options) {
     register('theme', new ThemeService());
     register('process', new ProcessService());
     register('locale', new LocaleService());
-    register('settings', new SettingsService());
     register('anti-csrf', new AntiCSRFService());
     register('__launch-on-init', new LaunchOnInitService());
 
@@ -455,7 +453,7 @@ window.initgui = async function (options) {
             // show signup window
             if ( await UIWindowSignup({
                 reload_on_success: false,
-                send_confirmation_code: false,
+                send_confirmation_code: true,
                 show_close_button: false,
                 window_options: {
                     has_head: false,
@@ -476,16 +474,23 @@ window.initgui = async function (options) {
                 // let's log the error for now in case a change in state occurred.
                 console.error('error in \'sign-in\' flow', e);
             }
-            // Always show session list so user sees their account(s); after OIDC they will see the one they signed into
-            picked_a_user_for_sdk_login = await UIWindowSessionList({
-                reload_on_success: false,
-                draggable_body: false,
-                has_head: false,
-                cover_page: true,
-            });
 
-            if ( picked_a_user_for_sdk_login ) {
+            if ( window.url_query_params.get('oidc_login') === 'true' ) {
+                // OIDC login just completed in popup — skip session list and finish the flow
+                picked_a_user_for_sdk_login = true;
                 await window.getUserAppToken(window.openerOrigin);
+            } else {
+                // Show session list so user can pick which account to use
+                picked_a_user_for_sdk_login = await UIWindowSessionList({
+                    reload_on_success: false,
+                    draggable_body: false,
+                    has_head: false,
+                    cover_page: true,
+                });
+
+                if ( picked_a_user_for_sdk_login ) {
+                    await window.getUserAppToken(window.openerOrigin);
+                }
             }
         }
     }
@@ -514,6 +519,24 @@ window.initgui = async function (options) {
             ? `${window.location.pathname}?${cleanSearch}`
             : window.location.pathname || '/';
         window.history.replaceState(null, document.title, cleanUrl);
+    }
+
+    //--------------------------------------------------------------------------------------
+    // Early check for fullpage mode from app metadata
+    // If the user navigated to /app/<app_name> and the app has fullpage_on_landing,
+    // set fullpage mode now so we can skip loading the desktop background and items.
+    //--------------------------------------------------------------------------------------
+    if ( !window.is_fullpage_mode && window.url_paths[0]?.toLocaleLowerCase() === 'app' && window.url_paths[1] ) {
+        try {
+            const app_info = await puter.apps.get(window.url_paths[1], { icon_size: 64 });
+            if ( app_info?.metadata?.fullpage_on_landing ) {
+                window.is_fullpage_mode = true;
+                window.taskbar_height = 0;
+                window.app_launched_from_url = app_info;
+            }
+        } catch (e) {
+            // App metadata fetch failed; will retry later in UIDesktop
+        }
     }
 
     //--------------------------------------------------------------------------------------
@@ -593,6 +616,7 @@ window.initgui = async function (options) {
         if ( ! window.is_auth() ) {
             opts.window_options = { cover_page: true, has_head: false };
         }
+        opts.send_confirmation_code = true;
         await UIWindowSignup(Object.keys(opts).length ? opts : undefined);
     }
     // -------------------------------------------------------------------------------------
@@ -642,8 +666,12 @@ window.initgui = async function (options) {
                 let is_verified;
                 do {
                     is_verified = await UIWindowEmailConfirmationRequired({
+                        show_close_button: false,
                         stay_on_top: true,
                         has_head: false,
+                        window_options: {
+                            is_draggable: false,
+                        },
                     });
                 }
                 while ( !is_verified );
@@ -683,6 +711,108 @@ window.initgui = async function (options) {
         }
     };
 
+    /**
+     * Event handler for a custom 'logout' event attached to the document.
+     * This function handles the process of logging out, including user confirmation,
+     * communication with the backend, and subsequent UI updates. It takes special
+     * precautions if the user is identified as using a temporary account.
+     *
+     * @listens Document#event:logout
+     * @async
+     * @param {Event} event - The JQuery event object associated with the logout event.
+     * @returns {Promise<void>} - This function does not return anything meaningful, but it performs an asynchronous operation.
+     */
+    $(document).on('logout', async function (event) {
+        // is temp user?
+        if ( window.user && window.user.is_temp && !window.user.deleted ) {
+            const alert_resp = await UIAlert({
+                message: '<strong>Save account before logging out!</strong><p>You are using a temporary account and logging out will erase all your data.</p>',
+                buttons: [
+                    {
+                        label: i18n('save_account'),
+                        value: 'save_account',
+                        type: 'primary',
+                    },
+                    {
+                        label: i18n('log_out'),
+                        value: 'log_out',
+                        type: 'danger',
+                    },
+                    {
+                        label: i18n('cancel'),
+                    },
+                ],
+            });
+            if ( alert_resp === 'save_account' ) {
+                let saved = await UIWindowSaveAccount({
+                    send_confirmation_code: false,
+                    default_username: window.user.username,
+                });
+                if ( saved )
+                {
+                    window.logout();
+                }
+            } else if ( alert_resp === 'log_out' ) {
+                window.logout();
+            }
+            else {
+                return;
+            }
+        }
+
+        // logout
+        try {
+            const resp = await fetch(`${window.gui_origin}/get-anticsrf-token`);
+            const { token } = await resp.json();
+            await $.ajax({
+                url: `${window.gui_origin }/logout`,
+                type: 'POST',
+                async: true,
+                contentType: 'application/json',
+                headers: {
+                    'Authorization': `Bearer ${ window.auth_token}`,
+                },
+                data: JSON.stringify({ anti_csrf: token }),
+                statusCode: {
+                    401: function () {
+                    },
+                },
+            });
+        } catch (e) {
+            // Ignored
+        }
+
+        // remove this user from the array of logged_in_users
+        for ( let i = 0; i < window.logged_in_users.length; i++ ) {
+            if ( window.logged_in_users[i].uuid === window.user.uuid ) {
+                window.logged_in_users.splice(i, 1);
+                break;
+            }
+        }
+
+        // update logged_in_users in local storage
+        localStorage.setItem('logged_in_users', JSON.stringify(window.logged_in_users));
+
+        // delete this user from local storage
+        window.user = null;
+        localStorage.removeItem('user');
+        window.auth_token = null;
+        localStorage.removeItem('auth_token');
+
+        // close all windows
+        $('.window').close();
+        // close all ctxmenus
+        $('.context-menu').remove();
+        // remove desktop
+        $('.desktop').remove();
+        // remove taskbar
+        $('.taskbar').remove();
+        // disable native browser exit confirmation
+        window.onbeforeunload = null;
+        // go to home page
+        window.location.replace('/');
+    });
+
     // -------------------------------------------------------------------------------------
     // Authed
     // -------------------------------------------------------------------------------------
@@ -705,10 +835,12 @@ window.initgui = async function (options) {
                 let is_verified;
                 do {
                     is_verified = await UIWindowEmailConfirmationRequired({
+                        show_close_button: false,
                         stay_on_top: true,
                         has_head: false,
                         logout_in_footer: true,
                         window_options: {
+                            is_draggable: false,
                             cover_page: window.is_embedded,
                         },
                     });
@@ -746,10 +878,15 @@ window.initgui = async function (options) {
             // Load desktop, only if we're not embedded in a popup and not on the dashboard page
             // -------------------------------------------------------------------------------------
             if ( !window.embedded_in_popup && !window.is_dashboard_mode ) {
-                await window.get_auto_arrange_data();
-                puter.fs.stat({ path: window.desktop_path, consistency: 'eventual' }).then(desktop_fsentry => {
-                    UIDesktop({ desktop_fsentry: desktop_fsentry });
-                });
+                if ( window.is_fullpage_mode ) {
+                    // In fullpage mode, skip loading desktop items and background
+                    UIDesktop({});
+                } else {
+                    await window.get_auto_arrange_data();
+                    puter.fs.stat({ path: window.desktop_path, consistency: 'eventual' }).then(desktop_fsentry => {
+                        UIDesktop({ desktop_fsentry: desktop_fsentry });
+                    });
+                }
             }
             // -------------------------------------------------------------------------------------
             // Dashboard mode
@@ -1012,60 +1149,6 @@ window.initgui = async function (options) {
             window.update_sites_cache();
         }
     }
-    //--------------------------------------------------------------------------------------
-    // `share_token` provided
-    // i.e. https://puter.com/?share_token=<share_token>
-    //--------------------------------------------------------------------------------------
-    if ( window.url_query_params.has('share_token') ) {
-        let share_token = window.url_query_params.get('share_token');
-
-        fetch(`${puter.APIOrigin}/sharelink/check`, {
-            'headers': {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${puter.authToken}`,
-            },
-            'body': JSON.stringify({
-                token: share_token,
-            }),
-            'method': 'POST',
-        }).then(response => response.json())
-            .then(async data => {
-                // Show register screen
-                if ( data.email && data.email !== window.user?.email ) {
-                    // show signup window
-                    await UIWindowSignup({
-                        reload_on_success: true,
-                        email: data.email,
-                        send_confirmation_code: false,
-                        window_options: {
-                            has_head: false,
-                        },
-                    });
-                }
-                // Show email confirmation screen
-                else if ( data.email && data.email === window.user.email && !window.user.email_confirmed ) {
-                    await UIWindowEmailConfirmationRequired({
-                        stay_on_top: true,
-                        has_head: false,
-                        window_options: {
-                            cover_page: window.is_embedded,
-                        },
-                    });
-                }
-
-                // show shared item
-                UIWindow({
-                    path: data.path,
-                    title: path.basename(data.path),
-                    icon: await item_icon({ is_dir: data.is_dir, path: data.path }),
-                    is_dir: data.is_dir,
-                    app: 'explorer',
-                });
-            }).catch(error => {
-                console.error('Error:', error);
-            });
-    }
-
     // -------------------------------------------------------------------------------------
     // Desktop Background
     // If we're in fullpage/emebedded/Auth Popup mode, we don't want to load the custom background
@@ -1090,7 +1173,7 @@ window.initgui = async function (options) {
             const whoarewe = await resp.json();
             await UIWindowLogin({
                 reload_on_success: !window.embedded_in_popup,
-                send_confirmation_code: false,
+                send_confirmation_code: true,
                 show_signup_button: ( !whoarewe.disable_user_signup ),
                 redirect_url: needs_action ? window.location.href : undefined,
                 window_options: {
@@ -1235,7 +1318,7 @@ window.initgui = async function (options) {
 
                         await UIWindowSignup({
                             reload_on_success: !window.embedded_in_popup,
-                            send_confirmation_code: false,
+                            send_confirmation_code: true,
                             window_options: {
                                 has_head: false,
                                 cover_page: true,
@@ -1263,6 +1346,21 @@ window.initgui = async function (options) {
                                 window.open('', '_self').close();
                             }
                         })();
+                    } else if ( err_obj.code === 'signup_blocked' ) {
+                        // Hide any captcha modal
+                        $('.captcha-modal').hide();
+
+                        const overlay = document.createElement('div');
+                        overlay.classList.add('signup-blocked-overlay');
+                        const blockedMsg = err_obj.message || 'Signup blocked';
+                        overlay.innerHTML = `
+                            <div class="signup-blocked-content">
+                                <img src="${window.icons['logo.svg'] || window.icons['logo-white.svg'] || ''}" style="width:64px;margin-bottom:24px;" />
+                                <p>${html_encode(blockedMsg)}</p>
+                                <p>If you already have an account, try <a href="/action/login">logging in</a>. Otherwise, contact <a href="mailto:hi@puter.com">hi@puter.com</a> for assistance.</p>
+                            </div>
+                        `;
+                        document.body.appendChild(overlay);
                     } else {
                         UIAlert({
                             message: err_obj.message ?? 'There was an error creating your account. Please try again.',
@@ -1334,13 +1432,34 @@ window.initgui = async function (options) {
         }
 
         // -------------------------------------------------------------------------------------
+        // Early check for fullpage mode from app metadata (after login)
+        // -------------------------------------------------------------------------------------
+        if ( !window.is_fullpage_mode && window.url_paths[0]?.toLocaleLowerCase() === 'app' && window.url_paths[1] ) {
+            try {
+                const app_info = await puter.apps.get(window.url_paths[1], { icon_size: 64 });
+                if ( app_info?.metadata?.fullpage_on_landing ) {
+                    window.is_fullpage_mode = true;
+                    window.taskbar_height = 0;
+                    window.app_launched_from_url = app_info;
+                }
+            } catch (e) {
+                // App metadata fetch failed; will retry later in UIDesktop
+            }
+        }
+
+        // -------------------------------------------------------------------------------------
         // Load desktop, if not embedded in a popup and not on the dashboard page
         // -------------------------------------------------------------------------------------
         if ( !window.embedded_in_popup && !window.is_dashboard_mode ) {
-            await window.get_auto_arrange_data();
-            puter.fs.stat({ path: window.desktop_path, consistency: 'eventual' }).then(desktop_fsentry => {
-                UIDesktop({ desktop_fsentry: desktop_fsentry });
-            });
+            if ( window.is_fullpage_mode ) {
+                // In fullpage mode, skip loading desktop items and background
+                UIDesktop({});
+            } else {
+                await window.get_auto_arrange_data();
+                puter.fs.stat({ path: window.desktop_path, consistency: 'eventual' }).then(desktop_fsentry => {
+                    UIDesktop({ desktop_fsentry: desktop_fsentry });
+                });
+            }
         }
         // -------------------------------------------------------------------------------------
         // Dashboard mode: open explorer pointing to home directory
@@ -1739,107 +1858,6 @@ window.initgui = async function (options) {
         }
     });
 
-    /**
-     * Event handler for a custom 'logout' event attached to the document.
-     * This function handles the process of logging out, including user confirmation,
-     * communication with the backend, and subsequent UI updates. It takes special
-     * precautions if the user is identified as using a temporary account.
-     *
-     * @listens Document#event:logout
-     * @async
-     * @param {Event} event - The JQuery event object associated with the logout event.
-     * @returns {Promise<void>} - This function does not return anything meaningful, but it performs an asynchronous operation.
-     */
-    $(document).on('logout', async function (event) {
-        // is temp user?
-        if ( window.user && window.user.is_temp && !window.user.deleted ) {
-            const alert_resp = await UIAlert({
-                message: '<strong>Save account before logging out!</strong><p>You are using a temporary account and logging out will erase all your data.</p>',
-                buttons: [
-                    {
-                        label: i18n('save_account'),
-                        value: 'save_account',
-                        type: 'primary',
-                    },
-                    {
-                        label: i18n('log_out'),
-                        value: 'log_out',
-                        type: 'danger',
-                    },
-                    {
-                        label: i18n('cancel'),
-                    },
-                ],
-            });
-            if ( alert_resp === 'save_account' ) {
-                let saved = await UIWindowSaveAccount({
-                    send_confirmation_code: false,
-                    default_username: window.user.username,
-                });
-                if ( saved )
-                {
-                    window.logout();
-                }
-            } else if ( alert_resp === 'log_out' ) {
-                window.logout();
-            }
-            else {
-                return;
-            }
-        }
-
-        // logout
-        try {
-            const resp = await fetch(`${window.gui_origin}/get-anticsrf-token`);
-            const { token } = await resp.json();
-            await $.ajax({
-                url: `${window.gui_origin }/logout`,
-                type: 'POST',
-                async: true,
-                contentType: 'application/json',
-                headers: {
-                    'Authorization': `Bearer ${ window.auth_token}`,
-                },
-                data: JSON.stringify({ anti_csrf: token }),
-                statusCode: {
-                    401: function () {
-                    },
-                },
-            });
-        } catch (e) {
-            // Ignored
-        }
-
-        // remove this user from the array of logged_in_users
-        for ( let i = 0; i < window.logged_in_users.length; i++ ) {
-            if ( window.logged_in_users[i].uuid === window.user.uuid ) {
-                window.logged_in_users.splice(i, 1);
-                break;
-            }
-        }
-
-        // update logged_in_users in local storage
-        localStorage.setItem('logged_in_users', JSON.stringify(window.logged_in_users));
-
-        // delete this user from local storage
-        window.user = null;
-        localStorage.removeItem('user');
-        window.auth_token = null;
-        localStorage.removeItem('auth_token');
-
-        // close all windows
-        $('.window').close();
-        // close all ctxmenus
-        $('.context-menu').remove();
-        // remove desktop
-        $('.desktop').remove();
-        // remove taskbar
-        $('.taskbar').remove();
-        // disable native browser exit confirmation
-        window.onbeforeunload = null;
-        // go to home page
-        window.location.replace('/');
-    });
 };
 
 function requestOpenerOrigin () {

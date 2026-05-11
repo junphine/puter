@@ -241,6 +241,7 @@ const ipc_listener = async (event, handled) => {
         const prompt_resp = await UIPrompt({
             message: html_encode(event.data.message),
             placeholder: html_encode(event.data.placeholder),
+            defaultValue: event.data.options?.defaultValue,
             window_options: {
                 parent_uuid: event.data.appInstanceID,
                 disable_parent_window: true,
@@ -1367,6 +1368,9 @@ const ipc_listener = async (event, handled) => {
         }
 
         // set options
+        if ( typeof event.data.options === 'string' ) {
+            event.data.options = { defaultColor: event.data.options };
+        }
         event.data.options = event.data.options ?? {};
 
         // Clear window_options for security reasons
@@ -1499,7 +1503,6 @@ const ipc_listener = async (event, handled) => {
                 modified: res.modified,
                 type: res.type,
                 is_dir: false,
-                is_shared: res.is_shared,
                 suggested_apps: res.suggested_apps,
             });
             // sort each window

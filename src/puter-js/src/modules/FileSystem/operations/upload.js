@@ -1,6 +1,7 @@
 import path from '../../../lib/path.js';
 import * as utils from '../../../lib/utils.js';
 import getAbsolutePathForApp from '../utils/getAbsolutePathForApp.js';
+import { showUsageLimitDialog } from '../../../modules/UsageLimitDialog.js';
 
 /* eslint-disable */
 const MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024;
@@ -358,6 +359,19 @@ const upload = async function (items, dirPath, options = {}) {
         }
 
         const error = (e) => {
+            // Check for storage limit errors and show upgrade dialog
+            const isStorageError =
+                e?.code === 'NOT_ENOUGH_SPACE' ||
+                e?.status === 413 ||
+                e?.code === 'storage_limit_reached';
+            if ( isStorageError ) {
+                if ( puter.env === 'app' ) {
+                    puter.ui.requestUpgrade();
+                } else {
+                    showUsageLimitDialog('Not enough storage space available.<br>Please upgrade to continue.');
+                }
+            }
+
             // if error callback is provided, call it
             if ( options.error && typeof options.error === 'function' )
             {
@@ -716,7 +730,7 @@ const upload = async function (items, dirPath, options = {}) {
                         size: file.size,
                         contentType: file.type || 'application/octet-stream',
                         overwrite: overwriteEnabled,
-                        dedupeName: options.dedupeName ?? true,
+                        dedupeName: overwriteEnabled? false: options.dedupeName ?? true,
                         createMissingParents: shouldCreateMissingParents,
                         app_uid: options.appUID,
                     };

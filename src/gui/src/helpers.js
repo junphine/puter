@@ -77,10 +77,26 @@ window.suggest_apps_for_fsentry = async (options) => {
  * @returns
  */
 window.byte_format = (bytes) => {
-    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB'];
     if ( bytes === 0 ) return '0 Byte';
-    const i = parseInt(Math.floor(Math.log(bytes) / Math.log(1024)));
+    let i = parseInt(Math.floor(Math.log(bytes) / Math.log(1024)));
+    if ( i < 0 ) i = 0;
+    if ( i >= sizes.length ) i = sizes.length - 1;
     return `${(bytes / Math.pow(1024, i)).toFixed(2) } ${ sizes[i]}`;
+};
+
+/**
+ * Returns a fill color for a usage progress bar that shifts from green at 0%
+ * toward red as the percentage approaches 100%, passing through yellow/orange
+ * in the middle. Uses HSL so the transition is smooth.
+ *
+ * @param {number} percent - 0..100 (clamped)
+ * @returns {string} CSS color
+ */
+window.usage_bar_color = (percent) => {
+    const p = Math.max(0, Math.min(100, Number(percent) || 0)) / 100;
+    const hue = 120 * (1 - p);
+    return `hsl(${hue.toFixed(0)}, 70%, 45%)`;
 };
 
 /**
@@ -3083,26 +3099,6 @@ window.save_desktop_item_positions = () => {
 window.delete_desktop_item_positions = () => {
     window.desktop_item_positions = {};
     puter.kv.del('desktop_item_positions');
-};
-
-window.change_clock_visible = (clock_visible) => {
-    let newValue = clock_visible || window.user_preferences.clock_visible;
-
-    newValue === 'auto' && window.is_fullscreen() ? $('#clock').show() : $('#clock').hide();
-
-    newValue === 'show' && $('#clock').show();
-    newValue === 'hide' && $('#clock').hide();
-
-    if ( clock_visible ) {
-        // save clock_visible to user preferences
-        window.mutate_user_preferences({
-            clock_visible: newValue,
-        });
-
-        return;
-    }
-
-    $('select.change-clock-visible').val(window.user_preferences.clock_visible);
 };
 
 // Finds the `.window` element for the given app instance ID

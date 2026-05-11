@@ -55,7 +55,6 @@ const en = {
         revalidate_sign_in_popup: 'Sign in with your linked account in the popup.',
         revalidate_flow_notice: 'You will be asked to sign in with your linked account when you continue.',
         color_depth: 'Color Depth',
-        clock_visibility: 'Clock Visibility',
         close: 'Close',
         close_all_windows: 'Close All Windows',
         close_all_windows_confirm: 'Are you sure you want to close all windows?',
@@ -103,10 +102,6 @@ const en = {
         current_password: 'Current Password',
         cut: 'Cut',
         client_information: 'Client Information',
-        clock: 'Clock',
-        clock_visible_hide: 'Hide - Always hidden',
-        clock_visible_show: 'Show - Always visible',
-        clock_visible_auto: 'Auto - Default, visible only in full-screen mode.',
         close_all: 'Close All',
         created: 'Created',
         date_modified: 'Date modified',
@@ -354,7 +349,7 @@ const en = {
         'toolbar.save_account': 'Save Account',
         'toolbar.search': 'Search',
         'toolbar.qrcode': 'QR Code',
-        tos_fineprint: 'By clicking \'Create Free Account\' you agree to Puter\'s {{link=terms}}Terms of Service{{/link}} and {{link=privacy}}Privacy Policy{{/link}}.',
+        tos_fineprint: 'By signing up, you agree to Puter\'s {{link=terms}}Terms of Service{{/link}} and {{link=privacy}}Privacy Policy{{/link}}.',
         transparency: 'Transparency',
         trash: 'Trash',
         two_factor: 'Two Factor Authentication',
@@ -397,12 +392,7 @@ const en = {
 
         // === 2FA Setup ===
         setup2fa_1_step_heading: 'Open your authenticator app',
-        setup2fa_1_instructions: `
-            You can use any authenticator app that supports the Time-based One-Time Password (TOTP) protocol.
-            There are many to choose from, but if you're unsure
-            <a target="_blank" href="https://authy.com/download">Authy</a>
-            is a solid choice for Android and iOS.
-        `,
+        setup2fa_1_instructions: 'Scan the QR code with your authenticator app, then enter the 6-digit code it generates.',
         setup2fa_2_step_heading: 'Scan the QR code',
         setup2fa_3_step_heading: 'Enter the 6-digit code',
         setup2fa_4_step_heading: 'Copy your recovery codes',
@@ -492,6 +482,8 @@ const en = {
         'signup_error': 'An error occurred during signup. Please try again.',
 
         // Welcome Window
+        'welcome': 'Welcome',
+        'your_personal_internet_computer': 'To your personal internet computer',
         'welcome_title': 'Welcome to your Personal Internet Computer',
         'welcome_description': 'Store files, play games, find awesome apps, and much more! All in one place, accessible from anywhere at any time.',
         'welcome_get_started': 'Get Started',
@@ -516,6 +508,9 @@ const en = {
         'signup_confirm_password': 'Confirm Password',
         sign_in_with_google: 'Sign in with Google',
         sign_up_with_google: 'Sign up with Google',
+        sign_in_with_apple: 'Sign in with Apple',
+        sign_up_with_apple: 'Sign up with Apple',
+        sign_up_with_email: 'Sign up using email',
         oidc_switched_to_login_message: 'You have been logged in to an existing account.',
 
         // Login Window
