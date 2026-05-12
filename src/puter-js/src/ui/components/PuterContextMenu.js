@@ -92,17 +92,14 @@ class PuterContextMenu extends PuterWebComponent {
             .menu-item:hover:not(.disabled):not(.divider) .icon,
             .menu-item:hover:not(.disabled):not(.divider) .check,
             .menu-item:hover:not(.disabled):not(.divider) .submenu-arrow,
-            .menu-item:hover:not(.disabled):not(.divider) .shortcut,
             .menu-item:hover:not(.disabled):not(.divider) .label,
             .menu-item.focused:not(.disabled):not(.divider) .icon,
             .menu-item.focused:not(.disabled):not(.divider) .check,
             .menu-item.focused:not(.disabled):not(.divider) .submenu-arrow,
-            .menu-item.focused:not(.disabled):not(.divider) .shortcut,
             .menu-item.focused:not(.disabled):not(.divider) .label,
             .menu-item.has-open-submenu .icon,
             .menu-item.has-open-submenu .check,
             .menu-item.has-open-submenu .submenu-arrow,
-            .menu-item.has-open-submenu .shortcut,
             .menu-item.has-open-submenu .label {
                 color: white;
             }
@@ -115,6 +112,27 @@ class PuterContextMenu extends PuterWebComponent {
             .menu-item.focused:not(.disabled):not(.divider) .icon img,
             .menu-item.has-open-submenu .icon img {
                 filter: brightness(0) invert(1);
+            }
+
+            /* Safe-triangle: while the cursor traces a diagonal path toward
+               an open submenu, suppress :hover highlight on intermediate
+               items so they don't flash blue. .focused and .has-open-submenu
+               (managed by JS) still highlight normally. */
+            .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) {
+                background-color: transparent;
+                color: #333;
+            }
+            .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon,
+            .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .check,
+            .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .submenu-arrow,
+            .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .label {
+                color: #333;
+            }
+            .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon svg {
+                filter: none;
+            }
+            .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon img {
+                filter: drop-shadow(0px 0px 0.3px rgb(51, 51, 51));
             }
 
             /* .has-open-context-menu-submenu — line 1738-1739 */
@@ -213,6 +231,8 @@ class PuterContextMenu extends PuterWebComponent {
                 margin-left: 16px;
                 font-size: 11px;
                 color: #999;
+                flex-shrink: 0;
+                letter-spacing: 0.5px;
             }
 
             /* === iOS-style action sheet (mobile) ========================= */
@@ -261,6 +281,14 @@ class PuterContextMenu extends PuterWebComponent {
                 border-radius: 0;
             }
 
+            /* Keyboard shortcuts have no meaning on touch / small-screen
+               devices — hide them so labels can use the full width. */
+            @media (max-width: 480px), (pointer: coarse) {
+                .shortcut {
+                    display: none;
+                }
+            }
+
             :host(.sheet-mode) .menu-item:hover:not(.disabled):not(.divider) {
                 background-color: rgba(0, 122, 255, 0.1);
                 color: inherit;
@@ -294,7 +322,7 @@ class PuterContextMenu extends PuterWebComponent {
 
             :host(.sheet-mode) .icon {
                 width: 24px;
-                margin-right: 12px;
+                margin-right: 0px;
             }
             :host(.sheet-mode) .icon svg,
             :host(.sheet-mode) .icon img {
@@ -342,7 +370,7 @@ class PuterContextMenu extends PuterWebComponent {
                 : '';
 
             const shortcutHTML = item.shortcut
-                ? `<span class="shortcut">${this._escapeHTML(item.shortcut)}</span>`
+                ? `<span class="shortcut">${this._escapeHTML(this._formatShortcut(item.shortcut))}</span>`
                 : '';
 
             return `
@@ -431,7 +459,7 @@ class PuterContextMenu extends PuterWebComponent {
     _bindEvents () {
         // Remove any stale document listeners from a prior render
         if ( this._outsideClickHandler ) {
-            document.removeEventListener('click', this._outsideClickHandler, true);
+            document.removeEventListener('pointerdown', this._outsideClickHandler, true);
         }
         if ( this._keyHandler ) {
             document.removeEventListener('keydown', this._keyHandler, true);
@@ -472,6 +500,7 @@ class PuterContextMenu extends PuterWebComponent {
             el.addEventListener('mouseenter', () => {
                 if ( el.dataset.hasSubmenu === 'true' ) {
                     this.#pendingFocusIndex = null;
+                    this._setSafeTraverse(false);
                     this._setFocusIndex(index);
                     this._cancelSubmenuClose();
                     clearTimeout(this.#submenuTimeout);
@@ -485,16 +514,25 @@ class PuterContextMenu extends PuterWebComponent {
                     }
                 } else if ( this.#activeSubmenu ) {
                     // Safe-triangle: if cursor is heading toward the submenu,
-                    // defer focus change so intermediate items don't highlight
+                    // defer focus change AND suppress :hover styling on this
+                    // item so it doesn't flash blue mid-traversal.
                     if ( this._isMouseHeadingToSubmenu(this.#activeSubmenu.element) ) {
                         this.#pendingFocusIndex = index;
-                        this._cancelSubmenuClose();
+                        this._setSafeTraverse(true);
+                        // Don't call _cancelSubmenuClose — it clears
+                        // pendingFocusIndex. Just clear the close timer.
+                        if ( this.#submenuCloseTimer ) {
+                            clearTimeout(this.#submenuCloseTimer);
+                            this.#submenuCloseTimer = null;
+                        }
                         this.#submenuCloseTimer = setTimeout(() => this._submenuCloseCheck(), 100);
                         return;
                     }
+                    this._setSafeTraverse(false);
                     this._setFocusIndex(index);
                     this._scheduleSubmenuClose();
                 } else {
+                    this._setSafeTraverse(false);
                     this._setFocusIndex(index);
                 }
             });
@@ -507,14 +545,18 @@ class PuterContextMenu extends PuterWebComponent {
             });
         });
 
-        // Close on outside click
+        // Close on outside pointerdown — fires the instant the press starts,
+        // before mouseup/click, so the menu doesn't linger during a drag.
+        // Submenus are sibling elements appended to <body>, so we explicitly
+        // walk the submenu chain — a click in a descendant submenu must not
+        // tear us (and therefore that submenu) down.
         this._outsideClickHandler = (e) => {
-            if ( ! this.contains(e.target) ) {
+            if ( ! this._isEventInChain(e) ) {
                 this._closeAll();
             }
         };
         setTimeout(() => {
-            document.addEventListener('click', this._outsideClickHandler, true);
+            document.addEventListener('pointerdown', this._outsideClickHandler, true);
         }, 0);
 
         // Track mouse for safe-triangle submenu hover
@@ -809,13 +851,17 @@ class PuterContextMenu extends PuterWebComponent {
             clearTimeout(this.#submenuCloseTimer);
             this.#submenuCloseTimer = null;
         }
-        // User reached the submenu — discard deferred focus
+        // User reached the submenu — discard deferred focus and end traversal
         this.#pendingFocusIndex = null;
+        this._setSafeTraverse(false);
     }
 
     _submenuCloseCheck () {
         this.#submenuCloseTimer = null;
-        if ( ! this.#activeSubmenu ) return;
+        if ( ! this.#activeSubmenu ) {
+            this._setSafeTraverse(false);
+            return;
+        }
 
         // If cursor is currently over the submenu or the parent item, keep open
         const submenu = this.#activeSubmenu.element;
@@ -823,6 +869,8 @@ class PuterContextMenu extends PuterWebComponent {
         const latest = this.#mouseLocs[this.#mouseLocs.length - 1];
         if ( latest ) {
             if ( this._pointInElement(latest, submenu) || this._pointInRect(latest, parentEl.getBoundingClientRect()) ) {
+                // Cursor arrived at submenu / parent — end safe-triangle mode
+                this._setSafeTraverse(false);
                 return;
             }
         }
@@ -834,7 +882,14 @@ class PuterContextMenu extends PuterWebComponent {
             return;
         }
 
+        // Trajectory no longer heading to submenu — end traversal mode
+        this._setSafeTraverse(false);
         this._hideActiveSubmenu();
+    }
+
+    _setSafeTraverse (on) {
+        const menu = this.$('.context-menu');
+        if ( menu ) menu.classList.toggle('safe-traverse', on);
     }
 
     _pointInRect (p, r) {
@@ -911,6 +966,7 @@ class PuterContextMenu extends PuterWebComponent {
             this._setFocusIndex(this.#pendingFocusIndex);
             this.#pendingFocusIndex = null;
         }
+        this._setSafeTraverse(false);
     }
 
     _closeAll () {
@@ -924,7 +980,7 @@ class PuterContextMenu extends PuterWebComponent {
         const wasHidden = this._sheetHidden;
         this._hideActiveSubmenu(false);
         if ( this._outsideClickHandler ) {
-            document.removeEventListener('click', this._outsideClickHandler, true);
+            document.removeEventListener('pointerdown', this._outsideClickHandler, true);
         }
         if ( this._keyHandler ) {
             document.removeEventListener('keydown', this._keyHandler, true);
@@ -953,7 +1009,7 @@ class PuterContextMenu extends PuterWebComponent {
 
     disconnectedCallback () {
         if ( this._outsideClickHandler ) {
-            document.removeEventListener('click', this._outsideClickHandler, true);
+            document.removeEventListener('pointerdown', this._outsideClickHandler, true);
         }
         if ( this._keyHandler ) {
             document.removeEventListener('keydown', this._keyHandler, true);
@@ -979,6 +1035,89 @@ class PuterContextMenu extends PuterWebComponent {
     _escapeAttr (str) {
         if ( ! str ) return '';
         return str.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    /**
+     * Render a keyboard-shortcut string in OS-appropriate form.
+     *
+     *   Mac:  modifiers as glyphs, concatenated  →  ⇧⌘D
+     *   Win/Linux:  text labels joined with '+'   →  Ctrl+Shift+D
+     *
+     * Accepts portable tokens (Mod, Cmd, Ctrl, Alt, Option, Shift, Meta) and
+     * the literal Mac glyphs (⌘ ⌃ ⌥ ⇧). 'Mod' is the recommended portable
+     * name — it maps to Cmd on Mac and Ctrl elsewhere.
+     */
+    _formatShortcut (str) {
+        if ( ! str ) return '';
+        const isMac = PuterContextMenu._isMac();
+
+        // Inflate any glyphs into named tokens so we can re-emit per OS.
+        const normalized = String(str)
+            .replace(/⌘/g, 'Mod+')   // ⌘
+            .replace(/⌃/g, 'Ctrl+')  // ⌃
+            .replace(/⌥/g, 'Alt+')   // ⌥
+            .replace(/⇧/g, 'Shift+'); // ⇧
+
+        const tokens = normalized.split('+').map(t => t.trim()).filter(Boolean);
+
+        const out = tokens.map(t => {
+            switch ( t.toLowerCase() ) {
+                case 'mod':
+                case 'cmd':
+                case 'command':
+                    return isMac ? '⌘' : 'Ctrl';
+                case 'ctrl':
+                case 'control':
+                    return isMac ? '⌃' : 'Ctrl';
+                case 'alt':
+                case 'option':
+                case 'opt':
+                    return isMac ? '⌥' : 'Alt';
+                case 'shift':
+                    return isMac ? '⇧' : 'Shift';
+                case 'meta':
+                case 'super':
+                case 'win':
+                    return isMac ? '⌘' : 'Win';
+                default:
+                    return t;
+            }
+        });
+
+        return isMac ? out.join('') : out.join('+');
+    }
+
+    _getActiveSubmenu () {
+        return this.#activeSubmenu;
+    }
+
+    /**
+     * Returns true if a document-level event targets this menu or any
+     * submenu nested below it. e.target on shadow-DOM-crossing events is
+     * the submenu's host element, so we use contains() on each host in the
+     * chain.
+     */
+    _isEventInChain (e) {
+        const target = e.target;
+        if ( ! target ) return false;
+        if ( this.contains(target) ) return true;
+        let cur = this.#activeSubmenu;
+        while ( cur && cur.element ) {
+            if ( cur.element.contains(target) ) return true;
+            cur = cur.element._getActiveSubmenu
+                ? cur.element._getActiveSubmenu()
+                : null;
+        }
+        return false;
+    }
+
+    static _isMac () {
+        if ( typeof navigator === 'undefined' ) return false;
+        const uaData = navigator.userAgentData;
+        if ( uaData && typeof uaData.platform === 'string' ) {
+            return /mac/i.test(uaData.platform);
+        }
+        return /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent || '');
     }
 }
 
