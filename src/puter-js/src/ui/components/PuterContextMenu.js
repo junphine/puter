@@ -93,14 +93,17 @@ class PuterContextMenu extends PuterWebComponent {
             .menu-item:hover:not(.disabled):not(.divider) .check,
             .menu-item:hover:not(.disabled):not(.divider) .submenu-arrow,
             .menu-item:hover:not(.disabled):not(.divider) .label,
+            .menu-item:hover:not(.disabled):not(.divider) .shortcut,
             .menu-item.focused:not(.disabled):not(.divider) .icon,
             .menu-item.focused:not(.disabled):not(.divider) .check,
             .menu-item.focused:not(.disabled):not(.divider) .submenu-arrow,
             .menu-item.focused:not(.disabled):not(.divider) .label,
+            .menu-item.focused:not(.disabled):not(.divider) .shortcut,
             .menu-item.has-open-submenu .icon,
             .menu-item.has-open-submenu .check,
             .menu-item.has-open-submenu .submenu-arrow,
-            .menu-item.has-open-submenu .label {
+            .menu-item.has-open-submenu .label,
+            .menu-item.has-open-submenu .shortcut {
                 color: white;
             }
             .menu-item:hover:not(.disabled):not(.divider) .icon svg,
@@ -127,6 +130,9 @@ class PuterContextMenu extends PuterWebComponent {
             .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .submenu-arrow,
             .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .label {
                 color: #333;
+            }
+            .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .shortcut {
+                color: #999;
             }
             .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon svg {
                 filter: none;

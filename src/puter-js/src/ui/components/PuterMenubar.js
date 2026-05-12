@@ -105,6 +105,9 @@ class PuterMenubar extends PuterWebComponent {
         if ( this._keyUpHandler ) {
             document.removeEventListener('keyup', this._keyUpHandler, true);
         }
+        if ( this._docPointerDownHandler ) {
+            document.removeEventListener('pointerdown', this._docPointerDownHandler, true);
+        }
 
         const buttons = this.$$('.menu-button');
         buttons.forEach((btn) => {
@@ -132,19 +135,6 @@ class PuterMenubar extends PuterWebComponent {
                 this._openDropdown(btn, item);
             });
 
-            // pointerdown on this button while it owns the open dropdown:
-            // mark it so the outside-pointerdown close (about to fire) and
-            // the trailing click don't reopen.
-            btn.addEventListener('pointerdown', () => {
-                if ( this.#activeButtonEl === btn ) {
-                    this._suppressClickFor = btn;
-                    clearTimeout(this._suppressClickTimer);
-                    this._suppressClickTimer = setTimeout(() => {
-                        this._suppressClickFor = null;
-                    }, 400);
-                }
-            });
-
             // Hover-switch when a dropdown is already open
             btn.addEventListener('mouseenter', () => {
                 if ( this.#activeDropdown && this.#activeButtonEl !== btn ) {
@@ -158,6 +148,26 @@ class PuterMenubar extends PuterWebComponent {
         this._keyUpHandler = (e) => this._onGlobalKeyUp(e);
         document.addEventListener('keydown', this._keyHandler, true);
         document.addEventListener('keyup', this._keyUpHandler, true);
+
+        // Capture-phase pointerdown on document. The open context menu also
+        // listens in capture for outside-pointerdown to close itself; that
+        // listener registers later (when the dropdown opens) so ours runs
+        // first. If the press lands on the currently-active button, mark it
+        // so the trailing click — which would otherwise reopen the just-closed
+        // dropdown — is treated as a toggle-close. Uses composedPath because
+        // the button lives inside this shadow root.
+        this._docPointerDownHandler = (e) => {
+            if ( ! this.#activeButtonEl ) return;
+            const path = typeof e.composedPath === 'function' ? e.composedPath() : [];
+            if ( path.includes(this.#activeButtonEl) ) {
+                this._suppressClickFor = this.#activeButtonEl;
+                clearTimeout(this._suppressClickTimer);
+                this._suppressClickTimer = setTimeout(() => {
+                    this._suppressClickFor = null;
+                }, 400);
+            }
+        };
+        document.addEventListener('pointerdown', this._docPointerDownHandler, true);
     }
 
     _onGlobalKeyDown (e) {
@@ -356,6 +366,9 @@ class PuterMenubar extends PuterWebComponent {
         }
         if ( this._keyUpHandler ) {
             document.removeEventListener('keyup', this._keyUpHandler, true);
+        }
+        if ( this._docPointerDownHandler ) {
+            document.removeEventListener('pointerdown', this._docPointerDownHandler, true);
         }
     }
 
