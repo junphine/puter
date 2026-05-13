@@ -89,7 +89,11 @@ class PuterContextMenu extends PuterWebComponent {
                 border-radius: 4px;
             }
 
-            /* Active item turns all children white */
+            /* Active item turns all children white.
+               For .has-open-submenu the :hover branch above already covers
+               the hovered case; in the non-hovered grey state we want the
+               children to keep their default colors, so we don't include
+               .has-open-submenu here. */
             .menu-item:hover:not(.disabled):not(.divider) .icon,
             .menu-item:hover:not(.disabled):not(.divider) .check,
             .menu-item:hover:not(.disabled):not(.divider) .submenu-arrow,
@@ -99,22 +103,15 @@ class PuterContextMenu extends PuterWebComponent {
             .menu-item.focused:not(.disabled):not(.divider) .check,
             .menu-item.focused:not(.disabled):not(.divider) .submenu-arrow,
             .menu-item.focused:not(.disabled):not(.divider) .label,
-            .menu-item.focused:not(.disabled):not(.divider) .shortcut,
-            .menu-item.has-open-submenu .icon,
-            .menu-item.has-open-submenu .check,
-            .menu-item.has-open-submenu .submenu-arrow,
-            .menu-item.has-open-submenu .label,
-            .menu-item.has-open-submenu .shortcut {
+            .menu-item.focused:not(.disabled):not(.divider) .shortcut {
                 color: white;
             }
             .menu-item:hover:not(.disabled):not(.divider) .icon svg,
-            .menu-item.focused:not(.disabled):not(.divider) .icon svg,
-            .menu-item.has-open-submenu .icon svg {
+            .menu-item.focused:not(.disabled):not(.divider) .icon svg {
                 filter: brightness(0) invert(1);
             }
             .menu-item:hover:not(.disabled):not(.divider) .icon img,
-            .menu-item.focused:not(.disabled):not(.divider) .icon img,
-            .menu-item.has-open-submenu .icon img {
+            .menu-item.focused:not(.disabled):not(.divider) .icon img {
                 filter: brightness(0) invert(1);
             }
 
@@ -586,8 +583,20 @@ class PuterContextMenu extends PuterWebComponent {
         // previously-focused item — the cursor has clearly moved past it.
         // It should also close any submenu opened from an item above, so
         // the parent's .has-open-submenu highlight goes away too.
+        // Exception: if the cursor is on a diagonal path toward the open
+        // submenu, treat the divider like any other safe-traverse cell so
+        // we don't tear down the submenu mid-drag.
         this.$$('.menu-item.divider').forEach((el) => {
             el.addEventListener('mouseenter', () => {
+                if ( this.#activeSubmenu && this._isMouseHeadingToSubmenu(this.#activeSubmenu.element) ) {
+                    this._setSafeTraverse(true);
+                    if ( this.#submenuCloseTimer ) {
+                        clearTimeout(this.#submenuCloseTimer);
+                        this.#submenuCloseTimer = null;
+                    }
+                    this.#submenuCloseTimer = setTimeout(() => this._submenuCloseCheck(), 100);
+                    return;
+                }
                 this._setSafeTraverse(false);
                 this._clearFocus();
                 clearTimeout(this.#submenuTimeout);
@@ -912,6 +921,11 @@ class PuterContextMenu extends PuterWebComponent {
         this._cancelSubmenuClose();
 
         parentEl.classList.add('has-open-submenu');
+        // The parent now "owns" an open submenu; drop the .focused class so
+        // it paints in the dim has-open-submenu state instead of the bright
+        // focused/hover blue. :hover still keeps it blue when the cursor is
+        // directly over it. #focusedIndex is preserved for ArrowLeft restore.
+        parentEl.classList.remove('focused');
 
         const submenu = document.createElement('puter-context-menu');
         submenu.setAttribute('data-submenu', '');
