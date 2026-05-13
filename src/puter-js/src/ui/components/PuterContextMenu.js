@@ -709,9 +709,24 @@ class PuterContextMenu extends PuterWebComponent {
             case 'ArrowDown':
                 this._moveFocus(+1);
                 return true;
-            case 'ArrowUp':
+            case 'ArrowUp': {
+                // Root dropdown: ArrowUp on the first focusable item bubbles
+                // to the menubar, which closes the dropdown and re-focuses
+                // the parent menubar button.
+                if ( ! this._parentMenu ) {
+                    const f = this._focusableIndices();
+                    if ( f.length && this.#focusedIndex === f[0] ) {
+                        this.dispatchEvent(new CustomEvent('puter-menu-navigate', {
+                            detail: { direction: 'up' },
+                            bubbles: true,
+                            composed: true,
+                        }));
+                        return true;
+                    }
+                }
                 this._moveFocus(-1);
                 return true;
+            }
             case 'Home': {
                 const f = this._focusableIndices();
                 if ( f.length ) this._setFocusIndex(f[0]);
@@ -822,14 +837,21 @@ class PuterContextMenu extends PuterWebComponent {
         if ( ! el ) return false;
         clearTimeout(this.#submenuTimeout);
         this._cancelSubmenuClose();
-        this._showSubmenu(el, item.items);
-        // Focus first item in submenu, and start it in keyboard-nav mode so a
-        // stale cursor position doesn't fight the keyboard focus.
+        // Don't re-open an already-open submenu for this parent — it would
+        // wipe the user's focused item inside it. We only auto-focus the
+        // first sub-item when the submenu is freshly opened by this call.
+        const wasNewlyOpened = !this.#activeSubmenu || this.#activeSubmenu.parentEl !== el;
+        if ( wasNewlyOpened ) {
+            this._showSubmenu(el, item.items);
+        }
         requestAnimationFrame(() => {
             const sub = this.#activeSubmenu && this.#activeSubmenu.element;
-            if ( sub ) {
+            if ( ! sub ) return;
+            if ( wasNewlyOpened ) {
                 const f = sub._focusableIndices();
                 if ( f.length ) sub._setFocusIndex(f[0]);
+            }
+            if ( typeof sub._setKeyboardNav === 'function' ) {
                 sub._setKeyboardNav(true);
             }
         });
