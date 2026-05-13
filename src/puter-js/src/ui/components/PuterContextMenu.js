@@ -345,99 +345,100 @@ class PuterContextMenu extends PuterWebComponent {
                 height: 20px;
             }
 
-            @media (prefers-color-scheme: dark) {
-                .context-menu {
-                    background: #2d2d2d;
-                    background-color: rgb(45 45 45 / 94%);
-                    color: #e6e6e6;
-                    border-color: #00000080;
-                    box-shadow: 0px 0px 15px #000000aa;
-                }
-                .menu-item {
-                    color: #e6e6e6;
-                }
-                /* Inactive items: icon/check/shortcut/arrow tones */
-                .icon,
-                .check {
-                    color: #e6e6e6;
-                }
-                .submenu-arrow {
-                    color: #b0b0b0;
-                }
-                .shortcut {
-                    color: #888;
-                }
-                .icon img {
-                    filter: drop-shadow(0px 0px 0.3px rgb(230, 230, 230));
-                }
-                /* Inactive icon SVGs use currentColor already; nothing to invert */
+            /* Dark theme — applied when system prefers dark and no light
+               override is set, or when theme="dark" is forced. The base
+               class toggles .puter-theme-dark on the host accordingly. */
+            :host(.puter-theme-dark) .context-menu {
+                background: #2d2d2d;
+                background-color: rgb(45 45 45 / 94%);
+                color: #e6e6e6;
+                border-color: #00000080;
+                box-shadow: 0px 0px 15px #000000aa;
+            }
+            :host(.puter-theme-dark) .menu-item {
+                color: #e6e6e6;
+            }
+            /* Inactive items: icon/check/shortcut/arrow tones */
+            :host(.puter-theme-dark) .icon,
+            :host(.puter-theme-dark) .check {
+                color: #e6e6e6;
+            }
+            :host(.puter-theme-dark) .submenu-arrow {
+                color: #b0b0b0;
+            }
+            :host(.puter-theme-dark) .shortcut {
+                color: #888;
+            }
+            :host(.puter-theme-dark) .icon img {
+                filter: drop-shadow(0px 0px 0.3px rgb(230, 230, 230));
+            }
+            /* Inactive icon SVGs use currentColor already; nothing to invert */
 
-                /* Safe-triangle / keyboard-nav: non-active hover restored colors should match dark */
-                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider),
-                .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) {
-                    color: #e6e6e6;
-                }
-                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon,
-                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .check,
-                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .submenu-arrow,
-                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .label,
-                .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon,
-                .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .check,
-                .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .submenu-arrow,
-                .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .label {
-                    color: #e6e6e6;
-                }
-                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .shortcut,
-                .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .shortcut {
-                    color: #888;
-                }
-                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon img,
-                .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon img {
-                    filter: drop-shadow(0px 0px 0.3px rgb(230, 230, 230));
-                }
+            /* Safe-triangle / keyboard-nav: non-active hover restored colors should match dark */
+            :host(.puter-theme-dark) .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider),
+            :host(.puter-theme-dark) .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) {
+                color: #e6e6e6;
+            }
+            :host(.puter-theme-dark) .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon,
+            :host(.puter-theme-dark) .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .check,
+            :host(.puter-theme-dark) .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .submenu-arrow,
+            :host(.puter-theme-dark) .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .label,
+            :host(.puter-theme-dark) .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon,
+            :host(.puter-theme-dark) .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .check,
+            :host(.puter-theme-dark) .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .submenu-arrow,
+            :host(.puter-theme-dark) .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .label {
+                color: #e6e6e6;
+            }
+            :host(.puter-theme-dark) .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .shortcut,
+            :host(.puter-theme-dark) .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .shortcut {
+                color: #888;
+            }
+            :host(.puter-theme-dark) .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon img,
+            :host(.puter-theme-dark) .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon img {
+                filter: drop-shadow(0px 0px 0.3px rgb(230, 230, 230));
+            }
 
-                /* Submenu-open parent (no hover): subtle dark highlight */
-                .menu-item.has-open-submenu:not(:hover) {
-                    background-color: #3f3f3f;
-                    color: #e6e6e6;
-                }
-                .menu-item.has-open-submenu:not(:hover) .icon,
-                .menu-item.has-open-submenu:not(:hover) .icon svg,
-                .menu-item.has-open-submenu:not(:hover) .icon img {
-                    color: #e6e6e6;
-                }
+            /* Submenu-open parent (no hover): subtle dark highlight */
+            :host(.puter-theme-dark) .menu-item.has-open-submenu:not(:hover) {
+                background-color: #3f3f3f;
+                color: #e6e6e6;
+            }
+            :host(.puter-theme-dark) .menu-item.has-open-submenu:not(:hover) .icon,
+            :host(.puter-theme-dark) .menu-item.has-open-submenu:not(:hover) .icon svg,
+            :host(.puter-theme-dark) .menu-item.has-open-submenu:not(:hover) .icon img {
+                color: #e6e6e6;
+            }
 
-                /* Danger items */
-                .menu-item.danger,
-                .menu-item.danger .icon {
-                    color: #ff7b72;
-                }
+            /* Danger items */
+            :host(.puter-theme-dark) .menu-item.danger,
+            :host(.puter-theme-dark) .menu-item.danger .icon {
+                color: #ff7b72;
+            }
 
-                /* Divider */
-                .divider hr {
-                    background: #444;
-                }
+            /* Divider */
+            :host(.puter-theme-dark) .divider hr {
+                background: #444;
+            }
 
-                /* Sheet mode (mobile) */
-                :host(.sheet-mode) .context-menu {
-                    background-color: rgb(40 40 40 / 96%);
-                    box-shadow: 0 -6px 24px rgba(0, 0, 0, 0.45);
-                }
-                :host(.sheet-mode) .menu-item:hover:not(.disabled):not(.divider) {
-                    background-color: rgba(0, 122, 255, 0.22);
-                }
-                :host(.sheet-mode) .menu-item:active:not(.disabled):not(.divider) {
-                    background-color: rgba(0, 122, 255, 0.35);
-                }
-                :host(.sheet-mode) .menu-item:hover:not(.disabled):not(.divider) .label,
-                :host(.sheet-mode) .menu-item:hover:not(.disabled):not(.divider) .icon,
-                :host(.sheet-mode) .menu-item:active:not(.disabled):not(.divider) .label,
-                :host(.sheet-mode) .menu-item:active:not(.disabled):not(.divider) .icon {
-                    color: #e6e6e6;
-                }
-                :host(.sheet-mode) .divider hr {
-                    background: rgba(255, 255, 255, 0.15);
-                }
+            /* Sheet mode (mobile) */
+            :host(.puter-theme-dark.sheet-mode) .context-menu {
+                background-color: rgb(40 40 40 / 96%);
+                box-shadow: 0 -6px 24px rgba(0, 0, 0, 0.45);
+            }
+            :host(.puter-theme-dark.sheet-mode) .menu-item:hover:not(.disabled):not(.divider) {
+                background-color: rgba(0, 122, 255, 0.22);
+            }
+            :host(.puter-theme-dark.sheet-mode) .menu-item:active:not(.disabled):not(.divider) {
+                background-color: rgba(0, 122, 255, 0.35);
+            }
+            :host(.puter-theme-dark.sheet-mode) .menu-item:hover:not(.disabled):not(.divider) .label,
+            :host(.puter-theme-dark.sheet-mode) .menu-item:hover:not(.disabled):not(.divider) .icon,
+            :host(.puter-theme-dark.sheet-mode) .menu-item:active:not(.disabled):not(.divider) .label,
+            :host(.puter-theme-dark.sheet-mode) .menu-item:active:not(.disabled):not(.divider) .icon {
+                color: #e6e6e6;
+            }
+            :host(.puter-theme-dark.sheet-mode) .divider hr {
+                background: rgba(255, 255, 255, 0.15);
             }
         `;
     }
@@ -930,6 +931,9 @@ class PuterContextMenu extends PuterWebComponent {
         const submenu = document.createElement('puter-context-menu');
         submenu.setAttribute('data-submenu', '');
         submenu.setAttribute('data-parent-managed', '');
+        // Forward any forced theme so the submenu paints in the same theme.
+        const themeAttr = this.getAttribute('theme');
+        if ( themeAttr ) submenu.setAttribute('theme', themeAttr);
         submenu.items = items;
         submenu._parentMenu = this;
         submenu._parentItemEl = parentEl;
@@ -1184,6 +1188,7 @@ class PuterContextMenu extends PuterWebComponent {
     }
 
     disconnectedCallback () {
+        super.disconnectedCallback();
         if ( this._outsideClickHandler ) {
             document.removeEventListener('pointerdown', this._outsideClickHandler, true);
         }

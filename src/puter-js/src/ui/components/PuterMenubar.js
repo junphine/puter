@@ -91,22 +91,23 @@ class PuterMenubar extends PuterWebComponent {
                     flex-shrink: 0;
                 }
             }
-            @media (prefers-color-scheme: dark) {
-                .menubar {
-                    background-color: #2a2a2a;
-                    border-bottom-color: #3a3a3a;
-                }
-                .menu-button {
-                    color: #e6e6e6;
-                }
-                .menu-button:hover,
-                .menu-button.active,
-                .menu-button.focused {
-                    background-color: #3a3a3a;
-                }
-                .menubar.keyboard-nav .menu-button:hover:not(.focused):not(.active) {
-                    background-color: transparent;
-                }
+            /* Dark theme — applied when system prefers dark and no light
+               override is set, or when theme="dark" is forced. The base
+               class toggles .puter-theme-dark on the host accordingly. */
+            :host(.puter-theme-dark) .menubar {
+                background-color: #2a2a2a;
+                border-bottom-color: #3a3a3a;
+            }
+            :host(.puter-theme-dark) .menu-button {
+                color: #e6e6e6;
+            }
+            :host(.puter-theme-dark) .menu-button:hover,
+            :host(.puter-theme-dark) .menu-button.active,
+            :host(.puter-theme-dark) .menu-button.focused {
+                background-color: #3a3a3a;
+            }
+            :host(.puter-theme-dark) .menubar.keyboard-nav .menu-button:hover:not(.focused):not(.active) {
+                background-color: transparent;
             }
         `;
     }
@@ -352,6 +353,9 @@ class PuterMenubar extends PuterWebComponent {
         const rect = buttonEl.getBoundingClientRect();
         const dropdown = document.createElement('puter-context-menu');
         dropdown.setAttribute('data-submenu', ''); // skip mobile sheet behavior
+        // Forward any forced theme so the dropdown paints in the same theme.
+        const themeAttr = this.getAttribute('theme');
+        if ( themeAttr ) dropdown.setAttribute('theme', themeAttr);
         dropdown.items = item.items;
         dropdown.setAttribute('x', String(rect.left));
         dropdown.setAttribute('y', String(rect.bottom));
@@ -410,6 +414,7 @@ class PuterMenubar extends PuterWebComponent {
     }
 
     disconnectedCallback () {
+        super.disconnectedCallback();
         this._closeDropdown();
         clearTimeout(this._suppressClickTimer);
         this._suppressClickFor = null;
