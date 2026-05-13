@@ -188,7 +188,6 @@ class PuterContextMenu extends PuterWebComponent {
                 padding-bottom: 5px;
                 cursor: default;
                 height: auto;
-                pointer-events: none;
             }
             .divider hr {
                 border: none;
@@ -582,6 +581,20 @@ class PuterContextMenu extends PuterWebComponent {
             document.removeEventListener('mousemove', this.#mouseTracker);
             this.#mouseTracker = null;
         }
+
+        // Hovering a separator should drop the focus highlight from the
+        // previously-focused item — the cursor has clearly moved past it.
+        // It should also close any submenu opened from an item above, so
+        // the parent's .has-open-submenu highlight goes away too.
+        this.$$('.menu-item.divider').forEach((el) => {
+            el.addEventListener('mouseenter', () => {
+                this._setSafeTraverse(false);
+                this._clearFocus();
+                clearTimeout(this.#submenuTimeout);
+                this._cancelSubmenuClose();
+                this._hideActiveSubmenu();
+            });
+        });
 
         const menuItems = this.$$('.menu-item:not(.divider):not(.disabled)');
 
