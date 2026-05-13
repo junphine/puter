@@ -305,6 +305,9 @@ class PuterMenubar extends PuterWebComponent {
                 if ( dd && typeof dd._focusableIndices === 'function' ) {
                     const f = dd._focusableIndices();
                     if ( f.length ) dd._setFocusIndex(f[0]);
+                    if ( typeof dd._setKeyboardNav === 'function' ) {
+                        dd._setKeyboardNav(true);
+                    }
                 }
             });
         }

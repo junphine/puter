@@ -120,25 +120,37 @@ class PuterContextMenu extends PuterWebComponent {
 
             /* Safe-triangle: while the cursor traces a diagonal path toward
                an open submenu, suppress :hover highlight on intermediate
-               items so they don't flash blue. .focused and .has-open-submenu
-               (managed by JS) still highlight normally. */
-            .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) {
+               items so they don't flash blue.
+               Keyboard-nav: after a keyboard navigation, suppress :hover on
+               the (now stale) item the mouse is still resting on so only
+               the keyboard-focused item highlights. Cleared on next
+               mousemove. .focused and .has-open-submenu (managed by JS)
+               still highlight normally. */
+            .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider),
+            .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) {
                 background-color: transparent;
                 color: #333;
             }
             .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon,
             .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .check,
             .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .submenu-arrow,
-            .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .label {
+            .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .label,
+            .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon,
+            .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .check,
+            .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .submenu-arrow,
+            .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .label {
                 color: #333;
             }
-            .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .shortcut {
+            .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .shortcut,
+            .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .shortcut {
                 color: #999;
             }
-            .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon svg {
+            .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon svg,
+            .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon svg {
                 filter: none;
             }
-            .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon img {
+            .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon img,
+            .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon img {
                 filter: drop-shadow(0px 0px 0.3px rgb(51, 51, 51));
             }
 
@@ -364,20 +376,27 @@ class PuterContextMenu extends PuterWebComponent {
                 }
                 /* Inactive icon SVGs use currentColor already; nothing to invert */
 
-                /* Safe-triangle: non-active hover restored colors should match dark */
-                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) {
+                /* Safe-triangle / keyboard-nav: non-active hover restored colors should match dark */
+                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider),
+                .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) {
                     color: #e6e6e6;
                 }
                 .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon,
                 .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .check,
                 .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .submenu-arrow,
-                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .label {
+                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .label,
+                .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon,
+                .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .check,
+                .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .submenu-arrow,
+                .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .label {
                     color: #e6e6e6;
                 }
-                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .shortcut {
+                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .shortcut,
+                .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .shortcut {
                     color: #888;
                 }
-                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon img {
+                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon img,
+                .context-menu.keyboard-nav .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon img {
                     filter: drop-shadow(0px 0px 0.3px rgb(230, 230, 230));
                 }
 
@@ -654,10 +673,12 @@ class PuterContextMenu extends PuterWebComponent {
             document.addEventListener('pointerdown', this._outsideClickHandler, true);
         }, 0);
 
-        // Track mouse for safe-triangle submenu hover
+        // Track mouse for safe-triangle submenu hover. Also exits
+        // keyboard-nav mode: once the cursor moves, :hover should win again.
         this.#mouseTracker = (e) => {
             this.#mouseLocs.push({ x: e.clientX, y: e.clientY });
             if ( this.#mouseLocs.length > 3 ) this.#mouseLocs.shift();
+            this._setKeyboardNav(false);
         };
         document.addEventListener('mousemove', this.#mouseTracker);
 
@@ -666,6 +687,10 @@ class PuterContextMenu extends PuterWebComponent {
             if ( this.#activeSubmenu ) return; // let the deeper submenu handle
             const consumed = this._handleKey(e);
             if ( consumed ) {
+                // A handled key (nav, typeahead, etc.) means the user is
+                // driving by keyboard — suppress any stale :hover until the
+                // mouse next moves.
+                this._setKeyboardNav(true);
                 e.preventDefault();
                 e.stopImmediatePropagation();
             }
@@ -798,12 +823,14 @@ class PuterContextMenu extends PuterWebComponent {
         clearTimeout(this.#submenuTimeout);
         this._cancelSubmenuClose();
         this._showSubmenu(el, item.items);
-        // Focus first item in submenu
+        // Focus first item in submenu, and start it in keyboard-nav mode so a
+        // stale cursor position doesn't fight the keyboard focus.
         requestAnimationFrame(() => {
             const sub = this.#activeSubmenu && this.#activeSubmenu.element;
             if ( sub ) {
                 const f = sub._focusableIndices();
                 if ( f.length ) sub._setFocusIndex(f[0]);
+                sub._setKeyboardNav(true);
             }
         });
         return true;
@@ -985,6 +1012,11 @@ class PuterContextMenu extends PuterWebComponent {
     _setSafeTraverse (on) {
         const menu = this.$('.context-menu');
         if ( menu ) menu.classList.toggle('safe-traverse', on);
+    }
+
+    _setKeyboardNav (on) {
+        const menu = this.$('.context-menu');
+        if ( menu ) menu.classList.toggle('keyboard-nav', on);
     }
 
     _pointInRect (p, r) {
