@@ -47,15 +47,16 @@ class PuterContextMenu extends PuterWebComponent {
                 font-family: sans-serif;
                 background: #FFF;
                 color: #333;
-                border-radius: 2px;
+                border-radius: 4px;
                 padding: 3px 0;
                 min-width: 200px;
                 background-color: rgb(255 255 255 / 92%);
                 backdrop-filter: blur(3px);
                 border: 1px solid #e6e4e466;
-                box-shadow: 0px 0px 15px #00000066;
-                padding-left: 6px;
-                padding-right: 6px;
+                box-shadow: 0px 3px 10px #00000044;
+                margin-top: 5px;
+                padding-left: 4px;
+                padding-right: 4px;
                 padding-top: 4px;
                 padding-bottom: 4px;
                 user-select: none;
@@ -334,6 +335,94 @@ class PuterContextMenu extends PuterWebComponent {
             :host(.sheet-mode) .icon img {
                 width: 20px;
                 height: 20px;
+            }
+
+            @media (prefers-color-scheme: dark) {
+                .context-menu {
+                    background: #2d2d2d;
+                    background-color: rgb(45 45 45 / 94%);
+                    color: #e6e6e6;
+                    border-color: #00000080;
+                    box-shadow: 0px 0px 15px #000000aa;
+                }
+                .menu-item {
+                    color: #e6e6e6;
+                }
+                /* Inactive items: icon/check/shortcut/arrow tones */
+                .icon,
+                .check {
+                    color: #e6e6e6;
+                }
+                .submenu-arrow {
+                    color: #b0b0b0;
+                }
+                .shortcut {
+                    color: #888;
+                }
+                .icon img {
+                    filter: drop-shadow(0px 0px 0.3px rgb(230, 230, 230));
+                }
+                /* Inactive icon SVGs use currentColor already; nothing to invert */
+
+                /* Safe-triangle: non-active hover restored colors should match dark */
+                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) {
+                    color: #e6e6e6;
+                }
+                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon,
+                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .check,
+                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .submenu-arrow,
+                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .label {
+                    color: #e6e6e6;
+                }
+                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .shortcut {
+                    color: #888;
+                }
+                .context-menu.safe-traverse .menu-item:hover:not(.has-open-submenu):not(.focused):not(.disabled):not(.divider) .icon img {
+                    filter: drop-shadow(0px 0px 0.3px rgb(230, 230, 230));
+                }
+
+                /* Submenu-open parent (no hover): subtle dark highlight */
+                .menu-item.has-open-submenu:not(:hover) {
+                    background-color: #3f3f3f;
+                    color: #e6e6e6;
+                }
+                .menu-item.has-open-submenu:not(:hover) .icon,
+                .menu-item.has-open-submenu:not(:hover) .icon svg,
+                .menu-item.has-open-submenu:not(:hover) .icon img {
+                    color: #e6e6e6;
+                }
+
+                /* Danger items */
+                .menu-item.danger,
+                .menu-item.danger .icon {
+                    color: #ff7b72;
+                }
+
+                /* Divider */
+                .divider hr {
+                    background: #444;
+                }
+
+                /* Sheet mode (mobile) */
+                :host(.sheet-mode) .context-menu {
+                    background-color: rgb(40 40 40 / 96%);
+                    box-shadow: 0 -6px 24px rgba(0, 0, 0, 0.45);
+                }
+                :host(.sheet-mode) .menu-item:hover:not(.disabled):not(.divider) {
+                    background-color: rgba(0, 122, 255, 0.22);
+                }
+                :host(.sheet-mode) .menu-item:active:not(.disabled):not(.divider) {
+                    background-color: rgba(0, 122, 255, 0.35);
+                }
+                :host(.sheet-mode) .menu-item:hover:not(.disabled):not(.divider) .label,
+                :host(.sheet-mode) .menu-item:hover:not(.disabled):not(.divider) .icon,
+                :host(.sheet-mode) .menu-item:active:not(.disabled):not(.divider) .label,
+                :host(.sheet-mode) .menu-item:active:not(.disabled):not(.divider) .icon {
+                    color: #e6e6e6;
+                }
+                :host(.sheet-mode) .divider hr {
+                    background: rgba(255, 255, 255, 0.15);
+                }
             }
         `;
     }

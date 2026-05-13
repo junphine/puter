@@ -86,6 +86,20 @@ class PuterMenubar extends PuterWebComponent {
                     flex-shrink: 0;
                 }
             }
+            @media (prefers-color-scheme: dark) {
+                .menubar {
+                    background-color: #2a2a2a;
+                    border-bottom-color: #3a3a3a;
+                }
+                .menu-button {
+                    color: #e6e6e6;
+                }
+                .menu-button:hover,
+                .menu-button.active,
+                .menu-button.focused {
+                    background-color: #3a3a3a;
+                }
+            }
         `;
     }
 

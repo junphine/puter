@@ -175,6 +175,31 @@ class PuterNotification extends PuterWebComponent {
                     width: auto;
                 }
             }
+            @media (prefers-color-scheme: dark) {
+                .notification {
+                    background: #2d2d2dcd;
+                    border-color: #3a3a3a;
+                    box-shadow: 0px 0px 17px -6px #000;
+                }
+                .close-btn {
+                    background: #3a3a3a;
+                    color: #ccc;
+                    filter: drop-shadow(0px 0px 0.5px rgb(230, 230, 230));
+                }
+                .close-btn:hover {
+                    background: #4a4a4a;
+                    color: #fff;
+                }
+                .icon-area {
+                    filter: drop-shadow(0px 0px 0.5px rgb(230, 230, 230));
+                }
+                .title {
+                    color: #e6e6e6;
+                }
+                .text {
+                    color: #b0b0b0;
+                }
+            }
         `;
     }
 

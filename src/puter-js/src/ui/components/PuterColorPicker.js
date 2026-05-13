@@ -176,6 +176,48 @@ class PuterColorPicker extends PuterWebComponent {
                     flex: 1;
                 }
             }
+            @media (prefers-color-scheme: dark) {
+                .picker-body {
+                    background-color: rgba(40, 44, 52, .95);
+                    color: #e6e6e6;
+                    box-shadow: 0px 0px 15px #000000aa;
+                }
+                .preview {
+                    border-color: #555;
+                }
+                .header-label {
+                    color: #aaa;
+                }
+                .hex-input {
+                    background-color: #1f1f1f;
+                    border-color: #555;
+                    color: #e6e6e6;
+                }
+                .native-color-row {
+                    background: rgba(255, 255, 255, 0.05);
+                    border-color: #555;
+                }
+                .native-color-row label {
+                    color: #aaa;
+                }
+                input[type="color"] {
+                    border-color: #555;
+                }
+                .swatch {
+                    border-color: rgba(255, 255, 255, 0.1);
+                }
+                .btn {
+                    color: #e6e6e6;
+                    border-color: #555;
+                    background: linear-gradient(#4a4a4a, #3a3a3a);
+                    box-shadow: inset 0px 1px 0px rgb(255 255 255 / 8%), 0 1px 2px rgb(0 0 0 / 25%);
+                }
+                .btn:active {
+                    background-color: #333;
+                    border-color: #444;
+                    color: #999;
+                }
+            }
         `;
     }
 
