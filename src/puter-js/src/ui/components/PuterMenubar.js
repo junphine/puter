@@ -68,6 +68,11 @@ class PuterMenubar extends PuterWebComponent {
             .menu-button.focused {
                 background-color: #e2e2e2;
             }
+            /* Suppress stale :hover during keyboard nav so only the focused
+               button highlights. Cleared on the next mousemove. */
+            .menubar.keyboard-nav .menu-button:hover:not(.focused):not(.active) {
+                background-color: transparent;
+            }
             .menu-button:focus { outline: none; }
             @media (max-width: 480px) {
                 .menubar {
@@ -85,6 +90,24 @@ class PuterMenubar extends PuterWebComponent {
                     padding: 6px 12px;
                     flex-shrink: 0;
                 }
+            }
+            /* Dark theme — applied when system prefers dark and no light
+               override is set, or when theme="dark" is forced. The base
+               class toggles .puter-theme-dark on the host accordingly. */
+            :host(.puter-theme-dark) .menubar {
+                background-color: #2a2a2a;
+                border-bottom-color: #3a3a3a;
+            }
+            :host(.puter-theme-dark) .menu-button {
+                color: #e6e6e6;
+            }
+            :host(.puter-theme-dark) .menu-button:hover,
+            :host(.puter-theme-dark) .menu-button.active,
+            :host(.puter-theme-dark) .menu-button.focused {
+                background-color: #3a3a3a;
+            }
+            :host(.puter-theme-dark) .menubar.keyboard-nav .menu-button:hover:not(.focused):not(.active) {
+                background-color: transparent;
             }
         `;
     }
@@ -107,6 +130,9 @@ class PuterMenubar extends PuterWebComponent {
         }
         if ( this._docPointerDownHandler ) {
             document.removeEventListener('pointerdown', this._docPointerDownHandler, true);
+        }
+        if ( this._mouseMoveHandler ) {
+            document.removeEventListener('mousemove', this._mouseMoveHandler);
         }
 
         const buttons = this.$$('.menu-button');
@@ -168,6 +194,11 @@ class PuterMenubar extends PuterWebComponent {
             }
         };
         document.addEventListener('pointerdown', this._docPointerDownHandler, true);
+
+        // Once the user actually moves the mouse, exit keyboard-nav mode so
+        // :hover styling on menubar buttons works normally again.
+        this._mouseMoveHandler = () => this._setKeyboardNav(false);
+        document.addEventListener('mousemove', this._mouseMoveHandler);
     }
 
     _onGlobalKeyDown (e) {
@@ -244,12 +275,14 @@ class PuterMenubar extends PuterWebComponent {
         this.#menubarActive = true;
         this.#focusedIndex = 0;
         this._renderButtonFocus();
+        this._setKeyboardNav(true);
     }
 
     _deactivateMenubar () {
         this.#menubarActive = false;
         this.#focusedIndex = null;
         this._renderButtonFocus();
+        this._setKeyboardNav(false);
     }
 
     _renderButtonFocus () {
@@ -259,6 +292,11 @@ class PuterMenubar extends PuterWebComponent {
         });
     }
 
+    _setKeyboardNav (on) {
+        const menubar = this.$('.menubar');
+        if ( menubar ) menubar.classList.toggle('keyboard-nav', on);
+    }
+
     _moveButtonFocus (delta, { swapDropdown = true } = {}) {
         if ( ! this.#items.length ) return;
         const n = this.#items.length;
@@ -266,6 +304,7 @@ class PuterMenubar extends PuterWebComponent {
         const next = (cur + delta + n) % n;
         this.#focusedIndex = next;
         this._renderButtonFocus();
+        this._setKeyboardNav(true);
 
         // If a dropdown is already open, swap to the new button's dropdown
         if ( swapDropdown && this.#activeDropdown ) {
@@ -291,6 +330,9 @@ class PuterMenubar extends PuterWebComponent {
                 if ( dd && typeof dd._focusableIndices === 'function' ) {
                     const f = dd._focusableIndices();
                     if ( f.length ) dd._setFocusIndex(f[0]);
+                    if ( typeof dd._setKeyboardNav === 'function' ) {
+                        dd._setKeyboardNav(true);
+                    }
                 }
             });
         }
@@ -311,6 +353,9 @@ class PuterMenubar extends PuterWebComponent {
         const rect = buttonEl.getBoundingClientRect();
         const dropdown = document.createElement('puter-context-menu');
         dropdown.setAttribute('data-submenu', ''); // skip mobile sheet behavior
+        // Forward any forced theme so the dropdown paints in the same theme.
+        const themeAttr = this.getAttribute('theme');
+        if ( themeAttr ) dropdown.setAttribute('theme', themeAttr);
         dropdown.items = item.items;
         dropdown.setAttribute('x', String(rect.left));
         dropdown.setAttribute('y', String(rect.bottom));
@@ -331,12 +376,23 @@ class PuterMenubar extends PuterWebComponent {
                 this._deactivateMenubar();
             }
         });
-        // Keyboard navigate request bubbling from the context menu
+        // Keyboard navigate request bubbling from the context menu.
+        // Arrow-left/right at the menubar level closes the current dropdown
+        // and moves button focus only — the user must press ArrowDown (or
+        // Enter/Space) to open the adjacent dropdown.
+        // Arrow-up at the dropdown's first item closes it and returns
+        // focus to the same menubar button (which can re-open with ArrowDown).
         dropdown.addEventListener('puter-menu-navigate', (e) => {
             if ( ! e.detail ) return;
+            if ( e.detail.direction === 'up' ) {
+                this._closeDropdown();
+                this._renderButtonFocus();
+                this._setKeyboardNav(true);
+                return;
+            }
             const delta = e.detail.direction === 'right' ? +1 : -1;
+            this._closeDropdown();
             this._moveButtonFocus(delta, { swapDropdown: false });
-            this._openFocusedButton(true);
         });
 
         document.body.appendChild(dropdown);
@@ -358,6 +414,7 @@ class PuterMenubar extends PuterWebComponent {
     }
 
     disconnectedCallback () {
+        super.disconnectedCallback();
         this._closeDropdown();
         clearTimeout(this._suppressClickTimer);
         this._suppressClickFor = null;
@@ -369,6 +426,9 @@ class PuterMenubar extends PuterWebComponent {
         }
         if ( this._docPointerDownHandler ) {
             document.removeEventListener('pointerdown', this._docPointerDownHandler, true);
+        }
+        if ( this._mouseMoveHandler ) {
+            document.removeEventListener('mousemove', this._mouseMoveHandler);
         }
     }
 
