@@ -71,21 +71,16 @@ class PuterMenubar extends PuterWebComponent {
             .menu-button.focused {
                 background-color: #e2e2e2;
             }
-            /* Suppress browser-native :focus/:focus-visible/:active styling
-               so all visual state comes from JS-managed classes only. */
+            /* Suppress browser-native focus ring and tap highlight without
+               touching background. CAUTION: setting background-color here
+               would tie specificity with .menu-button.active and win by
+               source order, which would erase the open-menu highlight as
+               soon as the button takes DOM :focus from a click. */
             .menu-button:focus,
             .menu-button:focus-visible,
             .menu-button:active {
                 outline: none;
-                background-color: transparent;
                 -webkit-tap-highlight-color: transparent;
-            }
-            /* Re-assert the JS-managed highlight in case :active fires while
-               .hovered/.active/.focused is also applied. */
-            .menu-button.hovered:active,
-            .menu-button.active:active,
-            .menu-button.focused:active {
-                background-color: #e2e2e2;
             }
             @media (max-width: 480px) {
                 .menubar {
@@ -117,11 +112,6 @@ class PuterMenubar extends PuterWebComponent {
             :host(.puter-theme-dark) .menu-button.hovered,
             :host(.puter-theme-dark) .menu-button.active,
             :host(.puter-theme-dark) .menu-button.focused {
-                background-color: #3a3a3a;
-            }
-            :host(.puter-theme-dark) .menu-button.hovered:active,
-            :host(.puter-theme-dark) .menu-button.active:active,
-            :host(.puter-theme-dark) .menu-button.focused:active {
                 background-color: #3a3a3a;
             }
         `;
