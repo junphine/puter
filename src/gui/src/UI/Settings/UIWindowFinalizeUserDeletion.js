@@ -124,7 +124,10 @@ async function UIWindowFinalizeUserDeletion (options) {
             return fetch(apiUrl, {
                 method: 'POST',
                 credentials: 'include',
-                headers: { 'Content-Type': 'application/json' },
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${puter.authToken}`,
+                },
                 body: JSON.stringify(body),
             });
         };
