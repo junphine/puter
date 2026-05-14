@@ -580,14 +580,15 @@ class PuterContextMenu extends PuterWebComponent {
             this.#mouseTracker = null;
         }
 
-        // Hovering a separator should drop the focus highlight from the
-        // previously-focused item — the cursor has clearly moved past it.
-        // It should also close any submenu opened from an item above, so
-        // the parent's .has-open-submenu highlight goes away too.
+        // Hovering a separator or disabled item should drop the focus
+        // highlight from the previously-focused item — the cursor has
+        // clearly moved past it. It should also close any submenu opened
+        // from an item above, so the parent's .has-open-submenu highlight
+        // goes away too.
         // Exception: if the cursor is on a diagonal path toward the open
-        // submenu, treat the divider like any other safe-traverse cell so
-        // we don't tear down the submenu mid-drag.
-        this.$$('.menu-item.divider').forEach((el) => {
+        // submenu, treat these like any other safe-traverse cell so we
+        // don't tear down the submenu mid-drag.
+        this.$$('.menu-item.divider, .menu-item.disabled').forEach((el) => {
             el.addEventListener('mouseenter', () => {
                 if ( this.#activeSubmenu && this._isMouseHeadingToSubmenu(this.#activeSubmenu.element) ) {
                     this._setSafeTraverse(true);
@@ -636,6 +637,23 @@ class PuterContextMenu extends PuterWebComponent {
             // Hover: mouse takes over focus highlight
             el.addEventListener('mouseenter', () => {
                 if ( el.dataset.hasSubmenu === 'true' ) {
+                    // Safe-triangle: if a *different* submenu is already
+                    // open and the cursor is tracing diagonally toward it,
+                    // defer the swap. Without this, two adjacent items
+                    // with submenus would close the target as soon as the
+                    // cursor passed over the second one.
+                    if ( this.#activeSubmenu
+                         && this.#activeSubmenu.parentEl !== el
+                         && this._isMouseHeadingToSubmenu(this.#activeSubmenu.element) ) {
+                        this.#pendingFocusIndex = index;
+                        this._setSafeTraverse(true);
+                        if ( this.#submenuCloseTimer ) {
+                            clearTimeout(this.#submenuCloseTimer);
+                            this.#submenuCloseTimer = null;
+                        }
+                        this.#submenuCloseTimer = setTimeout(() => this._submenuCloseCheck(), 100);
+                        return;
+                    }
                     this.#pendingFocusIndex = null;
                     this._setSafeTraverse(false);
                     this._setFocusIndex(index);
@@ -681,6 +699,17 @@ class PuterContextMenu extends PuterWebComponent {
                 }
             });
         });
+
+        // When the cursor leaves the menu entirely, drop the item highlight
+        // so the user isn't left with a stale focus mark while the cursor
+        // is elsewhere. Submenu parents use .has-open-submenu (not .focused),
+        // so this is safe even while a submenu is open.
+        const menuRoot = this.$('.context-menu');
+        if ( menuRoot ) {
+            menuRoot.addEventListener('mouseleave', () => {
+                this._clearFocus();
+            });
+        }
 
         // Close on outside pointerdown — fires the instant the press starts,
         // before mouseup/click, so the menu doesn't linger during a drag.
@@ -1141,10 +1170,19 @@ class PuterContextMenu extends PuterWebComponent {
             this.style.display = '';
             this._sheetHidden = false;
         }
-        // Apply deferred focus from safe-triangle hover
+        // Apply deferred focus from safe-triangle hover. If the deferred
+        // item is itself a submenu opener, open it now — the user crossed
+        // the safe triangle without reaching the previous submenu, so we
+        // commit to the new target.
         if ( this.#pendingFocusIndex !== null ) {
-            this._setFocusIndex(this.#pendingFocusIndex);
+            const idx = this.#pendingFocusIndex;
             this.#pendingFocusIndex = null;
+            this._setFocusIndex(idx);
+            const pending = this.#items[idx];
+            if ( pending && pending.items && pending.items.length ) {
+                const pendingEl = this._itemEl(idx);
+                if ( pendingEl ) this._showSubmenu(pendingEl, pending.items);
+            }
         }
         this._setSafeTraverse(false);
     }
