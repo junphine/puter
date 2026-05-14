@@ -693,6 +693,10 @@ class PuterContextMenu extends PuterWebComponent {
             });
 
             el.addEventListener('mouseleave', () => {
+                // iOS Safari synthesizes mouseleave on touchend after a tap,
+                // which would schedule the just-opened submenu to close.
+                // On touch, submenus are driven by explicit taps, not hover.
+                if ( this._isMobile() ) return;
                 clearTimeout(this.#submenuTimeout);
                 if ( el.dataset.hasSubmenu === 'true' && this.#activeSubmenu && this.#activeSubmenu.parentEl === el ) {
                     this._scheduleSubmenuClose();
