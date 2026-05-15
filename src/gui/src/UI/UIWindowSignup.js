@@ -32,10 +32,12 @@ function UIWindowSignup (options) {
     return new Promise(async (resolve) => {
         const internal_id = window.uuidv4();
 
+        const logo_clickable = !!options.window_options?.cover_page;
+
         let h = '';
         h += '<div style="margin: 0 auto; max-width: 500px; min-width: 400px;">';
         // logo
-        h += `<img src="${window.icons['logo-white.svg']}" style="width: 40px; height: 40px; margin: 0 auto; display: block; padding: 10px; background-color: blue; border-radius: 5px;">`;
+        h += `<img src="${window.icons['logo-white.svg']}" class="auth-logo" style="width: 40px; height: 40px; margin: 0 auto; display: block; padding: 10px; background-color: blue; border-radius: 5px;${logo_clickable ? ' cursor: pointer;' : ''}">`;
         // close button
         if ( !options.has_head && options.show_close_button !== false )
         {
@@ -141,6 +143,11 @@ function UIWindowSignup (options) {
                 if ( ! window.disable_signup_autofocus )
                 {
                     $(el_window).find('.username').get(0).focus({ preventScroll: true });
+                }
+                if ( logo_clickable ) {
+                    $(el_window).find('.auth-logo').on('click', function () {
+                        window.location.href = '/';
+                    });
                 }
 
                 // Initialize Turnstile widget with callback to capture token

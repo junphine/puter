@@ -274,8 +274,9 @@ async function UIWindowLogin (options) {
         let h = '';
         h += '<div style="max-width:100%; width:100%; height:100%; min-height:0; box-sizing:border-box; display:flex; flex-direction:column; justify-content:center; align-items:stretch; padding:0; overflow:auto; color:var(--color-text);">';
         // logo
+        const logo_clickable = !!options.window_options?.cover_page;
         h += '<div class="logo-wrapper" style="display:flex; justify-content:center; padding:20px 20px 0 20px; margin-bottom: 0;">';
-        h += `<img src="${window.icons['logo-white.svg']}" style="width: 40px; height: 40px; margin: 0 auto; display: block; padding: 15px; background-color: blue; border-radius: 5px;">`;
+        h += `<img src="${window.icons['logo-white.svg']}" class="auth-logo" style="width: 40px; height: 40px; margin: 0 auto; display: block; padding: 15px; background-color: blue; border-radius: 5px;${logo_clickable ? ' cursor: pointer;' : ''}">`;
         h += '</div>';
         // title
         h += '<div style="padding:10px 20px; text-align:center; margin-bottom:0;">';
@@ -376,6 +377,12 @@ async function UIWindowLogin (options) {
                 'align-items': 'center',
             },
         });
+
+        if ( logo_clickable ) {
+            $(el_window).find('.auth-logo').on('click', function () {
+                window.location.href = '/';
+            });
+        }
 
         $(el_window).find('.forgot-password-link').on('click', function (e) {
             UIWindowRecoverPassword({
