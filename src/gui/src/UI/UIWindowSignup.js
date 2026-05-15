@@ -32,7 +32,7 @@ function UIWindowSignup (options) {
     return new Promise(async (resolve) => {
         const internal_id = window.uuidv4();
 
-        const logo_clickable = !!options.window_options?.cover_page;
+        const logo_clickable = !!options.window_options?.cover_page && !window.embedded_in_popup;
 
         let h = '';
         h += '<div style="margin: 0 auto; max-width: 500px; min-width: 400px;">';
