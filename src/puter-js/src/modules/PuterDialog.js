@@ -316,12 +316,9 @@ class PuterDialog extends (globalThis.HTMLElement || Object) { // It will fall b
             text-decoration: underline;
         }
         
-        @media (max-width:480px)  { 
+        @media (max-width:480px)  {
             .puter-dialog-content{
                 padding: 50px 20px;
-            }
-            dialog .buttons{
-                flex-direction: column-reverse;
             }
             dialog p.about{
                 padding: 10px 0;
