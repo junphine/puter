@@ -119,7 +119,7 @@ class PuterDialog extends (globalThis.HTMLElement || Object) { // It will fall b
         }
         
         .launch-auth-popup-footnote{
-            font-size: 11px;
+            font-size: 10px;
             color: #666;
             margin-top: 10px;
             /* footer at the bottom */
@@ -128,7 +128,8 @@ class PuterDialog extends (globalThis.HTMLElement || Object) { // It will fall b
             right: 0;
             bottom: 20px;
             text-align: center;
-            margin: 0 10px;
+            margin: 0 auto; 
+            max-width: 215px;
         }
         
         dialog .close-btn{
@@ -411,6 +412,10 @@ class PuterDialog extends (globalThis.HTMLElement || Object) { // It will fall b
 
             .error-container h1 {
                 color: #ff7466;
+            }
+
+            dialog .buttons{
+                margin-bottom: 20px;
             }
         }
         </style>`;
