@@ -115,7 +115,6 @@ class PuterDialog extends (globalThis.HTMLElement || Object) { // It will fall b
             flex-wrap: wrap;
             margin-top: 20px;
             text-align: center;
-            margin-bottom: 20px;
             flex-direction: column;
         }
         
@@ -297,16 +296,18 @@ class PuterDialog extends (globalThis.HTMLElement || Object) { // It will fall b
         }
         
         #launch-auth-popup{
-            width: 200px; 
+            width: 220px; 
             font-weight: 500; 
             font-size: 15px;
+            max-width: 250px;
         }
         dialog .button-auth{
             margin-bottom: 10px;
         }
         dialog .button-auth-cancel{
             background: none !important;
-            width:200px;
+            width: 220px;
+            max-width: 250px;
         }
         dialog a, dialog a:visited{
             color: rgb(0 0 0);
