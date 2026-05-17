@@ -330,6 +330,10 @@ class PuterDialog extends (globalThis.HTMLElement || Object) { // It will fall b
                 margin:0 !important;
                 margin-bottom: 10px !important;
             }
+
+            dialog .buttons{
+                margin-bottom: 20px;
+            }
         }
         .error-container h1 {
             color: #e74c3c;
@@ -412,10 +416,6 @@ class PuterDialog extends (globalThis.HTMLElement || Object) { // It will fall b
 
             .error-container h1 {
                 color: #ff7466;
-            }
-
-            dialog .buttons{
-                margin-bottom: 20px;
             }
         }
         </style>`;
