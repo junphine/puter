@@ -38,7 +38,7 @@ import type { IConfig } from './types';
 //
 // Post-flatten depth: compiled file is at `packages/puter/dist/src/backend/index.js`,
 // so three `..`s land at `packages/puter/`.
-const PACKAGE_ROOT = path.resolve(__dirname, '../../..');
+const PACKAGE_ROOT = path.resolve(__dirname, '../..');
 // Root of the running code tree. Matches PACKAGE_ROOT for a source run, but
 // points at `dist/` for a compiled run — so config-declared paths like
 // `./extensions` resolve to `dist/extensions` at runtime without the config

@@ -2513,7 +2513,12 @@ window.toggleDesktopIcons = function () {
 };
 
 $(document).on('click', '.btn-show-ai', function () {
-    $('.window[data-app="ai"]').makeWindowVisible();
+    var $target = $('.window[data-app="ai"]');
+    if ($target.is(':visible')) {
+        $target.makeWindowInvisible();        
+    } else {
+        $target.makeWindowVisible();
+    }    
 });
 
 export default UIDesktop;

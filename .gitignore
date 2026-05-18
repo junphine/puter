@@ -70,3 +70,6 @@ coverage/
 undefined
 servers.json
 config.*.json
+
+volatile/
+nohup.out

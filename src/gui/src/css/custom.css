@@ -1,0 +1,11 @@
+div[data-app="ai"] {
+    width: calc(100% - 52px) !important;
+}
+
+div[data-app="ai"] .window-body{
+    background: transparent !important;
+}
+
+.btn-show-ai {
+    z-index:999;
+}
