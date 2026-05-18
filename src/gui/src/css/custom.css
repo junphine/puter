@@ -1,5 +1,6 @@
 div[data-app="ai"] {
     width: calc(100% - 52px) !important;
+    z-index:4 !important;
 }
 
 div[data-app="ai"] .window-body{
@@ -7,5 +8,5 @@ div[data-app="ai"] .window-body{
 }
 
 .btn-show-ai {
-    z-index:999;
+    z-index:5;
 }

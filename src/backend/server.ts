@@ -1020,7 +1020,7 @@ export class PuterServer {
                 const entryPath = `${extDir}/${entry.name}`;
 
                 if (entry.isFile()) {
-                    if (/\.(js|mjs|cjs)$/.test(entry.name)) {
+                    if (/\.(js|mjs|cjs|ts)$/.test(entry.name)) {
                         console.log(`Importing extension file ${entryPath}`);
                         await import(entryPath);
                     }
