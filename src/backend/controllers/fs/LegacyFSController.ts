@@ -43,6 +43,7 @@ import {
     signingConfigFromAppConfig,
     toLegacyEntry,
 } from './legacyFsHelpers.js';
+import { RouteOptions } from '../../core/http/index.js';
 
 /**
  * Legacy FS routes, implemented as thin shims over `FSService`.
@@ -79,11 +80,16 @@ export class LegacyFSController extends PuterController {
     #additionalCache: RouterCache = new Map();
 
     registerRoutes(router: PuterRouter): void {
-        const apiOptions = { subdomain: 'api', requireVerified: true } as const;
+        const apiOptions = {
+            subdomain: 'api',
+            requireVerified: true,
+        } as RouteOptions;
         // Signed-URL routes: the handler validates the URL signature itself,
         // so no auth gate is applied (matches v1, which mounted these routers
         // with no middleware).
-        const signedOptions = { subdomain: 'api' } as const;
+        const signedOptions = {
+            subdomain: 'api',
+        } as RouteOptions;
 
         // Core filesystem_api routes — direct handlers over the FS service.
         router.post('/stat', apiOptions, this.stat);
@@ -98,7 +104,11 @@ export class LegacyFSController extends PuterController {
         router.get('/read', apiOptions, this.read);
         router.get(
             '/token-read',
-            { subdomain: 'api', requireVerified: false },
+            {
+                subdomain: 'api',
+                requireVerified: false,
+                allowAccessToken: true,
+            },
             this.tokenRead,
         );
 
@@ -248,7 +258,9 @@ export class LegacyFSController extends PuterController {
             async (req: Request, res: Response) => {
                 const userId = req.actor?.user?.id;
                 if (!userId)
-                    throw new HttpError(401, 'Authentication required');
+                    throw new HttpError(401, 'Authentication required', {
+                        legacyCode: 'unauthorized',
+                    });
                 const rows = await this.clients.db.read(
                     'SELECT `subdomain`, `root_dir_id`, `uuid`, `ts` FROM `subdomains` WHERE `user_id` = ?',
                     [userId],
@@ -264,17 +276,27 @@ export class LegacyFSController extends PuterController {
             async (req: Request, res: Response) => {
                 const userId = req.actor?.user?.id;
                 if (!userId)
-                    throw new HttpError(401, 'Authentication required');
+                    throw new HttpError(401, 'Authentication required', {
+                        legacyCode: 'unauthorized',
+                    });
                 const { uid, thumbnail } = (req.body ?? {}) as {
                     uid?: string;
                     thumbnail?: string;
                 };
-                if (!uid) throw new HttpError(400, 'Missing `uid`');
-                if (!thumbnail) throw new HttpError(400, 'Missing `thumbnail`');
+                if (!uid)
+                    throw new HttpError(400, 'Missing `uid`', {
+                        legacyCode: 'bad_request',
+                    });
+                if (!thumbnail)
+                    throw new HttpError(400, 'Missing `thumbnail`', {
+                        legacyCode: 'bad_request',
+                    });
 
                 const entry = await this.stores.fsEntry.getEntryByUuid(uid);
                 if (!entry || entry.userId !== userId)
-                    throw new HttpError(403, 'Access denied');
+                    throw new HttpError(403, 'Access denied', {
+                        legacyCode: 'forbidden',
+                    });
 
                 // Emit thumbnail.created so the thumbnails extension can S3-upload.
                 // emitAndWait is required — the extension rewrites `event.url`
@@ -446,7 +468,10 @@ export class LegacyFSController extends PuterController {
         const userId = this.#getActorUserId(req);
         const body = asRecord(req.body);
         const rawPath = getString(body, 'path');
-        if (!rawPath) throw new HttpError(400, '`path` is required');
+        if (!rawPath)
+            throw new HttpError(400, '`path` is required', {
+                legacyCode: 'bad_request',
+            });
 
         // Supports `{ parent, path }` where `path` is a relative suffix.
         // When `parent` is a path string, use it directly without requiring
@@ -673,7 +698,10 @@ export class LegacyFSController extends PuterController {
         const body = asRecord(req.body);
 
         const newName = getString(body, 'new_name');
-        if (!newName) throw new HttpError(400, '`new_name` is required');
+        if (!newName)
+            throw new HttpError(400, '`new_name` is required', {
+                legacyCode: 'bad_request',
+            });
 
         const entry = await resolveV1Selector(this.stores.fsEntry, body);
         await assertAccess(
@@ -695,13 +723,18 @@ export class LegacyFSController extends PuterController {
         const body = asRecord(req.body);
 
         const rawPath = getString(body, 'path');
-        if (!rawPath) throw new HttpError(400, '`path` is required');
+        if (!rawPath)
+            throw new HttpError(400, '`path` is required', {
+                legacyCode: 'bad_request',
+            });
 
         const parentPath = pathPosix.dirname(
             rawPath.startsWith('/') ? rawPath : `/${rawPath}`,
         );
         if (parentPath === '/') {
-            throw new HttpError(400, 'Cannot touch in root');
+            throw new HttpError(400, 'Cannot touch in root', {
+                legacyCode: 'bad_request',
+            });
         }
         await assertAccess(
             this.services.acl,
@@ -729,7 +762,9 @@ export class LegacyFSController extends PuterController {
         const body = asRecord(req.body);
         const query = getString(body, 'query', 'text') ?? '';
         if (query.trim().length === 0)
-            throw new HttpError(400, '`query` is required');
+            throw new HttpError(400, '`query` is required', {
+                legacyCode: 'bad_request',
+            });
 
         const results = await this.services.fs.searchByName(userId, query, 200);
         const shaped = await Promise.all(
@@ -759,7 +794,9 @@ export class LegacyFSController extends PuterController {
         );
 
         if (entry.isDir) {
-            throw new HttpError(400, 'Cannot read a directory');
+            throw new HttpError(400, 'Cannot read a directory', {
+                legacyCode: 'cannot_read_a_directory',
+            });
         }
 
         const range =
@@ -863,7 +900,10 @@ export class LegacyFSController extends PuterController {
         const actor = this.#requireActor(req);
         const body = asRecord(req.body);
         const items = Array.isArray(body.items) ? body.items : [];
-        if (items.length === 0) throw new HttpError(400, '`items` is required');
+        if (items.length === 0)
+            throw new HttpError(400, '`items` is required', {
+                legacyCode: 'bad_request',
+            });
 
         const isApp = Boolean((actor as { app?: unknown }).app);
         const signingCfg = signingConfigFromAppConfig(this.config);
@@ -874,7 +914,10 @@ export class LegacyFSController extends PuterController {
             const username = (actor as { user?: { username?: string } }).user
                 ?.username;
             const appUid = (actor as { app?: { uid?: string } }).app?.uid;
-            if (!username || !appUid) throw new HttpError(403, 'Forbidden');
+            if (!username || !appUid)
+                throw new HttpError(403, 'Forbidden', {
+                    legacyCode: 'forbidden',
+                });
             appDataRoot = `/${username}/AppData/${appUid}`;
         }
 
@@ -889,7 +932,10 @@ export class LegacyFSController extends PuterController {
         let grantApp: { uid: string } | null = null;
         if (typeof body.app_uid === 'string' && body.app_uid.length > 0) {
             const app = await this.stores.app.getByUid(body.app_uid);
-            if (!app) throw new HttpError(404, 'App not found');
+            if (!app)
+                throw new HttpError(404, 'App not found', {
+                    legacyCode: 'not_found',
+                });
             grantApp = { uid: app.uid };
             result.token = this.services.auth.getUserAppToken(actor, app.uid);
         }
@@ -916,7 +962,9 @@ export class LegacyFSController extends PuterController {
                       entry.path.startsWith(`${appDataRoot}/`)
                     : true;
                 if (!withinAppRoot) {
-                    throw new HttpError(403, 'Forbidden');
+                    throw new HttpError(403, 'Forbidden', {
+                        legacyCode: 'forbidden',
+                    });
                 }
 
                 // ACL: always require read; downgrade write→read silently.
@@ -986,17 +1034,37 @@ export class LegacyFSController extends PuterController {
         const targetEntry = await resolveV1Selector(this.stores.fsEntry, {
             uid,
         });
-        if (!targetEntry) throw new HttpError(404, 'Item not found');
+        if (!targetEntry)
+            throw new HttpError(404, 'Item not found', {
+                legacyCode: 'not_found',
+            });
 
         // Owner suspension check.
         const owner = await this.stores.user.getById(targetEntry.userId);
-        if (!owner) throw new HttpError(500, 'Owner not found');
+        if (!owner)
+            throw new HttpError(500, 'Owner not found', {
+                legacyCode: 'internal_error',
+            });
         if ((owner as { suspended?: unknown }).suspended)
-            throw new HttpError(401, 'Account suspended');
+            throw new HttpError(401, 'Account suspended', {
+                legacyCode: 'account_suspended',
+            });
 
         const userId = targetEntry.userId;
         const operation =
             typeof query.operation === 'string' ? query.operation : 'write';
+
+        // A valid write signature authorises overwriting the file's bytes,
+        // not structural changes. Restrict copy/move/mkdir/rename/delete/trash
+        // to a caller authenticated as the owner — otherwise a recipient of a
+        // write-share could relocate or destroy the source via this endpoint.
+        if (operation !== 'write' && req.actor?.user?.id !== userId) {
+            throw new HttpError(
+                403,
+                `'${operation}' via signed URL requires owner authentication`,
+                { legacyCode: 'forbidden' },
+            );
+        }
 
         // `write` — multipart upload, streamed directly to the v2 write path.
         if (operation === 'write') {
@@ -1031,8 +1099,19 @@ export class LegacyFSController extends PuterController {
         }
 
         // Non-write operations: route to existing service methods and sign the result.
+        // The signature alone authorises only byte writes to `targetEntry`. Structural
+        // ops (mkdir/rename/copy/move/delete) require a caller actor with explicit
+        // ACL on the affected paths — mirroring the unsigned counterparts above.
         const record = asRecord(req.body);
+        const callerActor = this.#requireActor(req);
         if (operation === 'mkdir') {
+            await assertAccess(
+                this.services.acl,
+                this.services.fs,
+                callerActor,
+                targetEntry.path,
+                'write',
+            );
             const folderName =
                 typeof record.name === 'string'
                     ? record.name
@@ -1050,13 +1129,30 @@ export class LegacyFSController extends PuterController {
         if (operation === 'rename') {
             const newName =
                 typeof record.new_name === 'string' ? record.new_name : '';
-            if (!newName) throw new HttpError(400, '`new_name` required');
+            if (!newName)
+                throw new HttpError(400, '`new_name` required', {
+                    legacyCode: 'bad_request',
+                });
+            await assertAccess(
+                this.services.acl,
+                this.services.fs,
+                callerActor,
+                targetEntry.path,
+                'write',
+            );
             const renamed = await this.services.fs.rename(targetEntry, newName);
             await this.#emitGuiEvent('outer.gui.item.updated', renamed);
             res.json({ ...signEntry(renamed, signingCfg), path: renamed.path });
             return;
         }
         if (operation === 'delete' || operation === 'trash') {
+            await assertAccess(
+                this.services.acl,
+                this.services.fs,
+                callerActor,
+                targetEntry.path,
+                'write',
+            );
             // Treat trash == delete (recursive). Most clients just call delete
             // directly; if a trash folder becomes important we can revisit.
             await this.services.fs.remove(userId, {
@@ -1072,10 +1168,27 @@ export class LegacyFSController extends PuterController {
                 record.destination ??
                 record.destination_uid ??
                 record.dest_path;
-            if (!destRef) throw new HttpError(400, '`destination` required');
+            if (!destRef)
+                throw new HttpError(400, '`destination` required', {
+                    legacyCode: 'bad_request',
+                });
             const destinationParent = await resolveV1Selector(
                 this.stores.fsEntry,
                 destRef,
+            );
+            await assertAccess(
+                this.services.acl,
+                this.services.fs,
+                callerActor,
+                targetEntry.path,
+                operation === 'copy' ? 'read' : 'write',
+            );
+            await assertAccess(
+                this.services.acl,
+                this.services.fs,
+                callerActor,
+                destinationParent.path,
+                'write',
             );
             const method = operation === 'copy' ? 'copy' : 'move';
             const result = await this.services.fs[method](userId, {
@@ -1104,6 +1217,7 @@ export class LegacyFSController extends PuterController {
         throw new HttpError(
             400,
             `Unsupported writeFile operation: '${operation}'`,
+            { legacyCode: 'bad_request' },
         );
     };
 
@@ -1134,7 +1248,9 @@ export class LegacyFSController extends PuterController {
         // would otherwise keep leaking content.
         const owner = await this.stores.user.getById(entry.userId);
         if ((owner as { suspended?: unknown } | null)?.suspended) {
-            throw new HttpError(401, 'Account suspended');
+            throw new HttpError(401, 'Account suspended', {
+                legacyCode: 'account_suspended',
+            });
         }
 
         // Directory: return a signed listing of direct children.
@@ -1255,19 +1371,26 @@ export class LegacyFSController extends PuterController {
         const actor = this.#requireActor(req);
         const body = asRecord(req.body);
         const appUid = getString(body, 'app_uid');
-        if (!appUid) throw new HttpError(400, '`app_uid` is required');
+        if (!appUid)
+            throw new HttpError(400, '`app_uid` is required', {
+                legacyCode: 'bad_request',
+            });
 
         const actorApp = (actor as { app?: { uid?: string } }).app;
         if (!actorApp?.uid || actorApp.uid !== appUid) {
             throw new HttpError(
                 403,
                 'Only the app itself may request its root dir',
+                { legacyCode: 'forbidden' },
             );
         }
         const userId = this.#getActorUserId(req);
         const username = (actor as { user?: { username?: string } }).user
             ?.username;
-        if (!username) throw new HttpError(401, 'Unauthorized');
+        if (!username)
+            throw new HttpError(401, 'Unauthorized', {
+                legacyCode: 'unauthorized',
+            });
 
         const rootPath = `/${username}/AppData/${appUid}`;
         // Auto-create the AppData/<uid> tree on first call.
@@ -1294,7 +1417,9 @@ export class LegacyFSController extends PuterController {
             | 'read'
             | 'write';
         if (!subjectRef || !appRef)
-            throw new HttpError(400, '`subject` and `app` are required');
+            throw new HttpError(400, '`subject` and `app` are required', {
+                legacyCode: 'bad_request',
+            });
 
         const subject = await resolveV1Selector(
             this.stores.fsEntry,
@@ -1306,7 +1431,10 @@ export class LegacyFSController extends PuterController {
                 (await this.stores.app.getByUid(appRef)) ??
                 (await this.stores.app.getByName(appRef));
         }
-        if (!app) throw new HttpError(404, 'App not found');
+        if (!app)
+            throw new HttpError(404, 'App not found', {
+                legacyCode: 'not_found',
+            });
 
         // Build an actor-under-user shape for the check.
         const actorForApp = {
@@ -1337,15 +1465,22 @@ export class LegacyFSController extends PuterController {
 
         const rawPath =
             typeof req.query.path === 'string' ? req.query.path.trim() : '';
-        if (!rawPath) throw new HttpError(400, '`path` is required');
+        if (!rawPath)
+            throw new HttpError(400, '`path` is required', {
+                legacyCode: 'bad_request',
+            });
         if (rawPath === '/')
-            throw new HttpError(400, 'Cannot download a directory');
+            throw new HttpError(400, 'Cannot download a directory', {
+                legacyCode: 'bad_request',
+            });
 
         const entry = await resolveV1Selector(this.stores.fsEntry, {
             path: rawPath,
         });
         if (entry.isDir)
-            throw new HttpError(400, 'Cannot download a directory');
+            throw new HttpError(400, 'Cannot download a directory', {
+                legacyCode: 'bad_request',
+            });
 
         // Same ACL gate that /read uses — owners hit the is-owner implicator;
         // shared-file readers get through the permission scan.
@@ -1494,11 +1629,19 @@ export class LegacyFSController extends PuterController {
             });
             bb.on('close', () => {
                 if (!dispatched) {
-                    reject(new HttpError(400, 'No file uploaded'));
+                    reject(
+                        new HttpError(400, 'No file uploaded', {
+                            legacyCode: 'bad_request',
+                        }),
+                    );
                     return;
                 }
                 if (!writePromise) {
-                    reject(new HttpError(500, 'Write did not dispatch'));
+                    reject(
+                        new HttpError(500, 'Write did not dispatch', {
+                            legacyCode: 'internal_error',
+                        }),
+                    );
                 }
                 // size is logged only; fsService.write handles quota/size.
                 void size;
@@ -1568,6 +1711,7 @@ export class LegacyFSController extends PuterController {
                         throw new HttpError(
                             400,
                             `write op has no paired file (item_upload_id=${uploadIdRaw})`,
+                            { legacyCode: 'bad_request' },
                         );
                     }
                     const fileInfo = fileinfos[fileIdx] ?? {};
@@ -1577,7 +1721,9 @@ export class LegacyFSController extends PuterController {
                             ? fileInfo.name
                             : undefined);
                     if (!name) {
-                        throw new HttpError(400, 'write op missing `name`');
+                        throw new HttpError(400, 'write op missing `name`', {
+                            legacyCode: 'bad_request',
+                        });
                     }
                     const parentPath = getString(record, 'path') ?? '';
                     const expandedParent = this.#expandTilde(
@@ -1641,7 +1787,9 @@ export class LegacyFSController extends PuterController {
                     const parentPath = getString(record, 'path') ?? '';
                     const name = getString(record, 'name');
                     if (!name) {
-                        throw new HttpError(400, 'mkdir op missing `name`');
+                        throw new HttpError(400, 'mkdir op missing `name`', {
+                            legacyCode: 'bad_request',
+                        });
                     }
                     const expandedParent = this.#expandTilde(
                         parentPath,
@@ -1681,12 +1829,15 @@ export class LegacyFSController extends PuterController {
                         getString(record, 'shortcut_to_uid') ??
                         getString(record, 'shortcut_to');
                     if (!name) {
-                        throw new HttpError(400, 'shortcut op missing `name`');
+                        throw new HttpError(400, 'shortcut op missing `name`', {
+                            legacyCode: 'shortcut_target_not_found',
+                        });
                     }
                     if (!shortcutToUid) {
                         throw new HttpError(
                             400,
                             'shortcut op missing `shortcut_to_uid`',
+                            { legacyCode: 'shortcut_target_not_found' },
                         );
                     }
                     const target = await resolveV1Selector(
@@ -1781,7 +1932,9 @@ export class LegacyFSController extends PuterController {
                     });
                     shaped = { ok: true, uid: entry.uuid };
                 } else {
-                    throw new HttpError(400, `Unsupported batch op: '${op}'`);
+                    throw new HttpError(400, `Unsupported batch op: '${op}'`, {
+                        legacyCode: 'bad_request',
+                    });
                 }
                 results.push(shaped);
             } catch (err) {
@@ -1873,7 +2026,10 @@ export class LegacyFSController extends PuterController {
     #expandTilde(path: string, username: string | undefined): string {
         if (!path) return path;
         if (path !== '~' && !path.startsWith('~/')) return path;
-        if (!username) throw new HttpError(400, 'Unable to resolve home path');
+        if (!username)
+            throw new HttpError(400, 'Unable to resolve home path', {
+                legacyCode: 'bad_request',
+            });
         return `/${username}${path.slice(1)}`;
     }
 
@@ -1905,7 +2061,7 @@ export class LegacyFSController extends PuterController {
         }
         const parsed = Number.parseInt(String(value), 10);
         if (!Number.isInteger(parsed) || parsed < 1) {
-            throw new HttpError(400, message);
+            throw new HttpError(400, message, { legacyCode: 'bad_request' });
         }
         return parsed;
     }
@@ -1921,7 +2077,7 @@ export class LegacyFSController extends PuterController {
         }
         const parsed = Number.parseInt(String(value), 10);
         if (!Number.isInteger(parsed) || parsed < 0) {
-            throw new HttpError(400, message);
+            throw new HttpError(400, message, { legacyCode: 'bad_request' });
         }
         return parsed;
     }
@@ -2010,7 +2166,9 @@ export class LegacyFSController extends PuterController {
     #requireActor(req: Request) {
         const actor = req.actor;
         if (!actor) {
-            throw new HttpError(401, 'Unauthorized');
+            throw new HttpError(401, 'Unauthorized', {
+                legacyCode: 'unauthorized',
+            });
         }
         return actor;
     }
@@ -2020,10 +2178,15 @@ export class LegacyFSController extends PuterController {
         const actorUser = req.actor?.user;
         const candidate = requestUser?.id ?? actorUser?.id;
         if (candidate === undefined || candidate === null) {
-            throw new HttpError(401, 'Unauthorized');
+            throw new HttpError(401, 'Unauthorized', {
+                legacyCode: 'unauthorized',
+            });
         }
         const numeric = Number(candidate);
-        if (Number.isNaN(numeric)) throw new HttpError(401, 'Unauthorized');
+        if (Number.isNaN(numeric))
+            throw new HttpError(401, 'Unauthorized', {
+                legacyCode: 'unauthorized',
+            });
         return numeric;
     }
 

@@ -115,6 +115,7 @@ export interface IChatMessageResult {
     stream?: never;
     finally_fn?: never;
     normalized?: boolean;
+    via_ai_chat_service?: boolean;
 }
 
 export type IChatCompleteResult = IChatStreamResult | IChatMessageResult;
@@ -124,4 +125,5 @@ export interface IChatProvider {
     list(): string[] | Promise<string[]>;
     getDefaultModel(): string;
     complete(arg: ICompleteArguments): Promise<IChatCompleteResult>;
+    checkModeration(text: string): { flagged: boolean; categories: string[] };
 }

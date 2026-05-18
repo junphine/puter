@@ -19,6 +19,7 @@
 
 import type { Request, RequestHandler } from 'express';
 import { HttpError } from '../HttpError';
+import { assertVerifiedEmail } from '../verifiedEmail';
 
 // Make sure the `Express.Request.actor` augmentation is in scope.
 import '../expressAugmentation';
@@ -42,26 +43,6 @@ const rejectAuth = (req: Request): HttpError => {
 };
 
 /**
- * Per-route gate middlewares.
- *
- * These are tiny because they need to be: composability is the point. The
- * server's route materializer (`server.ts#materializeRoute`) consults the
- * per-route `RouteOptions` and pushes the relevant gate(s) onto the express
- * middleware chain in this order:
- *
- *     subdomain → requireAuth (+ suspended check) → emailConfirmed →
- *     requireUserActor → adminOnly → allowedAppIds →
- *     caller middleware → handler
- *
- * Each gate either calls `next()` to pass through, calls `next('route')` to
- * skip (subdomain only), or throws an `HttpError` for the terminal error
- * handler to serialize. Express 5 forwards thrown errors automatically; no
- * `next(err)` ceremony required.
- */
-
-// ── subdomain ───────────────────────────────────────────────────────
-
-/**
  * Skip this route entirely (via `next('route')`) when the request's
  * leftmost subdomain doesn't match. This *isn't* a rejection — it lets
  * a different route matcher handle the request.
@@ -79,8 +60,6 @@ export const subdomainGate = (allowed: string | string[]): RequestHandler => {
         next();
     };
 };
-
-// ── requireAuth (+ suspended check) ─────────────────────────────────
 
 /**
  * Reject anonymous requests with 401. Also reject authenticated-but-suspended
@@ -107,8 +86,6 @@ export const requireAuthGate = (): RequestHandler => {
         next();
     };
 };
-
-// ── requireUserActor ────────────────────────────────────────────────
 
 /**
  * Reject app-under-user and access-token actors with 403. Use on endpoints
@@ -137,7 +114,26 @@ export const requireUserActorGate = (): RequestHandler => {
     };
 };
 
-// ── adminOnly ───────────────────────────────────────────────────────
+export const requireNonAccessTokenGate = (): RequestHandler => {
+    return (req, _res, next) => {
+        const actor = req.actor;
+        if (!actor) {
+            next(rejectAuth(req));
+            return;
+        }
+        if (actor.accessToken) {
+            next(
+                new HttpError(
+                    403,
+                    'Access tokens are not allowed to access this resource',
+                    { legacyCode: 'forbidden' },
+                ),
+            );
+            return;
+        }
+        next();
+    };
+};
 
 /** Built-in admin usernames that always pass `adminOnly`. */
 export const DEFAULT_ADMIN_USERNAMES = ['admin', 'system'] as const;
@@ -170,8 +166,6 @@ export const adminOnlyGate = (
     };
 };
 
-// ── requireVerified ─────────────────────────────────────────────────
-
 /**
  * Reject unless the authenticated user has a confirmed email. Gated behind
  * `strict_email_verification_required` config so self-hosted deployments
@@ -182,24 +176,15 @@ export const adminOnlyGate = (
  */
 export const requireVerifiedGate = (strictFlag: boolean): RequestHandler => {
     return (req, _res, next) => {
-        if (!strictFlag) {
-            next();
-            return;
-        }
-        const user = req.actor?.user as Record<string, unknown> | undefined;
-        if (!user?.email_confirmed) {
-            next(
-                new HttpError(400, 'Account email is not verified', {
-                    legacyCode: 'account_is_not_verified',
-                }),
-            );
+        try {
+            assertVerifiedEmail(strictFlag, req.actor?.user);
+        } catch (err) {
+            next(err);
             return;
         }
         next();
     };
 };
-
-// ── requireEmailConfirmed ────────────────────────────────────────────
 
 /**
  * Reject authenticated users whose account is pending email confirmation
@@ -224,8 +209,6 @@ export const requireEmailConfirmedGate = (): RequestHandler => {
         next();
     };
 };
-
-// ── allowedAppIds ───────────────────────────────────────────────────
 
 /**
  * Reject unless the actor is acting through one of the named apps.

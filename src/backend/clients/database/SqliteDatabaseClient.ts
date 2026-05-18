@@ -17,8 +17,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { existsSync, readFileSync } from 'fs';
-import { basename, extname, join, resolve } from 'path';
+import { existsSync, mkdirSync, readFileSync } from 'fs';
+import { basename, dirname, extname, join, resolve } from 'path';
 import { createContext, runInContext } from 'vm';
 import type { IConfig } from '../../types';
 import { AbstractDatabaseClient, type WriteResult } from './DatabaseClient';
@@ -77,6 +77,7 @@ const AVAILABLE_MIGRATIONS: [number, string[]][] = [
     [42, ['0046_is-private-apps.sql']],
     [43, ['0047_app-url-updates.sql']],
     [44, ['0048_old-app-names-unique-tuple.sql']],
+    [45, ['0049_music-player-pdf-player-updates.sql']],
 ];
 
 export class SqliteDatabaseClient extends AbstractDatabaseClient {
@@ -100,6 +101,10 @@ export class SqliteDatabaseClient extends AbstractDatabaseClient {
             ? ':memory:'
             : (this.config.database?.path ?? ':memory:');
         const isNew = dbPath === ':memory:' || !existsSync(dbPath);
+
+        if (dbPath !== ':memory:') {
+            mkdirSync(dirname(dbPath), { recursive: true });
+        }
 
         this.db = new Database(dbPath);
 

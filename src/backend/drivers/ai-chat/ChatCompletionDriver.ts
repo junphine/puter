@@ -27,6 +27,7 @@ import {
 } from '../../services/metering/consts.js';
 import type { DriverStreamResult } from '../meta.js';
 import { PuterDriver } from '../types.js';
+import { AI_CONCURRENT, AI_RATE_LIMIT } from '../util/aiLimits.js';
 import { ClaudeProvider } from './providers/claude/ClaudeProvider.js';
 import { DeepSeekProvider } from './providers/deepseek/DeepSeekProvider.js';
 import { FakeChatProvider } from './providers/FakeChatProvider.js';
@@ -40,6 +41,7 @@ import { OpenRouterProvider } from './providers/openrouter/OpenRouterProvider.js
 import { TogetherAIProvider } from './providers/together/TogetherAIProvider.js';
 import { XAIProvider } from './providers/xai/XAIProvider.js';
 import { ZAIProvider } from './providers/zai/ZAIProvider.js';
+import { AlibabaProvider } from './providers/alibaba/AlibabaProvider.js';
 import { MoonshotProvider } from './providers/moonshot/MoonshotProvider.js';
 import type {
     IChatCompleteResult,
@@ -54,8 +56,139 @@ import {
     normalize_single_message,
 } from './utils/Messages.js';
 import { AIChatStream } from './utils/Streaming.js';
+import { EventMap } from '../../clients/event/types.js';
 
 const MAX_FALLBACKS = 4; // includes first attempt
+
+type ProviderAttempt = {
+    model: string;
+    provider: string;
+    status?: number;
+    code?: string;
+    error: string;
+};
+
+/**
+ * Capture what an upstream provider gave us so the classifier downstream
+ * can decide a user-facing status code instead of always returning 500.
+ *
+ * OpenAI-SDK-based providers throw `APIError` with `.status` and a
+ * structured `.error` body — pull both. For arbitrary errors we fall
+ * back to the message and a status sniff so providers that throw plain
+ * `Error("... 503 ...")` strings still classify correctly.
+ */
+const toAttempt = (
+    modelId: string,
+    providerId: string,
+    err: unknown,
+): ProviderAttempt => {
+    const e = err as {
+        status?: number;
+        statusCode?: number;
+        code?: string;
+        error?: { code?: string; type?: string; message?: string };
+        message?: string;
+    };
+    const message = e?.message ?? (typeof err === 'string' ? err : String(err));
+    let status = e?.status ?? e?.statusCode;
+    if (status === undefined) {
+        const m = message.match(/\b(4\d\d|5\d\d)\b/);
+        if (m) status = Number(m[1]);
+    }
+    return {
+        model: modelId,
+        provider: providerId,
+        status,
+        code: e?.error?.code ?? e?.code,
+        error: message,
+    };
+};
+
+const isRateLimit = (a: ProviderAttempt) =>
+    a.status === 429 ||
+    /rate[\s_-]?limit|too many requests|quota/i.test(a.error);
+
+const isAuthFailure = (a: ProviderAttempt) =>
+    a.status === 401 ||
+    a.status === 403 ||
+    /unauthorized|forbidden|invalid api key/i.test(a.error);
+
+const isUpstream5xx = (a: ProviderAttempt) =>
+    (a.status !== undefined && a.status >= 500) ||
+    /provider returned error|internal server error|service unavailable|bad gateway/i.test(
+        a.error,
+    );
+
+/**
+ * Map an exhausted fallback chain to a single user-facing HttpError.
+ *
+ * Per-class rules (see also alarm gate in server.ts):
+ *  - all rate-limited → 429 `upstream_rate_limited` (paged: forced alert)
+ *  - all auth failures → 500 `upstream_auth_failed` (paged: our config)
+ *  - all upstream 5xx → 400 `upstream_provider_unavailable` (no page)
+ *  - all upstream 4xx (other) → 400 `upstream_bad_request` (no page)
+ *  - mixed → 400 `upstream_failed` (no page)
+ */
+const classifyAttempts = (attempts: ProviderAttempt[]): HttpError => {
+    const fields = { attempts };
+    if (attempts.length === 0) {
+        return new HttpError(500, 'No providers attempted', {
+            legacyCode: 'internal_error',
+            fields,
+        });
+    }
+
+    if (attempts.every(isRateLimit)) {
+        return new HttpError(429, 'AI provider rate limit exceeded', {
+            legacyCode: 'upstream_rate_limited',
+            fields,
+        });
+    }
+    if (attempts.every(isAuthFailure)) {
+        return new HttpError(500, 'AI provider authentication failed', {
+            legacyCode: 'upstream_auth_failed',
+            fields,
+        });
+    }
+    if (attempts.every(isUpstream5xx)) {
+        return new HttpError(400, 'AI provider unavailable', {
+            legacyCode: 'upstream_provider_unavailable',
+            fields,
+        });
+    }
+    if (
+        attempts.every(
+            (a) => a.status !== undefined && a.status >= 400 && a.status < 500,
+        )
+    ) {
+        return new HttpError(400, attempts[0].error, {
+            legacyCode: 'upstream_bad_request',
+            fields,
+        });
+    }
+
+    // Mixed failures where at least one attempt is clearly upstream
+    // (had an HTTP status from the SDK) means "AI providers couldn't
+    // satisfy the request" — expose, don't page.
+    const isUpstreamSignal = (a: ProviderAttempt) =>
+        a.status !== undefined ||
+        isRateLimit(a) ||
+        isAuthFailure(a) ||
+        isUpstream5xx(a);
+    if (attempts.some(isUpstreamSignal)) {
+        return new HttpError(400, 'All AI providers failed', {
+            legacyCode: 'upstream_failed',
+            fields,
+        });
+    }
+
+    // Nothing identifiable as an upstream issue — treat as our bug
+    // and let the global alarm fire so we actually find out.
+    return new HttpError(500, 'All providers failed', {
+        legacyCode: 'internal_error',
+        fields,
+    });
+};
 
 /**
  * Driver implementing the `puter-chat-completion` interface.
@@ -71,6 +204,10 @@ export class ChatCompletionDriver extends PuterDriver {
     readonly driverInterface = 'puter-chat-completion';
     readonly driverName = 'ai-chat';
     readonly isDefault = true;
+
+    // Shared AI policy — see `drivers/util/aiLimits.ts` for the tier table.
+    readonly rateLimit = AI_RATE_LIMIT;
+    readonly concurrent = AI_CONCURRENT;
 
     #providers: Record<string, IChatProvider> = {};
     #modelIdMap: Record<string, IChatModel[]> = {};
@@ -132,7 +269,10 @@ export class ChatCompletionDriver extends PuterDriver {
 
     async complete(args: ICompleteArguments): Promise<IChatCompleteResult> {
         const actor = Context.get('actor');
-        if (!actor) throw new HttpError(401, 'Authentication required');
+        if (!actor)
+            throw new HttpError(401, 'Authentication required', {
+                legacyCode: 'unauthorized',
+            });
 
         let intendedProvider = args.provider || '';
         if (!args.model && !intendedProvider) {
@@ -148,7 +288,9 @@ export class ChatCompletionDriver extends PuterDriver {
 
         let model = this.#resolveModel(args.model, intendedProvider);
         if (!model) {
-            throw new HttpError(400, `Model not found: ${args.model}`);
+            throw new HttpError(400, `Model not found: ${args.model}`, {
+                legacyCode: 'bad_request',
+            });
         }
 
         if (args.messages) {
@@ -163,7 +305,8 @@ export class ChatCompletionDriver extends PuterDriver {
             .replaceAll('-', '')
             .slice(0, 25);
 
-        const validateEvent: Record<string, unknown> = {
+        const validateEvent: EventMap['ai.prompt.validate'] = {
+            username: actor.user?.username || '',
             actor,
             completionId,
             allow: true,
@@ -187,7 +330,9 @@ export class ChatCompletionDriver extends PuterDriver {
             const fakeModelId = validateEvent.abuse ? 'abuse' : 'fake';
             const fakeModel = this.#resolveModel(fakeModelId, 'fake-chat');
             if (!fakeModel) {
-                throw new HttpError(403, 'Prompt blocked by policy');
+                throw new HttpError(403, 'Prompt blocked by policy', {
+                    legacyCode: 'forbidden',
+                });
             }
             blocked = true;
             model = fakeModel;
@@ -268,11 +413,14 @@ export class ChatCompletionDriver extends PuterDriver {
         // First attempt
         const provider = this.#providers[model.provider!];
         if (!provider) {
-            throw new HttpError(500, `No provider found for model ${model.id}`);
+            throw new HttpError(
+                500,
+                `No provider found for model ${model.id}`,
+                { legacyCode: 'internal_error' },
+            );
         }
 
-        const attempts: { model: string; provider: string; error: string }[] =
-            [];
+        const attempts: ProviderAttempt[] = [];
         let res: IChatCompleteResult | undefined;
 
         try {
@@ -282,17 +430,12 @@ export class ChatCompletionDriver extends PuterDriver {
                 provider: model.provider,
             });
         } catch (e) {
-            const error = e as Error;
-            attempts.push({
-                model: model.id,
-                provider: model.provider!,
-                error: error?.message ?? String(e),
-            });
+            attempts.push(toAttempt(model.id, model.provider!, e));
 
             // Fallback loop
             const tried = [model.id];
             const triedProviders = [model.provider!];
-            let lastError: Error | null = error;
+            let lastError: Error | null = e as Error;
 
             while (lastError && tried.length < MAX_FALLBACKS) {
                 const fallback = this.#findFallback(
@@ -308,10 +451,8 @@ export class ChatCompletionDriver extends PuterDriver {
                 // Credits can be exhausted mid-fallback by parallel requests;
                 // re-check before another upstream hit. Same bail as the
                 // pre-flight above.
-                const fallbackUsageAllowed = await metering.hasEnoughCredits(
-                    actor,
-                    1,
-                );
+                const fallbackUsageAllowed =
+                    await this.services.metering.hasEnoughCredits(actor, 1);
                 if (!fallbackUsageAllowed) {
                     throw new HttpError(402, 'No usage left for request.', {
                         legacyCode: 'insufficient_funds',
@@ -331,19 +472,15 @@ export class ChatCompletionDriver extends PuterDriver {
                     lastError = null;
                 } catch (fbErr) {
                     lastError = fbErr as Error;
-                    attempts.push({
-                        model: fallback.id,
-                        provider: fallback.provider!,
-                        error: lastError?.message ?? String(fbErr),
-                    });
+                    attempts.push(
+                        toAttempt(fallback.id, fallback.provider!, fbErr),
+                    );
                 }
             }
         }
 
         if (!res) {
-            throw new HttpError(500, 'All providers failed', {
-                fields: { attempts },
-            });
+            throw classifyAttempts(attempts);
         }
 
         const username = actor.user?.username;
@@ -369,13 +506,13 @@ export class ChatCompletionDriver extends PuterDriver {
                 this.clients.event.emit(
                     'ai.prompt.complete',
                     {
-                        username,
+                        username: username!,
                         completionId,
                         intended_service: intendedProvider,
                         parameters: args,
                         result: { usage: enrichedUsage, stream: true },
                         model_used: model.id,
-                        service_used: model.provider,
+                        service_used: model.provider!,
                     },
                     {},
                 );
@@ -425,13 +562,13 @@ export class ChatCompletionDriver extends PuterDriver {
         this.clients.event.emit(
             'ai.prompt.complete',
             {
-                username,
+                username: username!,
                 completionId,
                 intended_service: intendedProvider,
                 parameters: args,
                 result: res,
                 model_used: model.id,
-                service_used: model.provider,
+                service_used: model.provider!,
             },
             {},
         );
@@ -601,7 +738,7 @@ export class ChatCompletionDriver extends PuterDriver {
             'ai.prompt.cost-calculated',
             {
                 completionId,
-                username,
+                username: username!,
                 usage,
                 input_tokens: inputTokens,
                 output_tokens: outputTokens,
@@ -610,11 +747,11 @@ export class ChatCompletionDriver extends PuterDriver {
                 total_ucents: inputMicroCents + outputMicroCents,
                 costs_currency: model.costs_currency,
                 model_used: model.id,
-                service_used: model.provider,
+                service_used: model.provider!,
                 intended_service: intendedProvider,
                 model_details: {
                     id: model.id,
-                    provider: model.provider,
+                    provider: model.provider!,
                     input_cost_key: inputKey,
                     output_cost_key: outputKey,
                     costs: model.costs,
@@ -734,13 +871,13 @@ export class ChatCompletionDriver extends PuterDriver {
             );
         }
 
-        const openrouter = providers['openrouter'];
-        const openrouterKey = readKey(openrouter);
-        if (openrouterKey) {
-            this.#providers['openrouter'] = new OpenRouterProvider(
+        const alibaba = providers['alibaba'];
+        const alibabaKey = readKey(alibaba);
+        if (alibabaKey) {
+            this.#providers['alibaba'] = new AlibabaProvider(
                 {
-                    apiKey: openrouterKey,
-                    apiBaseUrl: openrouter?.apiBaseUrl as string | undefined,
+                    apiKey: alibabaKey,
+                    apiBaseUrl: alibaba?.apiBaseUrl as string | undefined,
                 },
                 metering,
             );
@@ -760,6 +897,18 @@ export class ChatCompletionDriver extends PuterDriver {
             this.#providers['ollama'] = new OllamaChatProvider(
                 {
                     apiBaseUrl: ollama?.apiBaseUrl,
+                },
+                metering,
+            );
+        }
+
+        const openrouter = providers['openrouter'];
+        const openrouterKey = readKey(openrouter);
+        if (openrouterKey) {
+            this.#providers['openrouter'] = new OpenRouterProvider(
+                {
+                    apiKey: openrouterKey,
+                    apiBaseUrl: openrouter?.apiBaseUrl as string | undefined,
                 },
                 metering,
             );

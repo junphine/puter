@@ -37,6 +37,7 @@ import {
     allowedAppIdsGate,
     requireAuthGate,
     requireEmailConfirmedGate,
+    requireNonAccessTokenGate,
     requireUserActorGate,
     requireVerifiedGate,
     subdomainGate,
@@ -48,8 +49,9 @@ import {
 } from './core/http/middleware/antiCsrf';
 import { captchaGate, setCaptchaRedis } from './core/http/middleware/captcha';
 import {
-    rateLimitGate,
+    concurrencyGate,
     configureRateLimit,
+    rateLimitGate,
 } from './core/http/middleware/rateLimit';
 import {
     createWwwRedirect,
@@ -319,30 +321,40 @@ export class PuterServer {
     }
 
     /**
-     * Point the shared rate-limiter at its configured backend. Reads
-     * `config.rate_limit.backend` (defaults to `redis`) and resolves the
-     * required dependency from `this.clients` / `this.stores`. Unknown
-     * or misconfigured backends fall back to memory with a warning so a
-     * typo doesn't take the server down.
+     * Register every rate-limit backend whose dependency is available, so
+     * routes / drivers can mix and match per call. `config.rate_limit.backend`
+     * selects the *default* applied when a caller doesn't specify a
+     * backend; it's no longer an exclusive choice. A typo or missing
+     * dependency for the chosen default falls back to memory with a
+     * warning so boot doesn't break.
      */
     #configureRateLimiter() {
         // Default to `redis` — the redis client is always present (falls
         // back to ioredis-mock in dev when no nodes are configured), and
         // sorted-set rate limiting scales across nodes for free. Set
         // `rate_limit.backend` in config to switch to `memory` or `kv`.
-        const backend = this.#config.rate_limit?.backend ?? 'redis';
+        const defaultBackend = this.#config.rate_limit?.backend ?? 'redis';
+        // Metering is wired so the concurrency gate can resolve
+        // `bySubscription` overrides per actor. Optional — without it,
+        // the base `limit` applies uniformly.
+        const metering = this.services?.metering as unknown;
         try {
             configureRateLimit({
-                backend,
+                default: defaultBackend,
                 redis: this.clients.redis,
                 kv: this.stores.kv,
+                metering,
             });
         } catch (e) {
             console.warn(
-                `[rate-limit] ${backend} backend unavailable, falling back to memory:`,
+                `[rate-limit] default backend '${defaultBackend}' unavailable, falling back to memory:`,
                 (e as Error).message,
             );
-            configureRateLimit();
+            configureRateLimit({
+                redis: this.clients.redis,
+                kv: this.stores.kv,
+                metering,
+            });
         }
     }
 
@@ -357,13 +369,10 @@ export class PuterServer {
      *     `#materializeRoute` as those options ship.
      */
     #installGlobalMiddleware() {
-        // ── Cookie parsing ──────────────────────────────────────────
         this.#app.use(cookieParser());
 
-        // ── Compression ─────────────────────────────────────────────
         this.#app.use(compression());
 
-        // ── Security headers (helmet) ───────────────────────────────
         this.#app.use(helmet.noSniff());
         this.#app.use(helmet.hsts());
         this.#app.use(helmet.ieNoOpen());
@@ -604,7 +613,6 @@ export class PuterServer {
         this.#app.use((req, res, next) => {
             const origin = req.headers.origin;
             const subdomain = req.subdomains?.[req.subdomains.length - 1];
-            const isApiOrDav = subdomain === 'api' || subdomain === 'dav';
 
             // Allow any origin. puter.js is meant to be consumed from
             // arbitrary third-party sites, so reflect the caller's origin
@@ -612,22 +620,17 @@ export class PuterServer {
             res.setHeader('Access-Control-Allow-Origin', origin ?? '*');
             if (origin) res.vary('Origin');
 
-            // Credentials require a specific (non-`*`) Allow-Origin, which
-            // we just set when an origin was present. Enable on API/DAV
-            // so cookie-auth works cross-origin.
-            if (isApiOrDav && origin) {
+            // Sticky cookies require api to allow credentials, but only for the API subdomain, and be careful not to set any other credentials on it
+            if (subdomain === 'api' && origin) {
                 res.setHeader('Access-Control-Allow-Credentials', 'true');
+            } else if (subdomain === 'dav') {
+                res.setHeader('Access-Control-Allow-Credentials', 'false');
             }
 
             res.setHeader('Access-Control-Allow-Methods', allowedMethods);
             res.setHeader('Access-Control-Allow-Headers', allowedHeaders);
 
-            // Private Network Access: grant public origins permission to
-            // reach loopback/private addresses (e.g. self-hosted Puter on
-            // localhost, or api.puter.com pointed at a local IP via hosts).
-            if (req.headers['access-control-request-private-network']) {
-                res.setHeader('Access-Control-Allow-Private-Network', 'true');
-            }
+            res.setHeader('Access-Control-Allow-Private-Network', 'true');
 
             // Disable iframes on the main domain
             if (req.hostname === config.domain) {
@@ -648,7 +651,7 @@ export class PuterServer {
             // client forge the value when traffic isn't behind the expected
             // proxy.
             const ip = req.ip;
-            const event = { allow: true, ip };
+            const event = { allow: true, ip: ip! };
             // emitAndWait so listeners that do async work (IP-reputation
             // lookups, Redis checks) can complete before we read
             // `event.allow` and decide the gate.
@@ -681,9 +684,30 @@ export class PuterServer {
                     // route + error signature so a hot loop of the same
                     // crash lands as a single alarm with N occurrences
                     // instead of N pages.
+                    //
+                    // FORCED_ALERT_CODES override the 5xx-only rule: a
+                    // status < 500 still pages if its legacyCode is in
+                    // the set. Use this for things we want to know about
+                    // even though we expose them as 4xx to users (e.g.
+                    // sustained upstream provider rate limits).
+                    //
+                    // SKIP_ALERT_PREFIXES override the 5xx rule the other
+                    // direction: an error tagged as caused by an upstream
+                    // provider or a misbehaving client gets exposed to
+                    // the user but does not page.
+                    const FORCED_ALERT_CODES = new Set([
+                        'upstream_rate_limited',
+                        'upstream_auth_failed',
+                    ]);
+                    const SKIP_ALERT_PREFIXES = /^(upstream_|client_)/;
                     const isHttp = isHttpError(err);
                     const status = isHttp ? err.statusCode : 500;
-                    if (status < 500) return;
+                    const legacyCode = isHttp ? (err.legacyCode ?? '') : '';
+                    const forced = FORCED_ALERT_CODES.has(legacyCode);
+                    if (!forced) {
+                        if (status < 500) return;
+                        if (SKIP_ALERT_PREFIXES.test(legacyCode)) return;
+                    }
                     const signature = isHttp
                         ? err.legacyCode || err.code || err.message
                         : err instanceof Error
@@ -789,7 +813,9 @@ export class PuterServer {
             opts.allowedAppIds ||
             opts.requireVerified,
         );
-        if (needsAuth) mwChain.push(requireAuthGate());
+        if (needsAuth) {
+            mwChain.push(requireAuthGate());
+        }
 
         // Default-on email confirmation gate. Every authenticated route
         // rejects users pending confirmation unless `allowUnconfirmed`
@@ -798,6 +824,11 @@ export class PuterServer {
         // flows (logout, confirm-email, whoami, save-account, …).
         if (needsAuth && !opts.allowUnconfirmed) {
             mwChain.push(requireEmailConfirmedGate());
+        }
+
+        // block access tokens by default
+        if (needsAuth && !opts.allowAccessToken) {
+            mwChain.push(requireNonAccessTokenGate());
         }
 
         // `requireVerified` intentionally does NOT imply `requireUserActor`:
@@ -811,7 +842,9 @@ export class PuterServer {
         // token, not only from browser sessions. `adminOnlyGate` gates on
         // `actor.user.username`, which is populated for access-token and
         // app-under-user actors alike.
-        if (opts.requireUserActor) mwChain.push(requireUserActorGate());
+        if (opts.requireUserActor) {
+            mwChain.push(requireUserActorGate());
+        }
 
         if (opts.adminOnly) {
             const extras = Array.isArray(opts.adminOnly) ? opts.adminOnly : [];
@@ -837,6 +870,16 @@ export class PuterServer {
         if (opts.rateLimit) {
             mwChain.push(
                 rateLimitGate(opts.rateLimit) as unknown as RequestHandler,
+            );
+        }
+
+        // 2b'. Concurrent in-flight limiting. Same auth-ordering reason
+        // (user key + bySubscription resolution needs req.actor); installed
+        // after rateLimitGate so a rate-rejection short-circuits before
+        // we acquire a concurrency slot. Slot is released on res finish/close.
+        if (opts.concurrent) {
+            mwChain.push(
+                concurrencyGate(opts.concurrent) as unknown as RequestHandler,
             );
         }
 
@@ -926,9 +969,9 @@ export class PuterServer {
                 };
             }
             if (fullPath !== undefined) {
-                app.use(fullPath as any, ...mwChain, handler);
+                app.use(fullPath as any, ...mwChain.flat(), handler);
             } else {
-                app.use(...mwChain, handler);
+                app.use(...mwChain.flat(), handler);
             }
             return;
         }
