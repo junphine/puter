@@ -1345,7 +1345,8 @@ window.delete_item = async function (el_item, descendants_only = false) {
     // hide all UIItems with matching uids
     $(`.item[data-uid='${$(el_item).attr('data-uid')}']`).fadeOut(150, function () {
         // close all windows with matching uids
-        $(`.window-${ $(el_item).attr('data-uid')}`).close();
+        // modify@@byron
+        $(`.window[data-uid='${$(el_item).attr('data-uid')}']`).close();
         // close all windows that belong to a descendant of this item
         // todo this has to be case-insensitive but the `i` selector doesn't work on ^=
         $(`.window[data-path^="${$(el_item).attr('data-path')}/"]`).close();
@@ -1381,7 +1382,9 @@ window.move_clipboard_items = function (el_target_container, target_path) {
     let el_items = [];
     if ( window.clipboard.length > 0 ) {
         for ( let i = 0; i < window.clipboard.length; i++ ) {
-            el_items.push($(`.item[data-path="${html_encode(window.clipboard[i])}" i]`));
+            // modify@byron
+            //- el_items.push($(`.item[data-path="${html_encode(window.clipboard[i])}" i]`));
+            el_items.push(window.clipboard[i].el);
         }
         if ( el_items.length > 0 )
         {
@@ -1998,13 +2001,65 @@ window.updateSubdomainsForItems = async function (fsentries, container) {
     }
 };
 
+
+/**
+ * Opens the file or folder picker (after a single "Upload here" entry) and uploads into target_path.
+ * Browsers require separate inputs for multi-file vs directory tree; we ask once, then open the matching picker.
+ *
+ * @param {*} el_target_container
+ * @param {*} target_path
+ */
+window.init_upload_using_dialog = async function (el_target_container, target_path = null) {    
+
+    const choice = await UIAlert({
+        message: i18n('upload_choose_how'),
+        type: 'confirm',
+        buttons: [
+            { label: i18n('upload_pick_files'), value: 'files', type: 'primary' },
+            { label: i18n('upload_pick_folder'), value: 'folder', type: 'primary' },
+            { label: i18n('cancel'), value: 'cancel', type: 'secondary' },
+        ],
+    });
+
+    if ( choice !== 'files' && choice !== 'folder' ) {
+        return;
+    }
+
+
+    if ( choice === 'files' ) {
+        window.init_upload_using_file_dialog(el_target_container,target_path);
+    }
+    else {
+        let resolved_path = target_path === null ? $(el_target_container).attr('data-path') : path.resolve(target_path);
+        $('#upload-folder-dialog').unbind('onchange');
+        $('#upload-folder-dialog').unbind('change');
+        $('#upload-folder-dialog').unbind('onChange');
+        $('#upload-folder-dialog').off('change');
+        $('#upload-folder-dialog').on('change', async function () {
+            if ( $('#upload-folder-dialog').val() !== '' ) {
+                const files = $('#upload-folder-dialog')[0].files;
+                if ( files.length > 0 ) {
+                    try {
+                        window.upload_items(files, resolved_path, { createMissingParents: true });
+                    }
+                    catch ( err ) {
+                        UIAlert(err.message ?? err);
+                    }
+                    $('#upload-folder-dialog').val('');
+                }
+            }
+        });
+        $('#upload-folder-dialog').trigger('click');
+    }
+};
+
 /**
  *
  * @param {*} el_target_container
  * @param {*} target_path
  */
 
-window.init_upload_using_dialog = function (el_target_container, target_path = null) {
+window.init_upload_using_file_dialog = function (el_target_container, target_path = null) {
     $('#upload-file-dialog').unbind('onchange');
     $('#upload-file-dialog').unbind('change');
     $('#upload-file-dialog').unbind('onChange');
@@ -2030,7 +2085,7 @@ window.init_upload_using_dialog = function (el_target_container, target_path = n
     });
 };
 
-window.upload_items = async function (items, dest_path) {
+window.upload_items = async function (items, dest_path, opts={}) {
     let upload_progress_window;
     let opid;
 
@@ -2047,6 +2102,7 @@ window.upload_items = async function (items, dest_path) {
         // options
         {
             generateThumbnails: true,
+            ...opts,
             // init
             init: async (operation_id, xhr) => {
                 opid = operation_id;
@@ -2903,11 +2959,11 @@ window.rename_file = async (options, new_name, old_name, old_path, el_item, el_i
             options.name = new_name;
             $(el_item).attr('data-name', html_encode(new_name));
             $(`.item[data-uid='${$(el_item).attr('data-uid')}']`).attr('data-name', html_encode(new_name));
-            $(`.window-${options.uid}`).attr('data-name', html_encode(new_name));
+            $(`.window[data-uid='${options.uid}']`).attr('data-name', html_encode(new_name));
 
             // Set new `title` attribute
             $(`.item[data-uid='${$(el_item).attr('data-uid')}']`).attr('title', html_encode(new_name));
-            $(`.window-${options.uid}`).attr('title', html_encode(new_name));
+            $(`.window[data-uid='${options.uid}']`).attr('title', html_encode(new_name));
 
             // Set new value for `item-name-editor`
             $(`.item[data-uid='${$(el_item).attr('data-uid')}'] .item-name-editor`).val(html_encode(new_name));
@@ -2918,7 +2974,7 @@ window.rename_file = async (options, new_name, old_name, old_path, el_item, el_i
             const new_path = options.path;
             $(el_item).attr('data-path', new_path);
             $(`.item[data-uid='${$(el_item).attr('data-uid')}']`).attr('data-path', new_path);
-            $(`.window-${options.uid}`).attr('data-path', new_path);
+            $(`.window[data-uid='${options.uid}']`).attr('data-path', new_path);
 
             // Update all elements that have matching paths
             $(`[data-path="${html_encode(old_path)}" i]`).each(function () {
@@ -2946,12 +3002,12 @@ window.rename_file = async (options, new_name, old_name, old_path, el_item, el_i
             $(el_item).attr('data-website_url', website_url);
 
             // Update all exact-matching windows
-            $(`.window-${options.uid}`).each(function () {
+            $(`.window[data-uid='${options.uid}']`).each(function () {
                 window.update_window_path(this, options.path);
             });
 
             // Set new name for corresponding open windows
-            $(`.window-${options.uid} .window-head-title`).text(new_name);
+            $(`.window[data-uid='${options.uid}'] .window-head-title`).text(new_name);
 
             // Re-sort all matching item containers
             $(`.item[data-uid='${$(el_item).attr('data-uid')}']`).parent('.item-container').each(function () {

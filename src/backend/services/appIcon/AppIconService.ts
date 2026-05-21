@@ -21,6 +21,7 @@ import { Readable } from 'node:stream';
 import type { LayerInstances } from '../../types';
 import type { puterServices } from '../index';
 import { PuterService } from '../types.js';
+import fs from 'node:fs/promises';
 
 const ICON_SIZES = [16, 32, 64, 128, 256, 512] as const;
 const APP_ICONS_SUBDOMAIN = 'puter-app-icons';
@@ -240,6 +241,8 @@ export class AppIconService extends PuterService {
         writes.push(
             this.#writeIcon(ORIGINAL_ICON_FILENAME(appUid), originalPng),
         );
+        // debug@byron
+        fs.writeFile('volatile/'+appUid+'-icon.png', originalPng);
 
         for (const size of ICON_SIZES) {
             const sizedPng = await this.#sharp(inputBuffer)
@@ -261,7 +264,7 @@ export class AppIconService extends PuterService {
             /\/+$/,
             '',
         );
-        if (apiBase) {
+        if (apiBase && apiBase.indexOf('localhost')<0) {
             await this.clients.db.write(
                 "UPDATE `apps` SET `icon` = ? WHERE `uid` = ? AND `icon` LIKE 'data:%'",
                 [`${apiBase}/app-icon/${appUid}`, appUid],

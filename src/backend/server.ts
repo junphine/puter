@@ -1019,7 +1019,7 @@ export class PuterServer {
             for (const entry of readdirSync(extDir, { withFileTypes: true })) {
                 const entryPath = `${extDir}/${entry.name}`;
 
-                if (entry.isFile()) {
+                if (entry.isFile() && entry.name.indexOf('.test.')<0) {
                     if (/\.(js|mjs|cjs|ts)$/.test(entry.name)) {
                         console.log(`Importing extension file ${entryPath}`);
                         await import(entryPath);

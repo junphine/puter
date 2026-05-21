@@ -1032,7 +1032,7 @@ async function UIItem (options) {
                     window.clipboard = [];
                     $selected_items.each(function () {
                         const ell = this;
-                        window.clipboard.push($(ell).attr('data-path'));
+                        window.clipboard.push({ path: $(ell).attr('data-path'), el: ell });
                     });
                 },
             });
@@ -1504,7 +1504,7 @@ async function UIItem (options) {
                     html: i18n('cut'),
                     onClick: function () {
                         window.clipboard_op = 'move';
-                        window.clipboard = [options.path];
+                        window.clipboard = [{ path: options.path, el: el_item }];
                     },
                 });
             }

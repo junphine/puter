@@ -454,7 +454,7 @@ const generate_file_context_menu = async function (options) {
             html: i18n('cut'),
             onClick: function () {
                 window.clipboard_op = 'move';
-                window.clipboard = [fsentry.path];
+                window.clipboard = [{ path: fsentry.path, el: el_item }];
             },
         });
     }

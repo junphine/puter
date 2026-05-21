@@ -605,7 +605,7 @@ export class AppStore extends PuterStore {
         ];
         if (newTypes.length > 0) {
             const placeholders = newTypes.map(() => '(?, ?)').join(', ');
-            const values = newTypes.flatMap((t) => [appId, t]);
+            const values = newTypes.flatMap((t) => [appId, t.replace('.', '')]);
             entries.push({
                 statement: `INSERT INTO \`app_filetype_association\` (\`app_id\`, \`type\`) VALUES ${placeholders}`,
                 values,

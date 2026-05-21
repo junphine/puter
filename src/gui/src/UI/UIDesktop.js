@@ -35,6 +35,7 @@ import UITaskbar from './UITaskbar.js';
 import new_context_menu_item from '../helpers/new_context_menu_item.js';
 import refresh_item_container from '../helpers/refresh_item_container.js';
 import changeLanguage from '../i18n/i18nChangeLanguage.js';
+import UIWindowSettings from './Settings/UIWindowSettings.js';
 import UIWindowTaskManager from './UIWindowTaskManager.js';
 import truncate_filename from '../helpers/truncate_filename.js';
 import UINotification from './UINotification.js';
@@ -313,11 +314,11 @@ async function UIDesktop (options) {
 
         // Set new data-name
         $(`.item[data-uid='${item.uid}']`).attr('data-name', html_encode(item.name));
-        $(`.window-${item.uid}`).attr('data-name', html_encode(item.name));
+        $(`.window[data-uid='${item.uid}']`).attr('data-name', html_encode(item.name));
 
         // Set new title attribute
         $(`.item[data-uid='${item.uid}']`).attr('title', html_encode(item.name));
-        $(`.window-${options.uid}`).attr('title', html_encode(item.name));
+        $(`.window[data-uid='${options.uid}']`).attr('title', html_encode(item.name));
 
         // Set new value for item-name-editor
         $(`.item[data-uid='${item.uid}'] .item-name-editor`).val(html_encode(item.name));
@@ -326,7 +327,7 @@ async function UIDesktop (options) {
         // Set new data-path
         const new_path = item.path;
         $(`.item[data-uid='${item.uid}']`).attr('data-path', new_path);
-        $(`.window-${item.uid}`).attr('data-path', new_path);
+        $(`.window[data-uid='${item.uid}']`).attr('data-path', new_path);
 
         // Update all elements that have matching paths
         $(`[data-path="${html_encode(item.old_path)}" i]`).each(function () {
@@ -344,11 +345,11 @@ async function UIDesktop (options) {
         });
 
         // Update all exact-matching windows
-        $(`.window-${item.uid}`).each(function () {
+        $(`.window[data-uid='${item.uid}']`).each(function () {
             window.update_window_path(this, new_path);
         });
         // Set new name for matching open windows
-        $(`.window-${item.uid} .window-head-title`).text(item.name);
+        $(`.window[data-uid='${item.uid}'] .window-head-title`).text(item.name);
 
         // Re-sort all matching item containers
         $(`.item[data-uid='${item.uid}']`).parent('.item-container').each(function () {
@@ -524,11 +525,11 @@ async function UIDesktop (options) {
 
         // Set new data-name
         $(`.item[data-uid='${item.uid}']`).attr('data-name', html_encode(item.name));
-        $(`.window-${item.uid}`).attr('data-name', html_encode(item.name));
+        $(`.window[data-uid='${item.uid}']`).attr('data-name', html_encode(item.name));
 
         // Set new title attribute
         $(`.item[data-uid='${item.uid}']`).attr('title', html_encode(item.name));
-        $(`.window-${options.uid}`).attr('title', html_encode(item.name));
+        $(`.window[data-uid='${options.uid}']`).attr('title', html_encode(item.name));
 
         // Set new value for item-name-editor
         $(`.item[data-uid='${item.uid}'] .item-name-editor`).val(html_encode(item.name));
@@ -537,7 +538,7 @@ async function UIDesktop (options) {
         // Set new data-path
         const new_path = item.path;
         $(`.item[data-uid='${item.uid}']`).attr('data-path', new_path);
-        $(`.window-${item.uid}`).attr('data-path', new_path);
+        $(`.window[data-uid='${item.uid}']`).attr('data-path', new_path);
 
         // Update all elements that have matching paths
         $(`[data-path="${html_encode(item.old_path)}" i]`).each(function () {
@@ -555,11 +556,11 @@ async function UIDesktop (options) {
         });
 
         // Update all exact-matching windows
-        $(`.window-${item.uid}`).each(function () {
+        $(`.window[data-uid='${item.uid}']`).each(function () {
             window.update_window_path(this, new_path);
         });
         // Set new name for matching open windows
-        $(`.window-${item.uid} .window-head-title`).text(item.name);
+        $(`.window[data-uid='${item.uid}'] .window-head-title`).text(item.name);
 
         // Re-sort all matching item containers
         $(`.item[data-uid='${item.uid}']`).parent('.item-container').each(function () {
@@ -639,6 +640,7 @@ async function UIDesktop (options) {
             <input type="hidden" name="name" id="upload-filename" value="">
             <input type="hidden" name="path" id="upload-target-path" value="">
             <input type="file" name="file" id="upload-file-dialog" style="display: none;" multiple="multiple">
+            <input type="file" name="folder" id="upload-folder-dialog" style="display: none;" webkitdirectory directory>
         </form>`;
 
     h += '<div class="window-container"></div>';
@@ -1181,7 +1183,15 @@ async function UIDesktop (options) {
     ht += '<svg style="width: 17px; height: 17px;" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" x="0px" y="0px" width="48px" height="48px" viewBox="0 0 48 48"><g transform="translate(0, 0)"><path d="M45.521,39.04L27.527,5.134c-1.021-1.948-3.427-2.699-5.375-1.679-.717,.376-1.303,.961-1.679,1.679L2.479,39.04c-.676,1.264-.635,2.791,.108,4.017,.716,1.207,2.017,1.946,3.42,1.943H41.993c1.403,.003,2.704-.736,3.42-1.943,.743-1.226,.784-2.753,.108-4.017ZM23.032,15h1.937c.565,0,1.017,.467,1,1.031l-.438,14c-.017,.54-.459,.969-1,.969h-1.062c-.54,0-.983-.429-1-.969l-.438-14c-.018-.564,.435-1.031,1-1.031Zm.968,25c-1.657,0-3-1.343-3-3s1.343-3,3-3,3,1.343,3,3-1.343,3-3,3Z" fill="#ffbb00"></path></g></svg>';
     ht += '</div>';
 
+    // 'Show Desktop'
+    ht += `<a href="/" class="show-desktop-btn toolbar-btn antialiased hidden" target="_blank" title="${i18n('desktop_show_desktop')}">${i18n('desktop_show_desktop')} <img src="${window.icons['launch-white.svg']}" style="width: 10px; height: 10px; margin-left: 5px;"></a>`;
 
+
+    // do not show the fullscreen button on mobile devices since it's broken
+    if ( ! isMobile.phone ) {
+        // fullscreen button
+        ht += `<div class="toolbar-btn fullscreen-btn" title="${i18n('toolbar.enter_fullscreen')}" style="background-image:url(${window.icons['fullscreen.svg']})"></div>`;
+    }
 
     // qr code button -- only show if not embedded
     if ( ! window.is_embedded )
@@ -1254,6 +1264,11 @@ async function UIDesktop (options) {
             try {
                 window.app_launched_from_url = await puter.apps.get(window.url_paths[1], { icon_size: 64 });
                 window.is_fullpage_mode = window.app_launched_from_url.metadata?.fullpage_on_landing ?? window.is_fullpage_mode ?? false;
+
+                // show 'Show Desktop' button
+                if ( window.is_fullpage_mode ) {
+                    $('.show-desktop-btn').removeClass('hidden');
+                }
             } catch (e) {
                 console.error('UIDesktop app path launch error', e);
             }
@@ -1272,7 +1287,14 @@ async function UIDesktop (options) {
     // /settings redirects to /dashboard
     //--------------------------------------------------------------------------------------
     else if ( window.url_paths[0]?.toLocaleLowerCase() === 'settings' ) {
-        window.open('/dashboard', '_blank');
+        //- window.open('/dashboard', '_blank');
+        // open settings
+        UIWindowSettings({
+            tab: window.url_paths[1] || 'about',
+            window_options: {
+                is_fullpage: true,
+            },
+        });
     }
     // ---------------------------------------------
     // Run apps from insta-login URL
@@ -2130,7 +2152,8 @@ $(document).on('click', '.user-options-menu-btn', async function (e) {
                 html: i18n('settings'),
                 id: 'settings',
                 onClick: async function () {
-                    window.open('/dashboard', '_blank');
+                    //- window.open('/dashboard', '_blank');
+                    UIWindowSettings();
                 },
             },
             //--------------------------------------------------
@@ -2205,6 +2228,31 @@ $(document).on('click', '.user-options-menu-btn', async function (e) {
     });
 });
 
+$(document).on('click', '.fullscreen-btn', async function (e) {
+    if ( ! window.is_fullscreen() ) {
+        var elem = document.documentElement;
+        if ( elem.requestFullscreen ) {
+            elem.requestFullscreen();
+        } else if ( elem.webkitRequestFullscreen ) { /* Safari */
+            elem.webkitRequestFullscreen();
+        } else if ( elem.mozRequestFullScreen ) { /* moz */
+            elem.mozRequestFullScreen();
+        } else if ( elem.msRequestFullscreen ) { /* IE11 */
+            elem.msRequestFullscreen();
+        }
+    }
+    else {
+        if ( document.exitFullscreen ) {
+            document.exitFullscreen();
+        } else if ( document.webkitExitFullscreen ) {
+            document.webkitExitFullscreen();
+        } else if ( document.mozCancelFullScreen ) {
+            document.mozCancelFullScreen();
+        } else if ( document.msExitFullscreen ) {
+            document.msExitFullscreen();
+        }
+    }
+});
 
 $(document).on('click', '.close-launch-popover', function () {
     $('.launch-popover').closest('.popover').fadeOut(200, function () {
@@ -2322,6 +2370,21 @@ $(document).on('click', '.launch-search-clear', function (e) {
     $('.launch-search').focus();
 });
 
+document.addEventListener('fullscreenchange', (event) => {
+    // document.fullscreenElement will point to the element that
+    // is in fullscreen mode if there is one. If there isn't one,
+    // the value of the property is null.
+
+    if ( document.fullscreenElement ) {
+        $('.fullscreen-btn').css('background-image', `url(${window.icons['shrink.svg']})`);
+        $('.fullscreen-btn').attr('title', i18n('desktop_exit_full_screen'));
+        window.user_preferences.clock_visible === 'auto' && $('#clock').show();
+    } else {
+        $('.fullscreen-btn').css('background-image', `url(${window.icons['fullscreen.svg']})`);
+        $('.fullscreen-btn').attr('title', i18n('desktop_enter_full_screen'));
+        window.user_preferences.clock_visible === 'auto' && $('#clock').hide();
+    }
+});
 
 window.set_desktop_background = function (options) {
     if ( options.fit ) {
@@ -2427,6 +2490,9 @@ window.exit_fullpage_mode = (el_window) => {
 
     // reset dektop height to take into account the taskbar height
     $('.desktop').css('height', `calc(100vh - ${window.taskbar_height + window.toolbar_height}px)`);
+
+    // hide the 'Show Desktop' button in toolbar
+    $('.show-desktop-btn').hide();
 
     // refresh desktop background
     window.refresh_desktop_background();

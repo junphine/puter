@@ -17,7 +17,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import init_apps from './apps.js';
+import init_apps,{generateDirTree,setRootDirTree} from './apps.js';
 import init_workers from './workers.js';
 import init_websites from './websites.js';
 
@@ -74,10 +74,17 @@ if ( window.url_params.has('source_path') ) {
     window.source_path = null;
 }
 
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
 // ---------------------------------------------------------------
 // Initialize
 // ---------------------------------------------------------------
 $(document).ready(async function () {
+
+    while ( window.auth_username===null ) {
+        await sleep(200);
+    }
     // initialize assets directory
     await initializeAssetsDirectory();
 

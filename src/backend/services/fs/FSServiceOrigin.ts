@@ -23,7 +23,6 @@ import { createHash } from 'node:crypto';
 import { Readable, Transform } from 'node:stream';
 import type { TransformCallback } from 'node:stream';
 import { v4 as uuidv4 } from 'uuid';
-import { Nano64 } from "nano64";
 import type {
     MultipartCompletePart,
     SignedUploadResult,
@@ -77,28 +76,6 @@ const isNoSuchKeyError = (err: unknown): boolean => {
     if (!err || typeof err !== 'object') return false;
     const e = err as { name?: unknown; Code?: unknown };
     return e.name === 'NoSuchKey' || e.Code === 'NoSuchKey';
-};
-
-export const genObjectKey = (path: string): string => {
-    const parts = path.split('/');
-    if(parts.length==2){
-        return parts[1]+'/';
-    }
-    if(parts.length==3 && parts[2]===''){
-        return parts[1]+'/';
-    }
-    if(parts.length==4 && parts[3]===''){
-        return parts[1]+'/'+parts[2] + '/';
-    }
-    const dot = path.lastIndexOf('.');
-    let ext = '';
-    if (dot > 0)
-        ext = path.slice(dot);
-    const uuid = Nano64.generate().toHex();
-    if(parts.length>3){
-        return parts[1]+'/'+parts[2]+'/'+uuid+ext;
-    }
-    return parts[1]+'/'+uuid+ext;
 };
 
 interface WriteTargetResolutionInput {
@@ -1060,7 +1037,7 @@ export class FSService extends PuterService {
         return {
             sessionId: '',
             uploadMode: 'single',
-            objectKey: fsEntry.path.substring(1),
+            objectKey: fsEntry.uuid,
             bucket: fsEntry.bucket ?? '',
             bucketRegion: fsEntry.bucketRegion ?? '',
             contentType: 'inode/directory',
@@ -1170,8 +1147,7 @@ export class FSService extends PuterService {
             index: item.index,
             normalizedInput: item.normalizedInput,
             existingEntry: item.existingEntry,
-            // modify@byron
-            objectKey: item.existingEntry?.uuid ?? genObjectKey(item.normalizedInput.path),
+            objectKey: item.existingEntry?.uuid ?? uuidv4(),
             wasOverwrite: item.wasOverwrite,
             requestedThumbnail: item.requestedThumbnail,
             guiMetadata: item.guiMetadata,
@@ -1442,8 +1418,8 @@ export class FSService extends PuterService {
                 'Failed to resolve parent directory for signed write',
             );
         }
-        // modify@byron
-        const objectKey = existingEntry?.uuid ?? genObjectKey(normalizedInput.path);
+
+        const objectKey = existingEntry?.uuid ?? uuidv4();
         const uploadMode = this.#determineUploadMode(
             signedWriteRequest.uploadMode,
             normalizedInput.size,
@@ -1684,8 +1660,7 @@ export class FSService extends PuterService {
             }
 
             const objectKeys = resolvedFileItems.map((item) => {
-                // modify@byron use real path
-                return item.existingEntry?.uuid ?? genObjectKey(item.normalizedInput.path);                
+                return item.existingEntry?.uuid ?? uuidv4();
             });
             const uploadModes = resolvedFileItems.map((item) => {
                 return this.#determineUploadMode(
@@ -2418,8 +2393,7 @@ export class FSService extends PuterService {
             writeRequest.encoding,
             uploadTracker,
         );
-        // modify@byron
-        const objectKey = existingEntry?.uuid ?? genObjectKey(normalizedInput.path);
+        const objectKey = existingEntry?.uuid ?? uuidv4();
         await this.stores.s3Object.uploadFromServer(
             {
                 bucket: normalizedInput.bucket,
@@ -2939,7 +2913,7 @@ export class FSService extends PuterService {
                 legacyCode: 'conflict',
             });
         }
-        // todo@byron op in s3
+
         const updated = await this.stores.fsEntry.updateEntry(entry.uuid, {
             name: newName,
             path: newPath,
@@ -3306,7 +3280,7 @@ export class FSService extends PuterService {
         if (input.newMetadata === null) metadataPatch = null;
         else if (typeof input.newMetadata === 'object')
             metadataPatch = JSON.stringify(input.newMetadata);
-        // todo@byron move in s3
+
         const updated = await this.stores.fsEntry.updateEntry(source.uuid, {
             name,
             path: finalPath,
@@ -3507,10 +3481,8 @@ export class FSService extends PuterService {
         }
 
         // Regular file: duplicate the S3 object under a new key (the new
-        // entry's uuid), then insert the DB row pointing at it.        
-        // modify@byron
-        //- const newUuid = uuidv4();        
-        const newObjectKey = genObjectKey(_newPath); // = newUuid;
+        // entry's uuid), then insert the DB row pointing at it.
+        const newUuid = uuidv4();
         const sourceObjectKey = this.#deriveObjectKeyFromEntry(source);
         const resolvedBucket = this.stores.s3Object.resolveBucket(
             source.bucket,
@@ -3520,7 +3492,7 @@ export class FSService extends PuterService {
                 sourceBucket: resolvedBucket,
                 sourceKey: sourceObjectKey,
                 destinationBucket: resolvedBucket,
-                destinationKey: newObjectKey,
+                destinationKey: newUuid,
             },
             this.stores.s3Object.resolveRegion(source.bucketRegion),
         );
@@ -3528,7 +3500,7 @@ export class FSService extends PuterService {
         // Re-serialize metadata, swapping in the new objectKey.
         const nextMetadata = this.#metadataWithObjectKey(
             source.metadata,
-            newObjectKey,
+            newUuid,
         );
 
         // Insert as a file row. We reuse the files INSERT path (batchCreateEntries)
@@ -3537,7 +3509,7 @@ export class FSService extends PuterService {
             [
                 {
                     userId,
-                    uuid: newObjectKey,
+                    uuid: newUuid,
                     path:
                         destinationParent.path === '/'
                             ? `/${newName}`
@@ -3568,7 +3540,7 @@ export class FSService extends PuterService {
                     source,
                     copy: created,
                     sourceObjectKey,
-                    copyObjectKey: newObjectKey,
+                    copyObjectKey: newUuid,
                 },
                 {},
             );

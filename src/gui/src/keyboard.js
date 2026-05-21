@@ -774,7 +774,8 @@ $(document).bind('keyup keydown', async function (e) {
                 window.clipboard = [];
                 window.clipboard_op = 'move';
                 $selected_items.each(function () {
-                    window.clipboard.push($(this).attr('data-path'));
+                    // add to clipboard
+                    window.clipboard.push({ path: $(this).attr('data-path'), el: this });
                 });
             }
         }

@@ -233,10 +233,9 @@ async function UIWindow (options) {
         options.is_visible = false;
     }
 
-    h += `<div class="window window-active 
-                        ${options.app === 'explorer' ? 'window-explorer' : ''}
+    h += `<div class="window window-active                        
                         ${options.cover_page ? 'window-cover-page' : ''}
-                        ${options.uid !== undefined ? `window-${options.uid}` : ''} 
+                        ${options.app !== undefined ? `window-${options.app}` : ''} 
                         ${options.window_class} 
                         ${options.allow_user_select ? ' allow-user-select' : ''}
                         ${options.is_openFileDialog || options.is_saveFileDialog || options.is_directoryPicker ? 'window-filedialog' : ''}" 

@@ -2069,7 +2069,7 @@ window.deploy = async function (app, items) {
     }
 };
 
-function generateDirTree (paths) {
+export function generateDirTree (paths) {
     const root = {};
 
     for ( let path of paths ) {
@@ -2087,7 +2087,7 @@ function generateDirTree (paths) {
     return root;
 }
 
-function setRootDirTree (tree, items) {
+export function setRootDirTree (tree, items) {
     // Get all keys (directories and files) in the root
     const rootKeys = Object.keys(tree);
 

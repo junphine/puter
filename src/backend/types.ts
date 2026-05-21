@@ -122,6 +122,7 @@ export interface IThumbnailStoreConfig {
     name?: string;
     /** Endpoint URL — unset forces the fallback. */
     endpoint?: string;
+    region?: string;
     credentials?: {
         accessKeyId: string;
         secretAccessKey: string;

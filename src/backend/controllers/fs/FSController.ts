@@ -421,7 +421,7 @@ export class FSController extends PuterController {
             const busboy = Busboy({ headers: req.headers });
 
             busboy.on('field', (fieldName, value, info) => {
-                if (info.fieldnameTruncated || info.valueTruncated) {
+                if (info.nameTruncated || info.valueTruncated) {
                     failParse(
                         new HttpError(
                             400,

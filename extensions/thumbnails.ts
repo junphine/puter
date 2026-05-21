@@ -6,6 +6,7 @@ import {
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { extension } from '@heyputer/backend/src/extensions';
+import { genObjectKey } from '@heyputer/backend/src/services/fs/FSService';
 import crypto from 'node:crypto';
 import sharp from 'sharp';
 const clients = extension.import('client');
@@ -28,12 +29,8 @@ function resolveClients(): { send: S3Client; presign: S3Client } {
     // dedicated S3 bucket instead of the main one.
     const thumbStore = extension.config.thumbnailStore;
 
-    if (thumbStore?.endpoint && thumbStore.credentials) {
-        s3Client = new S3Client({
-            region: 'auto',
-            endpoint: thumbStore.endpoint,
-            credentials: thumbStore.credentials,
-        });
+    if (thumbStore?.endpoint && thumbStore.name) {
+        s3Client = new S3Client(thumbStore);
         // Dedicated thumbnail buckets use a single endpoint for both
         // server-side ops and browser-facing presigned URLs.
         s3PresignClient = s3Client;
@@ -179,7 +176,7 @@ export const handleThumbnailRead = async (
     const presignClient = deps.s3Presign;
 
     if (thumb.startsWith('s3://')) {
-        const [bucket, key] = thumb.slice(5).split('/');
+        const [bucket, key] = thumb.slice(5).split('/',2);
         entry.thumbnail = await getSignedUrl(
             presignClient,
             new GetObjectCommand({ Bucket: bucket, Key: key }),
@@ -190,7 +187,7 @@ export const handleThumbnailRead = async (
         thumb.includes(new URL(deps.bucketEndpoint).hostname)
     ) {
         // Legacy format — remove after full migration
-        const [bucket, key] = new URL(thumb).pathname.slice(1).split('/');
+        const [bucket, key] = new URL(thumb).pathname.slice(1).split('/',2);
         entry.thumbnail = await getSignedUrl(
             presignClient,
             new GetObjectCommand({ Bucket: bucket, Key: key }),
@@ -239,7 +236,7 @@ export const handleFsRemoveNodeThumbnail = async (
     const thumbnailUrl = payload.target.thumbnail as string | undefined;
     if (!thumbnailUrl || !thumbnailUrl.startsWith('s3://')) return;
 
-    const [bucket, key] = thumbnailUrl.slice(5).split('/');
+    const [bucket, key] = thumbnailUrl.slice(5).split('/',2);
     await deps.s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
 };
 

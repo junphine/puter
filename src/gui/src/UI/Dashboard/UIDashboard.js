@@ -42,29 +42,18 @@ import UIWindowFeedback from '../UIWindowFeedback.js';
  *   dashboard window element. Extensions can listen for this event to add custom functionality.
  */
 
-// Import tab modules
-import TabHome from './TabHome.js';
-import TabApps from './TabApps.js';
-import TabUsage from './TabUsage.js';
-import TabAccount from './TabAccount.js';
-import TabSecurity from './TabSecurity.js';
+def(Symbol('TDashboardTab'), 'ui.traits.TDashboardTab');
 
-// Registry of built-in tabs
-const builtinTabs = [
-    TabHome,
-    TabApps,
-    '-',
-    TabUsage,
-    TabAccount,
-    TabSecurity,
-];
 
 async function UIDashboard (options) {
     // eslint-disable-next-line no-unused-vars
     options = options ?? {};
 
+    const svc_dashboard = globalThis.services.get('dashboard');
+    const ext_tabs = svc_dashboard.get_tabs();
+
     // Create mutable tabs array from built-in tabs
-    const tabs = [...builtinTabs];
+    const tabs = [...svc_dashboard.get_top_tabs(),'-',...ext_tabs];
 
     // Dispatch 'dashboard-will-open' event to allow extensions to add tabs
     window.dispatchEvent(new CustomEvent('dashboard-will-open', { detail: { tabs } }));
@@ -92,13 +81,16 @@ async function UIDashboard (options) {
             h += '<div class="dashboard-sidebar-nav">';
             for ( let i = 0; i < tabs.length; i++ ) {
                 const tab = tabs[i];
-                if ( tab === '-' ) {
+                if ( tab === '-' || tab === '_') {
                     h += '<hr class="dashboard-sidebar-separator">';
                     continue;
                 }
                 const isActive = i === 0 ? ' active' : '';
                 const tabHash = tab.id === 'home' ? '' : `#${tab.id}`;
                 const tabHref = tabHash || window.location.pathname;
+                if(tab.icon && (tab.icon.endsWith('.svg') || tab.icon.endsWith('.png'))){
+                   tab.icon = `<img src="${window.icons[tab.icon]}" height="18px" width="18px" />`;
+                }
                 h += `<a class="dashboard-sidebar-item allow-native-ctxmenu${isActive}" href="${tabHref}" data-section="${tab.id}" data-tooltip="${html_encode(tab.label)}">`;
                     h += tab.icon;
                     h += tab.label;
@@ -120,7 +112,7 @@ async function UIDashboard (options) {
         h += '<div class="dashboard-content">';
         for ( let i = 0; i < tabs.length; i++ ) {
             const tab = tabs[i];
-            if ( tab === '-' ) continue;
+            if ( tab === '-' || tab === '_') continue;
             const isActive = i === 0 ? ' active' : '';
             h += `<div class="dashboard-section dashboard-section-${tab.id}${isActive}" data-section="${tab.id}">`;
             h += tab.html();
@@ -156,6 +148,7 @@ async function UIDashboard (options) {
 
     // Initialize all tabs
     for ( const tab of tabs ) {
+        if ( tab === '-' || tab === '_') continue;
         if ( tab.init ) {
             tab.init($el_window);
         }

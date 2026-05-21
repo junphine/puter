@@ -31,6 +31,7 @@ const DEFAULT_FOLDERS = [
     'Pictures',
     'Videos',
     'Public',
+    'templates'
 ] as const;
 type FolderName = (typeof DEFAULT_FOLDERS)[number];
 
@@ -57,16 +58,17 @@ export async function generateDefaultFsentries(
     // Idempotency guard: if trash_uuid is already set, the tree exists.
     // Cheap check vs. a redundant INSERT + UPDATE on retries / re-runs.
     if (user.trash_uuid) return;
-
-    const home_uuid = uuidv4();
+    // modify@byron
+    const home_uuid = `${user.username}/`;
     const folderUuids: Record<FolderName, string> = {
-        Trash: uuidv4(),
-        AppData: uuidv4(),
-        Desktop: uuidv4(),
-        Documents: uuidv4(),
-        Pictures: uuidv4(),
-        Videos: uuidv4(),
-        Public: uuidv4(),
+        Trash: `${user.username}/Trash/`,
+        AppData: `${user.username}/AppData/`,
+        Desktop: `${user.username}/Desktop/`,
+        Documents: `${user.username}/Documents/`,
+        Pictures: `${user.username}/Pictures/`,
+        Videos: `${user.username}/Videos/`,
+        Public: `${user.username}/Public/`,
+        templates: `${user.username}/templates/`,
     };
     const ts = Math.floor(Date.now() / 1000);
 
