@@ -25,6 +25,7 @@ import type { Application, RequestHandler } from 'express';
 import helmet from 'helmet';
 import uaParser from 'ua-parser-js';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import http from 'node:http';
 import { puterClients } from './clients';
 import { puterControllers } from './controllers';
@@ -1019,10 +1020,10 @@ export class PuterServer {
             for (const entry of readdirSync(extDir, { withFileTypes: true })) {
                 const entryPath = `${extDir}/${entry.name}`;
 
-                if (entry.isFile() && entry.name.indexOf('.test.')<0) {
+                if (entry.isFile()) {
                     if (/\.(js|mjs|cjs|ts)$/.test(entry.name)) {
                         console.log(`Importing extension file ${entryPath}`);
-                        await import(entryPath);
+                        await import(pathToFileURL(entryPath).href);
                     }
                     continue;
                 }
@@ -1059,7 +1060,7 @@ export class PuterServer {
                 if (!mainPath) continue;
 
                 console.log(`Importing extension file ${mainPath}`);
-                await import(mainPath);
+                await import(pathToFileURL(mainPath).href);
             }
         }
     }

@@ -14,6 +14,9 @@
  *   the SocketService fans out to user-scoped channels.
  */
 
+import { Actor } from '../../core';
+import { FSEntry } from '../../stores/fs/FSEntry';
+
 // GUI write events spread an entry plus per-event metadata into `response`.
 // The exact field set varies by emit site (FSController / LegacyFSController /
 // WebDAVController each project a slightly different shape) so the envelope
@@ -96,8 +99,11 @@ export type EventMap = {
     };
     'app.from-origin': { origin: string };
     'app.privateAccess.check': {
-        app: unknown;
-        actor: unknown;
+        appUid: string;
+        userUid: string;
+        requestHost: string;
+        requestPath: string;
+        actor?: Actor;
         result: {
             allowed: boolean;
             reason?: string;
@@ -162,8 +168,9 @@ export type EventMap = {
         sourceObjectKey: string;
         copyObjectKey: string;
     };
-    'fs.move.node': { node: unknown; fromPath: string; toPath: string };
-    'fs.remove.node': { node: unknown; entry: unknown; target: unknown };
+    'fs.move.node': { node: FSEntry; fromPath: string; toPath: string };
+    'fs.remove.node': { node: FSEntry; entry: FSEntry; target: FSEntry };
+    'fs.write.file': { node: FSEntry; entry: FSEntry; target: FSEntry };
     'fs.storage.upload-progress': {
         upload_tracker: unknown;
         context: unknown;
@@ -199,6 +206,13 @@ export type EventMap = {
     // ---- Subdomains ----
     'subdomain.delete': { subdomain: string };
     'subdomain.update': { subdomain: string };
+    'site.htmlServed': {
+        subdomain: string;
+        entry: unknown;
+        host: string;
+        requestPath: string;
+        mime: string;
+    };
 
     // ---- Thumbnails ----
     'thumbnail.read': {
@@ -264,8 +278,9 @@ export type MatchingEvents<P extends ListenKey> = P extends `${infer Prefix}.*`
     ? Extract<EventKey, `${Prefix}.${string}`>
     : P & EventKey;
 
+export type EventMetadata = { from_outside?: boolean };
 export type EventListener<K extends EventKey = EventKey> = (
     key: K,
     data: EventMap[K],
-    meta: unknown,
+    meta: EventMetadata,
 ) => Promise<void> | void;

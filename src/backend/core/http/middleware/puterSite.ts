@@ -21,9 +21,9 @@ import type { RequestHandler } from 'express';
 import { contentType as contentTypeFromMime } from 'mime-types';
 import { posix as pathPosix } from 'node:path';
 import type { puterClients } from '../../../clients';
+import { FS_COSTS } from '../../../controllers/fs/costs';
 import type { puterServices } from '../../../services';
 import type { puterStores } from '../../../stores';
-import { FS_COSTS } from '../../../controllers/fs/costs';
 import type { IConfig, LayerInstances } from '../../../types';
 import {
     buildAppCenterFallback,
@@ -436,7 +436,16 @@ export const createPuterSiteMiddleware = (
         // Resolve URL path → absolute FS path under the site root.
         let urlPath = req.path || '/';
         if (urlPath.endsWith('/')) urlPath += 'index.html';
-        const decoded = decodeURIComponent(urlPath);
+        let decoded: string;
+        try {
+            decoded = decodeURIComponent(urlPath);
+        } catch {
+            // Malformed `%xx` escape — treat as a missing path, not a 500.
+            res.status(404)
+                .type('text/html; charset=UTF-8')
+                .send('<h1>404</h1><p>Not Found</p>');
+            return;
+        }
         // pathPosix.normalize strips `..` segments; the join with '/' anchors
         // it so traversal can't escape the site root.
         const resolvedUrlPath = pathPosix.normalize(
@@ -452,7 +461,14 @@ export const createPuterSiteMiddleware = (
         // Subdomain hosting bypasses ACL by design: anything the owner placed
         // under the registered root_dir is treated as public. Path traversal
         // is blocked above by `pathPosix.normalize` anchoring at `/`.
-        const entry = await layers.stores.fsEntry.getEntryByPath(filePath);
+        let entry = await layers.stores.fsEntry.getEntryByPath(filePath);
+        if (entry?.isDir) {
+            // Folder request → fall back to <folder>/index.html, the same
+            // way `/` is rewritten to `/index.html` at the site root above.
+            entry = await layers.stores.fsEntry.getEntryByPath(
+                pathPosix.join(filePath, 'index.html'),
+            );
+        }
         if (!entry || entry.isDir) {
             res.status(404)
                 .type('text/html; charset=UTF-8')
@@ -479,6 +495,25 @@ export const createPuterSiteMiddleware = (
         const mime =
             contentTypeFromMime(entry.name) || 'application/octet-stream';
         res.setHeader('Content-Type', mime);
+
+        // Fire-and-forget signal for downstream extensions
+        if (mime === 'text/html' || mime === 'application/xhtml+xml') {
+            try {
+                layers.clients.event.emit(
+                    'site.htmlServed',
+                    {
+                        subdomain,
+                        entry,
+                        host,
+                        requestPath: req.path,
+                        mime,
+                    },
+                    {},
+                );
+            } catch (e) {
+                console.warn('[puter-site] site.htmlServed emit failed', e);
+            }
+        }
         if (download.contentLength !== null) {
             res.setHeader('Content-Length', String(download.contentLength));
         }
