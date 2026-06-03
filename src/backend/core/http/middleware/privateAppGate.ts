@@ -31,9 +31,10 @@ import type { Actor } from '../../actor';
  *
  * Covers:
  *   - Host/subdomain parsing against `private_app_hosting_domain(_alt)`.
- *   - Broader private-app detection for hosted sites whose subdomain row
- *     has no `associated_app_id` — falls back to an `index_url` lookup
- *     against the subdomain owner's private apps.
+ *   - Owned-app detection for hosted sites: matches the subdomain owner's
+ *     apps by `index_url` against the request host. Replaces the older
+ *     `associated_app_id`-trusting path, which was user-writable without
+ *     an ownership check.
  *   - Bootstrap-token identity resolution (`Authorization: Bearer`,
  *     `?puter.auth.token=`, `X-Puter-Auth-Token`, referrer query) so
  *     private-app visitors with a valid session token (but no cookie on
@@ -68,6 +69,7 @@ export interface PrivateHostingConfig {
 export interface PrivateIdentity {
     source:
         | 'private-cookie'
+        | 'public-cookie'
         | 'session-cookie'
         | 'bootstrap-token'
         | 'authorization'
@@ -76,13 +78,12 @@ export interface PrivateIdentity {
         | 'none';
     userUid?: string;
     sessionUuid?: string;
-    /** True when resolved from the sticky `puter.private.asset.token` cookie. */
+    /** True when resolved from the sticky private-asset cookie. */
     hasValidPrivateCookie?: boolean;
 }
 
 interface SubdomainLike {
     user_id?: number | null;
-    associated_app_id?: number | null;
 }
 
 interface AppLike {
@@ -95,7 +96,7 @@ interface AppLike {
     index_url?: string | null;
 }
 
-// ── Host helpers ────────────────────────────────────────────────────
+// -- Host helpers ----------------------------------------------------
 
 export function normalizeHost(value: string | undefined | null): string | null {
     if (typeof value !== 'string') return null;
@@ -149,7 +150,7 @@ export function hostMatchesPrivateDomain(
     return privateDomains.some((pd) => host === pd || host.endsWith(`.${pd}`));
 }
 
-// ── Subdomain extraction from a hosted request ─────────────────────
+// -- Subdomain extraction from a hosted request ---------------------
 
 export function subdomainFromHost(
     host: string,
@@ -169,43 +170,39 @@ export function subdomainFromHost(
     return host.split('.')[0] || '';
 }
 
-// ── Private-app detection fallback (v1 `resolvePrivateAppForHostedSite`)
+// -- Hosted-site → owned-app resolution -----------------------------
 
 /**
- * When the subdomain row has no `associated_app_id`, v1 looked up the
- * owner's private apps and matched `index_url` against the request host
- * variants (this-subdomain × every hosting domain). Ports that logic.
+ * Resolve "what app does the subdomain owner run on this host?" by matching
+ * apps owned by `site.user_id` against the request's host variants. Used by
+ * the puter-site middleware to decide whether the request hits a private
+ * app (gate) or a public app (sticky cookie), and by the subdomain driver
+ * to populate the `associated_app` field in API responses.
  *
- * Returns the matched private app (if any) so the caller can run the
- * normal access check — closes a gap where a private app's files could
- * be served via a subdomain whose row wasn't explicitly linked.
+ * Ownership-anchored on `apps.owner_user_id = site.user_id` so a subdomain
+ * can never "claim" an app belonging to a different user. The `subdomains`
+ * row's own `associated_app_id` column is intentionally ignored — it was
+ * previously user-writable without an ownership check, so any value there
+ * is either legacy or planted; deriving from `index_url` makes the answer
+ * fall out of facts the system already verifies at app-create time.
  */
-export async function resolvePrivateAppForHostedSite(opts: {
+export async function resolveOwnedAppForHostedSite(opts: {
     req: Request;
     site: SubdomainLike;
-    associatedApp: AppLike | null;
     db: AbstractDatabaseClient;
     config: PrivateHostingConfig;
-    matchedHostingDomain: string;
+    requirePrivate?: boolean;
 }): Promise<AppLike | null> {
-    // When the subdomain row's own `associated_app_id` points at a private
-    // app, that wins outright. Otherwise fall through to index_url matching
-    // so a private app whose canonical URL lives on one hosting variant
-    // (`beans.puter.site`) still resolves when the visitor hits another
-    // (`beans.puter.app`).
-    if (opts.associatedApp && Number(opts.associatedApp.is_private ?? 0) > 0) {
-        return opts.associatedApp;
-    }
-    if (!opts.site?.user_id) return opts.associatedApp ?? null;
+    if (!opts.site?.user_id) return null;
 
     const host = normalizeHost(opts.req.hostname);
-    if (!host) return opts.associatedApp ?? null;
+    if (!host) return null;
 
     const hostedSubdomain = subdomainFromHost(host, [
         ...opts.config.staticDomains,
         ...opts.config.privateDomains,
     ]);
-    if (!hostedSubdomain) return opts.associatedApp ?? null;
+    if (!hostedSubdomain) return null;
 
     // Build host variants with AND without port, then cross each with both
     // protocols. Apps store whatever URL the user typed at create time, so
@@ -244,16 +241,19 @@ export async function resolvePrivateAppForHostedSite(opts: {
         }
     }
     const uniqueCandidates = [...new Set(urlCandidates)];
-    if (uniqueCandidates.length === 0) return opts.associatedApp ?? null;
+    if (uniqueCandidates.length === 0) return null;
 
+    const privateFilter = opts.requirePrivate
+        ? `AND \`is_private\` = ${opts.db.booleanLiteral(true)} `
+        : '';
     const placeholders = uniqueCandidates.map(() => '?').join(', ');
     const rows = await opts.db.read(
-        `SELECT * FROM apps WHERE owner_user_id = ? AND is_private = 1 AND index_url IN (${placeholders}) LIMIT 2`,
+        `SELECT * FROM apps WHERE owner_user_id = ? ${privateFilter}AND index_url IN (${placeholders}) LIMIT 2`,
         [opts.site.user_id, ...uniqueCandidates],
     );
-    if (rows.length === 0) return opts.associatedApp ?? null;
+    if (rows.length === 0) return null;
     if (rows.length > 1) {
-        console.warn('[puter-site] private_access.host_match_ambiguous', {
+        console.warn('[puter-site] hosted_site_app_match_ambiguous', {
             requestHost: host,
             matchCount: rows.length,
         });
@@ -261,7 +261,7 @@ export async function resolvePrivateAppForHostedSite(opts: {
     return rows[0] as unknown as AppLike;
 }
 
-// ── Bootstrap token resolution ──────────────────────────────────────
+// -- Bootstrap token resolution --------------------------------------
 
 function getAuthorizationToken(req: Request): string | null {
     const header = req.headers?.authorization;
@@ -348,12 +348,20 @@ export async function resolvePrivateIdentity(opts: {
     const cookies = (req as Request & { cookies?: Record<string, string> })
         .cookies;
 
-    // 1. Sticky private-asset cookie.
-    const privateCookieName = authService.getPrivateAssetCookieName();
+    // 1. Sticky private-asset cookie. Prefer the v2 cookie name; fall
+    // back to the legacy dot-style name while the deprecation window
+    // is open. A v1 (legacy-secret) token verifies but is intentionally
+    // NOT treated as a valid sticky cookie — we fall through so the
+    // chain re-mints under the v2 secret on this response.
+    const v2CookieName = authService.getPrivateAssetCookieNameV2();
+    const legacyCookieName = authService.getPrivateAssetCookieName();
     const privateCookieToken =
-        typeof cookies?.[privateCookieName] === 'string'
-            ? cookies[privateCookieName]
-            : null;
+        (typeof cookies?.[v2CookieName] === 'string'
+            ? cookies[v2CookieName]
+            : null) ??
+        (typeof cookies?.[legacyCookieName] === 'string'
+            ? cookies[legacyCookieName]
+            : null);
     if (privateCookieToken) {
         try {
             const claims = await authService.verifyPrivateAssetToken(
@@ -364,12 +372,15 @@ export async function resolvePrivateIdentity(opts: {
                     expectedPrivateHost,
                 },
             );
-            return {
-                source: 'private-cookie',
-                userUid: claims.userUid,
-                sessionUuid: claims.sessionUuid,
-                hasValidPrivateCookie: true,
-            };
+            if (!claims.legacy) {
+                return {
+                    source: 'private-cookie',
+                    userUid: claims.userUid,
+                    sessionUuid: claims.sessionUuid,
+                    hasValidPrivateCookie: true,
+                };
+            }
+            /* legacy cookie: fall through so the caller re-mints v2 */
         } catch {
             /* fall through — stale / mismatched / logged-out cookie */
         }
@@ -480,14 +491,18 @@ export async function resolvePublicHostedIdentity(opts: {
     const cookies = (req as Request & { cookies?: Record<string, string> })
         .cookies;
 
-    const publicCookieName = authService.getPublicHostedActorCookieName();
+    const publicCookieNameV2 = authService.getPublicHostedActorCookieNameV2();
+    const publicCookieNameLegacy = authService.getPublicHostedActorCookieName();
     const publicCookieToken =
-        typeof cookies?.[publicCookieName] === 'string'
-            ? cookies[publicCookieName]
-            : null;
+        (typeof cookies?.[publicCookieNameV2] === 'string'
+            ? cookies[publicCookieNameV2]
+            : null) ??
+        (typeof cookies?.[publicCookieNameLegacy] === 'string'
+            ? cookies[publicCookieNameLegacy]
+            : null);
     if (publicCookieToken) {
         try {
-            const claims = authService.verifyPublicHostedActorToken(
+            const claims = await authService.verifyPublicHostedActorToken(
                 publicCookieToken,
                 {
                     expectedAppUid,
@@ -495,12 +510,15 @@ export async function resolvePublicHostedIdentity(opts: {
                     expectedHost,
                 },
             );
-            return {
-                source: 'private-cookie',
-                userUid: claims.userUid,
-                sessionUuid: claims.sessionUuid,
-                hasValidPublicCookie: true,
-            };
+            if (!claims.legacy) {
+                return {
+                    source: 'public-cookie',
+                    userUid: claims.userUid,
+                    sessionUuid: claims.sessionUuid,
+                    hasValidPublicCookie: true,
+                };
+            }
+            /* legacy cookie: fall through so the caller re-mints v2 */
         } catch {
             /* fall through */
         }
@@ -564,7 +582,7 @@ export async function resolvePublicHostedIdentity(opts: {
     return { source: 'none' };
 }
 
-// ── Redirect helpers ────────────────────────────────────────────────
+// -- Redirect helpers ------------------------------------------------
 
 /** Build the URL to redirect a private-app request to its private host. */
 export function buildPrivateHostRedirect(
@@ -645,7 +663,7 @@ export function buildAppCenterFallback(
     return `https://${config.domain}/app/app-center/?item=${encodeURIComponent(appName)}`;
 }
 
-// ── Login bootstrap HTML ────────────────────────────────────────────
+// -- Login bootstrap HTML --------------------------------------------
 
 /**
  * Minimal HTML page that prompts the visitor to sign in with Puter.

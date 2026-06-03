@@ -307,7 +307,7 @@ export interface IS3Config {
 }
 
 export interface IDatabaseConfig {
-    engine: 'sqlite' | 'mysql';
+    engine: 'sqlite' | 'mysql' | 'postgres';
     // sqlite
     /**
      * SQLite database file path. Defaults to `':memory:'` (the
@@ -318,7 +318,8 @@ export interface IDatabaseConfig {
     /**
      * Force in-memory SQLite (ignores `path`). Equivalent to
      * `path: ':memory:'`. Intended for tests so each suite gets a
-     * pristine in-process database.
+     * pristine in-process database. Test utilities also use
+     * `engine: 'postgres'` with `inMemory: true` to run against pgmock.
      */
     inMemory?: boolean;
     targetVersion?: number;
@@ -328,17 +329,21 @@ export interface IDatabaseConfig {
     user?: string;
     password?: string;
     database?: string;
+    connectionString?: string;
+    url?: string;
     replica?: {
         host?: string;
         port?: number;
         user?: string;
         password?: string;
         database?: string;
+        connectionString?: string;
+        url?: string;
     };
     /**
      * Ordered list of directories whose `.sql` files are run sequentially at
-     * server start (mysql engine only). Files within a directory are sorted
-     * lexically; directories are processed in array order. Files MUST be
+     * server start (mysql/postgres engines). Numbered migration filenames sort
+     * numerically; directories are processed in array order. Files MUST be
      * idempotent — there is no per-file applied-state tracking.
      * Relative paths resolve from `process.cwd()`.
      */
@@ -396,7 +401,7 @@ export interface IDevWatcherConfig {
  * need to migrate.
  */
 interface IConfigOptional {
-    // ── Environment / identity ──────────────────────────────────────
+    // -- Environment / identity --------------------------------------
 
     /** Environment marker. `dev` disables blocked-email checks, opens auto-browser, etc. */
     env: 'dev' | 'prod';
@@ -407,7 +412,7 @@ interface IConfigOptional {
     /** Stable identity for this server node. Enables pager alerts + graceful shutdown delay. */
     serverId: string;
 
-    // ── Networking / URLs ───────────────────────────────────────────
+    // -- Networking / URLs -------------------------------------------
 
     /** Protocol used for the externally-visible origin ('http' or 'https'). Default: 'http'. */
     protocol: string;
@@ -477,10 +482,37 @@ interface IConfigOptional {
     /** Optional dev-time frontend watcher overrides. */
     devwatch: IDevWatcherConfig;
 
-    // ── Auth / session ──────────────────────────────────────────────
+    // -- Auth / session ----------------------------------------------
 
-    /** HMAC secret used to sign auth JWTs. */
+    /**
+     * Legacy HMAC secret for v1 JWTs. New tokens are always signed with
+     * `jwt_secret_v2`; this value is verify-only and accepted as long as
+     * `allow_v1_tokens` is true (flipped off to retire v1).
+     */
     jwt_secret: string;
+    /** HMAC secret used to sign and verify v2 auth JWTs (`kid: 'v2'`). */
+    jwt_secret_v2: string;
+    /**
+     * When false, v1 tokens (no `kid` header) are rejected at verify.
+     * Default true during the v1→v2 migration window.
+     */
+    allow_v1_tokens: boolean;
+    /**
+     * When false, `POST /auth/migrate-token` returns 410 Gone for v1
+     * `app-under-user` tokens. App-token migration is retired ahead
+     * of access-token migration — keeping these on separate flags
+     * lets ops kill apps first and keep API-key migration on
+     * indefinitely. Default true.
+     */
+    allow_v1_app_migration: boolean;
+    /**
+     * Optional explicit allowlist of `Origin` header values that may
+     * call `POST /auth/migrate-token` cross-origin. The main `origin`
+     * is always allowed. Used to thread the SDK migration call through
+     * app subdomains (e.g. `*.puter.site`) without opening the
+     * endpoint to arbitrary attacker pages.
+     */
+    allow_migrate_token_origins?: string[];
     /** HMAC secret for signed file URLs (/file, /writeFile, /sign). */
     url_signature_secret: string;
     /** Name of the session cookie the auth probe reads. */
@@ -496,7 +528,7 @@ interface IConfigOptional {
     /** OIDC / OAuth2 providers (google + custom). */
     oidc: IOIDCConfig;
 
-    // ── Groups / provisioning ───────────────────────────────────────
+    // -- Groups / provisioning ---------------------------------------
 
     /** UID of the persistent group that non-temp users are enrolled in at signup. */
     default_user_group: string;
@@ -505,7 +537,7 @@ interface IConfigOptional {
     /** When true, ACL grants read/list/see on `/<user>/Public` to any actor. */
     enable_public_folders: boolean;
 
-    // ── Storage / S3 ────────────────────────────────────────────────
+    // -- Storage / S3 ------------------------------------------------
 
     /** S3 storage config (local fauxqs or remote). */
     s3: IS3Config;
@@ -524,11 +556,11 @@ interface IConfigOptional {
     /** Optional dedicated S3-compatible bucket used by the thumbnails extension. */
     thumbnailStore: IThumbnailStoreConfig;
 
-    // ── Database ────────────────────────────────────────────────────
+    // -- Database ----------------------------------------------------
 
     database: IDatabaseConfig;
 
-    // ── Clients / infra ─────────────────────────────────────────────
+    // -- Clients / infra ---------------------------------------------
 
     dynamo: IDynamoConfig;
     redis: IRedisConfig;
@@ -537,7 +569,7 @@ interface IConfigOptional {
     clickhouse: IClickhouseConfig;
     cf_file_cache: ICfFileCacheConfig;
 
-    // ── Rate limiting ───────────────────────────────────────────────
+    // -- Rate limiting -----------------------------------------------
 
     rate_limit: {
         /**
@@ -549,7 +581,7 @@ interface IConfigOptional {
         backend?: 'memory' | 'redis' | 'kv';
     };
 
-    // ── AI / integration providers ──────────────────────────────────
+    // -- AI / integration providers ----------------------------------
     //
     // All AI providers — chat, image, video, TTS, OCR, speech-to-text,
     // speech-to-speech — are configured under `providers[<provider-id>]`.
@@ -559,7 +591,7 @@ interface IConfigOptional {
     // shortcut.
     providers: Record<string, IAIProviderConfig | undefined>;
 
-    // ── Cross-node / external integrations ──────────────────────────
+    // -- Cross-node / external integrations --------------------------
 
     /** Cross-node event replication config. */
     broadcast: IBroadcastConfig;
@@ -573,7 +605,7 @@ interface IConfigOptional {
     secureCorsProxy: ISecureCorsProxyConfig;
     /** Legacy Stripe billing extension. */
 
-    // ── GUI / static mounts ─────────────────────────────────────────
+    // -- GUI / static mounts -----------------------------------------
 
     /** Absolute path to the GUI assets root. */
     gui_assets_root: string;
@@ -603,7 +635,7 @@ interface IConfigOptional {
     /** Path to the puter-js SDK root (serves `/sdk/*` and `/puter.js/v{1,2}`). */
     puterjs_root: string;
 
-    // ── Extension-specific ──────────────────────────────────────────
+    // -- Extension-specific ------------------------------------------
 
     /**
      * Flat `{ flag_name: boolean }` bag of feature toggles. Non-boolean values

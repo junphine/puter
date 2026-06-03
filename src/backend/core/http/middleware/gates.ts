@@ -24,14 +24,22 @@ import { assertVerifiedEmail } from '../verifiedEmail';
 // Make sure the `Express.Request.actor` augmentation is in scope.
 import '../expressAugmentation';
 
-/**
- * Build the 401 a route gate emits when `req.actor` is absent. Splits the
- * legacy code so old clients can tell the two cases apart: `token_missing`
- * means "send a token", `token_auth_failed` means "your token didn't work,
- * re-login". Matches the v1 backend's auth-failure shape so the existing
- * client retry-vs-reauth logic doesn't need to change.
- */
 const rejectAuth = (req: Request): HttpError => {
+    if (req.requiresReauth) {
+        return new HttpError(401, 'Re-authentication required', {
+            legacyCode: 'reauth_required',
+            fields: {
+                code: 'reauth_required',
+                reason: req.requiresReauth.reason,
+                ...(req.requiresReauth.auth_id
+                    ? { auth_id: req.requiresReauth.auth_id }
+                    : {}),
+                ...(req.requiresReauth.reauth_token
+                    ? { reauth_token: req.requiresReauth.reauth_token }
+                    : {}),
+            },
+        });
+    }
     if (req.tokenAuthFailed) {
         return new HttpError(401, 'Authentication failed', {
             legacyCode: 'token_auth_failed',
@@ -151,10 +159,16 @@ export const DEFAULT_ADMIN_USERNAMES = ['admin', 'system'] as const;
 export const adminOnlyGate = (
     extras: readonly string[] = [],
 ): RequestHandler => {
-    const allowList = new Set<string>([...DEFAULT_ADMIN_USERNAMES, ...extras]);
+    // Match the case-insensitivity guarantee of the username column
+    // (MySQL: ascii_general_ci; SQLite: idx_user_username_nocase). Comparing
+    // raw-case here would let a stored `Admin` bypass the lowercase allowlist
+    // on any backend that lets case-collision rows exist.
+    const allowList = new Set<string>(
+        [...DEFAULT_ADMIN_USERNAMES, ...extras].map((u) => u.toLowerCase()),
+    );
     return (req, _res, next) => {
         const username = req.actor?.user.username;
-        if (!username || !allowList.has(username)) {
+        if (!username || !allowList.has(username.toLowerCase())) {
             next(
                 new HttpError(403, 'Only admins may request this resource', {
                     legacyCode: 'forbidden',

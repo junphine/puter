@@ -92,7 +92,7 @@ async function decodeAndValidateThumbnail(
     return { mimeType, data };
 }
 
-// ── thumbnail.created ───────────────────────────────────────────────
+// -- thumbnail.created -----------------------------------------------
 // Intercept data-URL thumbnails before they hit the DB: upload to S3
 // and replace the URL with an s3:// pointer.
 
@@ -250,7 +250,7 @@ extension.on(
     },
 );
 
-// ── thumbnail.upload.prepare ────────────────────────────────────────
+// -- thumbnail.upload.prepare ----------------------------------------
 // Generate pre-signed upload URLs so the client can PUT directly to S3.
 
 extension.on(
@@ -263,7 +263,7 @@ extension.on(
     },
 );
 
-// ── thumbnail.read ──────────────────────────────────────────────────
+// -- thumbnail.read --------------------------------------------------
 // Convert s3:// or legacy https:// thumbnails to signed URLs.
 
 extension.on('thumbnail.read', async (_key, entry: Record<string, unknown>) => {
@@ -276,7 +276,7 @@ extension.on('thumbnail.read', async (_key, entry: Record<string, unknown>) => {
     });
 });
 
-// ── fs.remove.node ──────────────────────────────────────────────────
+// -- fs.remove.node --------------------------------------------------
 // Delete S3 thumbnail when the file is removed.
 
 extension.on(

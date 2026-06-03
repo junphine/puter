@@ -78,6 +78,13 @@ const AVAILABLE_MIGRATIONS: [number, string[]][] = [
     [43, ['0047_app-url-updates.sql']],
     [44, ['0048_old-app-names-unique-tuple.sql']],
     [45, ['0049_music-player-pdf-player-updates.sql']],
+    [46, ['0050_add_preamble_version.sql']],
+    [47, ['0051_sessions_v2.sql']],
+    [48, ['0052_sessions_v2_lookups.sql']],
+    [49, ['0053_sessions_access_token_uid.sql']],
+    [50, ['0054_sessions_workers.sql']],
+    [50, ['0055_username_nocase_unique.sql']],
+    [51, ['0056_sessions_kind_worker.sql']],
 ];
 
 export class SqliteDatabaseClient extends AbstractDatabaseClient {

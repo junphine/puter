@@ -32,10 +32,16 @@ import {
     buildPublicHostRedirect,
     hostMatchesPrivateDomain,
     renderLoginBootstrapHtml,
-    resolvePrivateAppForHostedSite,
+    resolveOwnedAppForHostedSite,
     resolvePrivateIdentity,
     resolvePublicHostedIdentity,
 } from './privateAppGate';
+import {
+    isSiteConfigPath,
+    loadSiteConfig,
+    resolveErrorTarget,
+    type SiteConfig,
+} from './puterSiteConfig';
 
 /**
  * Serves user-hosted static sites on the hosting domains (`*.puter.site`,
@@ -52,9 +58,15 @@ import {
  *
  * Deferred (not yet implemented):
  *   - `.at` username-based sites (UUIDv5-keyed `/user/Public`).
- *   - `.puter_site_config` error rules (custom status-code → file mapping).
  *   - Custom domains (subdomains table `domain` column) — requires host
  *     validation to allow arbitrary hostnames first.
+ *
+ * Site config:
+ *   - `.puter_site_config` at the site root (see `puterSiteConfig.ts`)
+ *     supplies custom error pages. On a file 404, the matching rule's
+ *     `file` is served with the rule's `status` — supports the SPA
+ *     fallback pattern of `404 → /index.html with status 200`. The
+ *     config file itself is hidden from public serving.
  */
 
 const SUBDOMAIN_404 = `<div style="font-size: 20px;
@@ -192,29 +204,21 @@ export const createPuterSiteMiddleware = (
 
         const hostingCfg = buildHostingConfig(config);
 
-        let associatedApp: AppRow | null = null;
-        if (
-            site.associated_app_id !== null &&
-            site.associated_app_id !== undefined
-        ) {
-            associatedApp = (await layers.stores.app.getById(
-                site.associated_app_id,
-            )) as unknown as AppRow | null;
-        }
-
-        const privateApp = (await resolvePrivateAppForHostedSite({
+        // The subdomain row's `associated_app_id` column is intentionally
+        // not consulted — it was previously user-writable without an
+        // ownership check (so any value there is either legacy or planted).
+        // Resolve "what app does this subdomain host?" directly from
+        // `apps.owner_user_id = site.user_id` + `index_url` match against
+        // the request host.
+        const associatedApp = (await resolveOwnedAppForHostedSite({
             req,
-            site: {
-                user_id: site.user_id,
-                associated_app_id: site.associated_app_id,
-            },
-            associatedApp,
+            site: { user_id: site.user_id },
             db: layers.clients.db,
             config: hostingCfg,
-            matchedHostingDomain: matched,
         })) as AppRow | null;
 
-        const isPrivateApp = Boolean(privateApp?.is_private);
+        const isPrivateApp = Boolean(associatedApp?.is_private);
+        const privateApp = isPrivateApp ? associatedApp : null;
 
         if (isPrivateApp) {
             // Private apps must run on the private hosting domain. If a
@@ -319,15 +323,16 @@ export const createPuterSiteMiddleware = (
             // visitors but still refreshes after rotation/expiry.
             if (!identity.hasValidPrivateCookie) {
                 try {
-                    const token = layers.services.auth.createPrivateAssetToken({
-                        appUid: privateApp!.uid,
-                        userUid: identity.userUid,
-                        sessionUuid: identity.sessionUuid,
-                        subdomain,
-                        privateHost: host,
-                    });
+                    const token =
+                        await layers.services.auth.createPrivateAssetToken({
+                            appUid: privateApp!.uid,
+                            userUid: identity.userUid,
+                            sessionUuid: identity.sessionUuid,
+                            subdomain,
+                            privateHost: host,
+                        });
                     res.cookie(
-                        layers.services.auth.getPrivateAssetCookieName(),
+                        layers.services.auth.getPrivateAssetCookieNameV2(),
                         token,
                         layers.services.auth.getPrivateAssetCookieOptions({
                             requestHostname: host,
@@ -386,15 +391,17 @@ export const createPuterSiteMiddleware = (
                     associatedApp?.uid
                 ) {
                     const token =
-                        layers.services.auth.createPublicHostedActorToken({
-                            appUid: associatedApp.uid,
-                            userUid: identity.userUid,
-                            sessionUuid: identity.sessionUuid,
-                            subdomain,
-                            host,
-                        });
+                        await layers.services.auth.createPublicHostedActorToken(
+                            {
+                                appUid: associatedApp.uid,
+                                userUid: identity.userUid,
+                                sessionUuid: identity.sessionUuid,
+                                subdomain,
+                                host,
+                            },
+                        );
                     res.cookie(
-                        layers.services.auth.getPublicHostedActorCookieName(),
+                        layers.services.auth.getPublicHostedActorCookieNameV2(),
                         token,
                         layers.services.auth.getPublicHostedActorCookieOptions({
                             requestHostname: host,
@@ -458,10 +465,35 @@ export const createPuterSiteMiddleware = (
         }
         const filePath = rootPath + resolvedUrlPath;
 
+        // Best-effort site config load. A missing / malformed config
+        // never blocks the request — `loadSiteConfig` swallows all
+        // errors and returns null on any failure. The Redis cache
+        // keyed on `rootDirId` keeps the hot path off S3 for the
+        // common case where the same subdomain gets repeat visits.
+        let siteConfig: SiteConfig | null = null;
+        try {
+            siteConfig = await loadSiteConfig({
+                rootPath,
+                rootDirId: rootEntry.id,
+                fsEntryStore: layers.stores.fsEntry,
+                fsService: layers.services.fs,
+                cache: layers.clients.redis,
+            });
+        } catch (e) {
+            console.warn('[puter-site] loadSiteConfig threw', e);
+        }
+
+        // Hide the config file from public serving — visitors should
+        // see the same 404 as for any other missing path so the
+        // deployment shape isn't leaked.
+        const isConfigRequest = isSiteConfigPath(resolvedUrlPath);
+
         // Subdomain hosting bypasses ACL by design: anything the owner placed
         // under the registered root_dir is treated as public. Path traversal
         // is blocked above by `pathPosix.normalize` anchoring at `/`.
-        let entry = await layers.stores.fsEntry.getEntryByPath(filePath);
+        let entry = isConfigRequest
+            ? null
+            : await layers.stores.fsEntry.getEntryByPath(filePath);
         if (entry?.isDir) {
             // Folder request → fall back to <folder>/index.html, the same
             // way `/` is rewritten to `/index.html` at the site root above.
@@ -469,6 +501,27 @@ export const createPuterSiteMiddleware = (
                 pathPosix.join(filePath, 'index.html'),
             );
         }
+
+        // Custom error page fallback. On a 404 we consult the site config
+        // for a rule and, if one resolves to an existing file, serve that
+        // instead. Critical: we do this exactly once — the error page
+        // itself never re-enters error handling, so a misconfigured
+        // `errors.404.file` that doesn't exist falls through to the
+        // default 404 page rather than looping.
+        let statusOverride: number | undefined;
+        if (!entry || entry.isDir) {
+            const errorTarget = resolveErrorTarget(siteConfig, 404, rootPath);
+            if (errorTarget) {
+                const candidate = await layers.stores.fsEntry.getEntryByPath(
+                    errorTarget.absPath,
+                );
+                if (candidate && !candidate.isDir) {
+                    entry = candidate;
+                    statusOverride = errorTarget.status;
+                }
+            }
+        }
+
         if (!entry || entry.isDir) {
             res.status(404)
                 .type('text/html; charset=UTF-8')
@@ -477,8 +530,13 @@ export const createPuterSiteMiddleware = (
         }
 
         // Stream the file. `fsEntry.readContent` honours Range + emits
-        // ETag/Last-Modified when the S3 layer returns them.
+        // ETag/Last-Modified when the S3 layer returns them. Range
+        // requests are suppressed when serving a custom error page so
+        // the visitor always receives the full document with the
+        // configured status code (no 206 with a stale `bytes=...`
+        // header from the original request).
         const range =
+            statusOverride === undefined &&
             typeof req.headers.range === 'string'
                 ? req.headers.range
                 : undefined;
@@ -524,7 +582,7 @@ export const createPuterSiteMiddleware = (
             res.setHeader('Last-Modified', download.lastModified.toUTCString());
         res.setHeader('Accept-Ranges', 'bytes');
         res.setHeader('Access-Control-Allow-Origin', '*');
-        res.status(range ? 206 : 200);
+        res.status(statusOverride ?? (range ? 206 : 200));
 
         // Best-effort egress metering against the site owner. The request
         // itself is unauthenticated (public site visitor), so we can't use

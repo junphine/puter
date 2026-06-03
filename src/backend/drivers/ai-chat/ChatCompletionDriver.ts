@@ -43,6 +43,7 @@ import { XAIProvider } from './providers/xai/XAIProvider.js';
 import { ZAIProvider } from './providers/zai/ZAIProvider.js';
 import { AlibabaProvider } from './providers/alibaba/AlibabaProvider.js';
 import { MoonshotProvider } from './providers/moonshot/MoonshotProvider.js';
+import { MiniMaxProvider } from './providers/minimax/MiniMaxProvider.js';
 import type {
     IChatCompleteResult,
     IChatModel,
@@ -217,7 +218,7 @@ export class ChatCompletionDriver extends PuterDriver {
         this.#buildModelMap();
     }
 
-    // ── Interface methods ───────────────────────────────────────────
+    // -- Interface methods -------------------------------------------
 
     async models() {
         const seen = new Set<string>();
@@ -342,7 +343,7 @@ export class ChatCompletionDriver extends PuterDriver {
             }
         }
 
-        // ── Credit / subscription gates (metering) ────────────────────
+        // -- Credit / subscription gates (metering) --------------------
         // Cheap pre-flight: reject when the user can't afford even the
         // approximate input cost, keep subscriber-only models gated, and
         // cap `max_tokens` so output can't exceed remaining credits.
@@ -555,7 +556,7 @@ export class ChatCompletionDriver extends PuterDriver {
             return streamResult as unknown as IChatCompleteResult;
         }
 
-        // ── Post-completion audit event ──────────────────────────────
+        // -- Post-completion audit event ------------------------------
         // Only for non-streaming results (streaming emits from the
         // `chatStream.end` wrapper above). Extensions like prompt_block /
         // prodMeteringAndBilling listen for this to log completions.
@@ -651,8 +652,18 @@ export class ChatCompletionDriver extends PuterDriver {
             // thinking_tokens → output rate fallback
             let rate = costs[key];
             if (typeof rate !== 'number' || !Number.isFinite(rate)) {
-                if (key === 'thinking_tokens' && outputRate !== undefined) {
+                if (isOutputKey(key) && outputRate !== undefined) {
                     rate = outputRate;
+                } else if (!isOutputKey(key)) {
+                    const inputRateRaw = costs[inputKey];
+                    if (
+                        typeof inputRateRaw === 'number' &&
+                        Number.isFinite(inputRateRaw)
+                    ) {
+                        rate = inputRateRaw;
+                    } else {
+                        continue;
+                    }
                 } else {
                     continue;
                 }
@@ -762,7 +773,7 @@ export class ChatCompletionDriver extends PuterDriver {
         );
     }
 
-    // ── Provider registration ───────────────────────────────────────
+    // -- Provider registration ---------------------------------------
 
     #registerProviders() {
         const providers = this.config.providers ?? {};
@@ -859,6 +870,18 @@ export class ChatCompletionDriver extends PuterDriver {
             );
         }
 
+        const minimax = providers['minimax'];
+        const minimaxKey = readKey(minimax);
+        if (minimaxKey) {
+            this.#providers['minimax'] = new MiniMaxProvider(
+                {
+                    apiKey: minimaxKey,
+                    apiBaseUrl: minimax?.apiBaseUrl as string | undefined,
+                },
+                metering,
+            );
+        }
+
         const zai = providers['zai'];
         const zaiKey = readKey(zai);
         if (zaiKey) {
@@ -918,7 +941,7 @@ export class ChatCompletionDriver extends PuterDriver {
         this.#providers['fake-chat'] = new FakeChatProvider();
     }
 
-    // ── Model map ───────────────────────────────────────────────────
+    // -- Model map ---------------------------------------------------
 
     async #buildModelMap() {
         const AGGREGATORS = new Set(['together-ai', 'openrouter']);

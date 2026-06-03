@@ -27,6 +27,7 @@ import type { PuterRouter } from '../../core/http/PuterRouter.js';
 import { verify as verifyOtp } from '../../services/auth/OTPUtil.js';
 import { expandTildePath } from '../../services/fs/resolveNode.js';
 import type { FSEntry } from '../../stores/fs/FSEntry.js';
+import { toLegacyEntry } from '../fs/legacyFsHelpers.js';
 import { PuterController } from '../types.js';
 import {
     createLock,
@@ -128,7 +129,7 @@ export class WebDAVController extends PuterController {
             case 'MOVE':
                 return this.#move(req, res, actor, davPath, redis, lockToken);
             case 'LOCK':
-                return this.#lock(req, res, davPath, redis, lockToken);
+                return this.#lock(req, res, actor, davPath, redis, lockToken);
             case 'UNLOCK':
                 return this.#unlock(req, res, davPath, redis);
             default:
@@ -138,7 +139,7 @@ export class WebDAVController extends PuterController {
         }
     }
 
-    // ── Auth ─────────────────────────────────────────────────────────
+    // -- Auth ---------------------------------------------------------
 
     async #resolveActor(req: Request, res: Response): Promise<Actor | null> {
         // If the global authProbe already resolved an actor, use it.
@@ -236,7 +237,7 @@ export class WebDAVController extends PuterController {
         };
     }
 
-    // ── OPTIONS ──────────────────────────────────────────────────────
+    // -- OPTIONS ------------------------------------------------------
 
     #options(res: Response): void {
         res.status(200)
@@ -250,7 +251,7 @@ export class WebDAVController extends PuterController {
             .send('');
     }
 
-    // ── GET / HEAD ──────────────────────────────────────────────────
+    // -- GET / HEAD --------------------------------------------------
 
     async #get(
         req: Request,
@@ -300,7 +301,7 @@ export class WebDAVController extends PuterController {
         result.body.pipe(res);
     }
 
-    // ── PROPFIND ────────────────────────────────────────────────────
+    // -- PROPFIND ----------------------------------------------------
 
     async #propfind(
         req: Request,
@@ -347,7 +348,7 @@ export class WebDAVController extends PuterController {
             .send(wrapMultistatus(responses.join('\n')));
     }
 
-    // ── PROPPATCH (stub — acknowledges but doesn't persist props) ───
+    // -- PROPPATCH (stub — acknowledges but doesn't persist props) ---
 
     async #proppatch(
         res: Response,
@@ -371,7 +372,7 @@ export class WebDAVController extends PuterController {
             );
     }
 
-    // ── MKCOL ───────────────────────────────────────────────────────
+    // -- MKCOL -------------------------------------------------------
 
     async #mkcol(
         req: Request,
@@ -421,7 +422,7 @@ export class WebDAVController extends PuterController {
             .end();
     }
 
-    // ── PUT ─────────────────────────────────────────────────────────
+    // -- PUT ---------------------------------------------------------
 
     async #put(
         req: Request,
@@ -497,7 +498,7 @@ export class WebDAVController extends PuterController {
             .end();
     }
 
-    // ── DELETE ───────────────────────────────────────────────────────
+    // -- DELETE -------------------------------------------------------
 
     async #delete(
         res: Response,
@@ -527,7 +528,7 @@ export class WebDAVController extends PuterController {
         res.status(204).end();
     }
 
-    // ── COPY ────────────────────────────────────────────────────────
+    // -- COPY --------------------------------------------------------
 
     async #copy(
         req: Request,
@@ -585,7 +586,7 @@ export class WebDAVController extends PuterController {
         res.status(destExists ? 204 : 201).end();
     }
 
-    // ── MOVE ────────────────────────────────────────────────────────
+    // -- MOVE --------------------------------------------------------
 
     async #move(
         req: Request,
@@ -641,16 +642,22 @@ export class WebDAVController extends PuterController {
         res.status(destExists ? 204 : 201).end();
     }
 
-    // ── LOCK ────────────────────────────────────────────────────────
+    // -- LOCK --------------------------------------------------------
 
     async #lock(
         req: Request,
         res: Response,
+        actor: Actor,
         davPath: string,
         redis: unknown,
         headerToken: string | null,
     ): Promise<void> {
         const r = redis as import('ioredis').Cluster;
+
+        // ACL must succeed before any lock state is touched — otherwise
+        // an authenticated user could lock paths they don't own (e.g. `/`)
+        // and block writes for everyone else.
+        await this.#assertWrite(actor, davPath);
 
         // Refresh existing lock
         if (headerToken) {
@@ -702,7 +709,7 @@ export class WebDAVController extends PuterController {
             .send(lockResponseXml(token, davPath, lockScope));
     }
 
-    // ── UNLOCK ──────────────────────────────────────────────────────
+    // -- UNLOCK ------------------------------------------------------
 
     async #unlock(
         req: Request,
@@ -733,7 +740,7 @@ export class WebDAVController extends PuterController {
         res.status(204).end();
     }
 
-    // ── ACL helpers ─────────────────────────────────────────────────
+    // -- ACL helpers -------------------------------------------------
 
     async #assertRead(actor: Actor, path: string): Promise<void> {
         const descriptor = {
@@ -759,32 +766,36 @@ export class WebDAVController extends PuterController {
             });
     }
 
-    // ── Event emission ──────────────────────────────────────────────
+    // -- Event emission ----------------------------------------------
 
     #emitGuiEvent<T extends keyof EventMap>(
         eventName: T,
         entry: FSEntry,
         extra?: Record<string, unknown>,
     ): void {
-        const payload = {
-            user_id_list: [entry.userId],
-            response: { ...entry, ...extra, from_new_service: true },
-        };
         const meta = {};
         void Promise.resolve()
-            .then(() =>
+            .then(async () => {
+                const response = {
+                    ...(await toLegacyEntry(this.clients.event, entry)),
+                    ...extra,
+                    from_new_service: true,
+                };
                 this.clients.event.emit(
                     eventName,
-                    payload as unknown as EventMap[T],
+                    {
+                        user_id_list: [entry.userId],
+                        response,
+                    } as unknown as EventMap[T],
                     meta,
-                ),
-            )
+                );
+            })
             .catch(() => {
                 // non-critical
             });
     }
 
-    // ── Misc helpers ────────────────────────────────────────────────
+    // -- Misc helpers ------------------------------------------------
 
     #parseDestination(req: Request): string {
         const dest = req.headers.destination as string | undefined;
@@ -801,7 +812,7 @@ export class WebDAVController extends PuterController {
     }
 }
 
-// ── XML helpers ──────────────────────────────────────────────────────
+// -- XML helpers ------------------------------------------------------
 
 function escapeXml(text: string): string {
     return text

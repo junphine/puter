@@ -159,7 +159,7 @@ export class FSService extends PuterService {
         const permissions = this.services.permission;
         const fsEntryStore = this.stores.fsEntry;
 
-        // ── fs:/path:mode → fs:<uuid>:mode ─────────────────────────────
+        // -- fs:/path:mode → fs:<uuid>:mode -----------------------------
         // Clients (puter.perms, requestPermission) emit path-based strings;
         // stored as-is they'd never match anything, so resolve to uuid up
         // front.
@@ -192,7 +192,7 @@ export class FSService extends PuterService {
             },
         });
 
-        // ── is-owner ──────────────────────────────────────────────────
+        // -- is-owner --------------------------------------------------
         // For user actors, `fs:<uuid>:*` resolves iff the actor owns the
         // underlying entry. Without this, `check(user, fs:UUID:*)` can't
         // find a terminal and the `has_terminal` probe that #scanUserApp
@@ -229,7 +229,52 @@ export class FSService extends PuterService {
             },
         });
 
-        // ── fs-access-levels exploder ──────────────────────────────────
+        // -- app-owns-appdata -----------------------------------------
+        // Mirror of the ACLService short-circuit at ACLService.check:
+        // an app-under-user actor implicitly holds fs:<uuid>:* on any
+        // entry inside its own /<username>/AppData/<appUid> subtree.
+        // ACL paths (fs.read etc.) already accept these via that
+        // short-circuit, but permissionService.checkMany — used by
+        // createAccessToken's issuer-subset gate — bypasses ACL, so
+        // without this implicator an app can fs.read its appdata but
+        // can't mint a token for the same fs:<uuid>:read it just read.
+        permissions.registerImplicator({
+            id: 'app-owns-appdata',
+            shortcut: true,
+            matches: (permission: string): boolean => {
+                return (
+                    permission.startsWith('fs:') ||
+                    permission.startsWith(`${MANAGE_PERM_PREFIX}:fs:`) ||
+                    permission.startsWith(
+                        `${MANAGE_PERM_PREFIX}:${MANAGE_PERM_PREFIX}:fs:`,
+                    )
+                );
+            },
+            check: async ({ actor, permission }): Promise<unknown> => {
+                if (!actor.app || actor.accessToken) return undefined;
+                const username = actor.user?.username;
+                const appUid = actor.app.uid;
+                if (!username || !appUid) return undefined;
+
+                const stripped = permission.replaceAll(
+                    `${MANAGE_PERM_PREFIX}:`,
+                    '',
+                );
+                const uid = PermissionUtil.split(stripped)[1];
+                if (!uid) return undefined;
+
+                const entry = await fsEntryStore.getEntryByUuid(uid);
+                if (!entry) return undefined;
+
+                const root = `/${username}/AppData/${appUid}`;
+                if (entry.path === root || entry.path.startsWith(`${root}/`)) {
+                    return {};
+                }
+                return undefined;
+            },
+        });
+
+        // -- fs-access-levels exploder ----------------------------------
         // `fs:UUID:see` implies `[list, read, write, manage:fs:UUID]`.
         // ACLService.check already expands the same-family chain
         // (see→list→read→write) via MODES_ABOVE, but the `manage:fs:UUID`
@@ -303,9 +348,8 @@ export class FSService extends PuterService {
         return normalizedPath;
     }
 
-    #resolveBucket(metadata: FSEntryWriteInput): string {
-        const bucket =
-            metadata.bucket ?? this.config.s3_bucket ?? 'puter-local';
+    #resolveBucket(): string {
+        const bucket = this.config.s3_bucket ?? 'puter-local';
         if (typeof bucket !== 'string' || bucket.length === 0) {
             throw new HttpError(500, 'Missing S3 bucket configuration', {
                 legacyCode: 'internal_error',
@@ -314,12 +358,9 @@ export class FSService extends PuterService {
         return bucket;
     }
 
-    #resolveBucketRegion(metadata: FSEntryWriteInput): string {
+    #resolveBucketRegion(): string {
         const bucketRegion =
-            metadata.bucketRegion ??
-            this.config.s3_region ??
-            this.config.region ??
-            'us-west-2';
+            this.config.s3_region ?? this.config.region ?? 'us-west-2';
 
         if (typeof bucketRegion !== 'string' || bucketRegion.length === 0) {
             throw new HttpError(500, 'Missing S3 region configuration', {
@@ -368,8 +409,8 @@ export class FSService extends PuterService {
             immutable: Boolean(metadata.immutable),
             isPublic: metadata.isPublic,
             multipartPartSize: metadata.multipartPartSize,
-            bucket: this.#resolveBucket(metadata),
-            bucketRegion: this.#resolveBucketRegion(metadata),
+            bucket: this.#resolveBucket(),
+            bucketRegion: this.#resolveBucketRegion(),
         };
     }
 
@@ -673,8 +714,14 @@ export class FSService extends PuterService {
             size: session.size,
             contentType: session.contentType,
             checksumSha256: session.checksumSha256 ?? undefined,
-            bucket: session.bucket ?? undefined,
-            bucketRegion: session.bucketRegion ?? undefined,
+            bucket:
+                session.bucket ??
+                parsedMetadata.bucket ??
+                this.#resolveBucket(),
+            bucketRegion:
+                session.bucketRegion ??
+                parsedMetadata.bucketRegion ??
+                this.#resolveBucketRegion(),
             overwrite: Boolean(session.overwriteTargetUid),
         };
     }
@@ -2100,14 +2147,14 @@ export class FSService extends PuterService {
                         bucket:
                             session.bucket ??
                             createInput.bucket ??
-                            this.#resolveBucket(createInput),
+                            this.#resolveBucket(),
                         objectKey: session.objectKey,
                         multipartUploadId: session.multipartUploadId,
                         parts: completeParts,
                     },
                     session.bucketRegion ??
                         createInput.bucketRegion ??
-                        this.#resolveBucketRegion(createInput),
+                        this.#resolveBucketRegion(),
                 );
             }
 
@@ -2244,14 +2291,14 @@ export class FSService extends PuterService {
                         bucket:
                             item.session.bucket ??
                             item.finalData.bucket ??
-                            this.#resolveBucket(item.finalData),
+                            this.#resolveBucket(),
                         objectKey: item.session.objectKey,
                         multipartUploadId: item.session.multipartUploadId,
                         parts: completeParts,
                     },
                     item.session.bucketRegion ??
                         item.finalData.bucketRegion ??
-                        this.#resolveBucketRegion(item.finalData),
+                        this.#resolveBucketRegion(),
                 );
             }),
         );
@@ -2575,7 +2622,7 @@ export class FSService extends PuterService {
         return this.stores.fsEntry.getUserStorageAllowance(numericUserId);
     }
 
-    // ── Reads ───────────────────────────────────────────────────────────
+    // -- Reads -----------------------------------------------------------
 
     /**
      * List direct children of a directory. Caller is responsible for any ACL
@@ -2597,13 +2644,23 @@ export class FSService extends PuterService {
     /**
      * Search by file name for a user. Linear-scan with LIKE — cheap for
      * typical library sizes, revisit if we need full-text.
+     *
+     * `pathScope` restricts results to entries at or under that path.
+     * App-under-user callers pass their AppData root so search can't leak
+     * paths the actor isn't allowed to read.
      */
     async searchByName(
         userId: number,
         query: string,
         limit = 200,
+        pathScope?: string,
     ): Promise<FSEntry[]> {
-        return this.stores.fsEntry.searchByNameForUser(userId, query, limit);
+        return this.stores.fsEntry.searchByNameForUser(
+            userId,
+            query,
+            limit,
+            pathScope,
+        );
     }
 
     /**
@@ -2722,7 +2779,7 @@ export class FSService extends PuterService {
         return entry.uuid;
     }
 
-    // ── Mutation: mkdir / touch / rename / mkshortcut ─────────
+    // -- Mutation: mkdir / touch / rename / mkshortcut ---------
 
     /**
      * Resolve a free child name under `parentEntry` by appending ` (N)` when
@@ -3002,7 +3059,7 @@ export class FSService extends PuterService {
         return created;
     }
 
-    // ── Mutation: remove / move / copy ─────────────────────────────────
+    // -- Mutation: remove / move / copy ---------------------------------
 
     /**
      * Remove an entry. For directories, descendants are walked and removed
@@ -3047,6 +3104,9 @@ export class FSService extends PuterService {
             await this.#removeDescendantsStorage(descendants);
             if (descendants.length > 0) {
                 await this.stores.fsEntry.deleteEntries(descendants);
+                for (const descendant of descendants) {
+                    this.#emitRemoveEvent(descendant);
+                }
             }
 
             if (!input.descendantsOnly) {
@@ -3091,11 +3151,12 @@ export class FSService extends PuterService {
      */
     async removeAllForUser(userId: number): Promise<void> {
         const pageSize = 5000;
+        const falseLiteral = this.clients.db.booleanLiteral(false);
         // Files-first loop: delete backing S3 objects in batches, then DB rows.
         for (;;) {
             const files = (await this.clients.db.read(
                 `SELECT uuid, bucket, bucket_region FROM fsentries
-                 WHERE user_id = ? AND is_dir = 0 AND (is_shortcut = 0 OR is_shortcut IS NULL) AND (is_symlink = 0 OR is_symlink IS NULL)
+                 WHERE user_id = ? AND is_dir = ${falseLiteral} AND (is_shortcut = ${falseLiteral} OR is_shortcut IS NULL) AND (is_symlink = ${falseLiteral} OR is_symlink IS NULL)
                  LIMIT ${pageSize}`,
                 [userId],
             )) as Array<{

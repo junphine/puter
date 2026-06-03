@@ -434,6 +434,119 @@ describe('FSController.completeBatchWrites', () => {
         expect(finalized?.wasOverwrite).toBe(true);
     });
 
+    it('emits updated events with GUI metadata when overwriting via batch completion', async () => {
+        const { actor, userId } = await makeUser();
+        const username = actor.user!.username!;
+        const target = `/${username}/Documents/overwrite-event.js`;
+
+        const firstStart = makeRes();
+        await withActor(actor, () =>
+            controller.startBatchWrites(
+                makeReq<SignedWriteRequest[]>({
+                    body: [{ fileMetadata: { path: target, size: 1 } }],
+                    actor,
+                }),
+                firstStart.res,
+            ),
+        );
+        const [firstResponse] = firstStart.captured
+            .body as SignedWriteResponse[];
+        await withActor(actor, () =>
+            controller.completeBatchWrites(
+                makeReq<CompleteWriteRequest[]>({
+                    body: [{ uploadId: firstResponse!.sessionId }],
+                    actor,
+                }),
+                makeRes().res,
+            ),
+        );
+        const targetEntry = await server.stores.fsEntry.getEntryByPath(target);
+        expect(targetEntry).not.toBeNull();
+        await server.stores.subdomain.create({
+            userId,
+            subdomain: `workers.puter.${username}-worker`,
+            rootDirId: targetEntry!.id,
+        });
+
+        const secondStart = makeRes();
+        await withActor(actor, () =>
+            controller.startBatchWrites(
+                makeReq<SignedWriteRequest[]>({
+                    body: [
+                        {
+                            fileMetadata: {
+                                path: target,
+                                size: 2,
+                                overwrite: true,
+                            },
+                        },
+                    ],
+                    actor,
+                }),
+                secondStart.res,
+            ),
+        );
+        const [secondResponse] = secondStart.captured
+            .body as SignedWriteResponse[];
+
+        const emitSpy = vi.spyOn(server.clients.event, 'emit');
+        let updatedCall:
+            | (typeof emitSpy.mock.calls)[number]
+            | undefined;
+        try {
+            await withActor(actor, () =>
+                controller.completeBatchWrites(
+                    makeReq<CompleteWriteRequest[]>({
+                        body: [
+                            {
+                                uploadId: secondResponse!.sessionId,
+                                guiMetadata: {
+                                    operationId: 'op-123',
+                                    itemUploadId: 'item-456',
+                                    socketId: 'socket-789',
+                                    originalClientSocketId: 'socket-789',
+                                },
+                            },
+                        ],
+                        actor,
+                    }),
+                    makeRes().res,
+                ),
+            );
+            updatedCall = emitSpy.mock.calls.find(
+                ([eventName]) => eventName === 'outer.gui.item.updated',
+            );
+        } finally {
+            emitSpy.mockRestore();
+        }
+        expect(updatedCall).toBeTruthy();
+        const payload = updatedCall?.[1] as {
+            user_id_list?: number[];
+            response?: Record<string, unknown>;
+        };
+        expect(payload.user_id_list).toEqual([userId]);
+        expect(payload.response).toMatchObject({
+            uid: expect.any(String),
+            uuid: expect.any(String),
+            id: expect.any(String),
+            path: target,
+            name: 'overwrite-event.js',
+            is_dir: false,
+            type: expect.stringMatching(/^application\/javascript/),
+            workers: [
+                expect.objectContaining({
+                    subdomain: `workers.puter.${username}-worker`,
+                    address: expect.stringContaining(`${username}-worker`),
+                }),
+            ],
+            from_new_service: true,
+            operation_id: 'op-123',
+            item_upload_id: 'item-456',
+            socket_id: 'socket-789',
+            original_client_socket_id: 'socket-789',
+        });
+    });
+
     it("rejects another user's session ids with a 4xx", async () => {
         const a = await makeUser();
         const b = await makeUser();
@@ -677,6 +790,87 @@ describe('FSController.searchEntries', () => {
         const results = captured.body as Array<{ name: string }>;
         expect(Array.isArray(results)).toBe(true);
         expect(results.some((r) => r.name === needle)).toBe(true);
+    });
+
+    it('scopes app-under-user actors to their AppData root', async () => {
+        const { actor: userActor } = await makeUser();
+        const username = userActor.user!.username!;
+        const appUid = `app-search-${uuidv4()}`;
+        const appActor: Actor = { ...userActor, app: { uid: appUid } };
+        const needle = `appneedle-${Math.random().toString(36).slice(2, 8)}`;
+
+        // User-owned entry outside AppData — must NOT appear for the app.
+        await withActor(userActor, () =>
+            controller.mkdirEntry(
+                makeReq({
+                    body: { path: `/${username}/Documents/${needle}` },
+                    actor: userActor,
+                }),
+                makeRes().res,
+            ),
+        );
+        // Entry under the app's own AppData — must appear.
+        await withActor(userActor, () =>
+            controller.mkdirEntry(
+                makeReq({
+                    body: {
+                        path: `/${username}/AppData/${appUid}/${needle}`,
+                        create_missing_parents: true,
+                    },
+                    actor: userActor,
+                }),
+                makeRes().res,
+            ),
+        );
+
+        const { res, captured } = makeRes();
+        await withActor(appActor, () =>
+            controller.searchEntries(
+                makeReq({ body: { query: needle }, actor: appActor }),
+                res,
+            ),
+        );
+        const results = captured.body as Array<{ name: string; path: string }>;
+        expect(results.length).toBeGreaterThan(0);
+        for (const r of results) {
+            expect(
+                r.path === `/${username}/AppData/${appUid}` ||
+                    r.path.startsWith(`/${username}/AppData/${appUid}/`),
+            ).toBe(true);
+        }
+        expect(
+            results.some(
+                (r) => r.path === `/${username}/Documents/${needle}`,
+            ),
+        ).toBe(false);
+    });
+
+    it('returns nothing for an app actor when no AppData entries match', async () => {
+        const { actor: userActor } = await makeUser();
+        const username = userActor.user!.username!;
+        const appUid = `app-search-${uuidv4()}`;
+        const appActor: Actor = { ...userActor, app: { uid: appUid } };
+        const needle = `appneedle-${Math.random().toString(36).slice(2, 8)}`;
+
+        // Only seed outside AppData — the app must not be able to find it.
+        await withActor(userActor, () =>
+            controller.mkdirEntry(
+                makeReq({
+                    body: { path: `/${username}/Documents/${needle}` },
+                    actor: userActor,
+                }),
+                makeRes().res,
+            ),
+        );
+
+        const { res, captured } = makeRes();
+        await withActor(appActor, () =>
+            controller.searchEntries(
+                makeReq({ body: { query: needle }, actor: appActor }),
+                res,
+            ),
+        );
+        expect(captured.body).toEqual([]);
     });
 });
 

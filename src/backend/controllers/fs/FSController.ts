@@ -20,12 +20,13 @@
 import Busboy from 'busboy';
 import type { Request, Response } from 'express';
 import { posix as pathPosix } from 'node:path';
-import { assertNormalized } from '../../services/fs/resolveNode.js';
 import { pipeline } from 'node:stream/promises';
 import type { Actor } from '../../core/actor.js';
+import { effectiveActorApp } from '../../core/actor.js';
 import { Context } from '../../core/context.js';
 import { HttpError } from '../../core/http/HttpError.js';
 import { Controller, Get, Post } from '../../core/http/decorators.js';
+import { assertNormalized } from '../../services/fs/resolveNode.js';
 import type {
     PreparedBatchWrite,
     UploadedBatchWriteItem,
@@ -58,6 +59,7 @@ import type {
     ThumbnailUploadPrepareItem,
     ThumbnailUploadPreparePayload,
 } from './types.js';
+import { toLegacyEntry } from './legacyFsHelpers.js';
 class UploadProgressTracker implements UploadProgressTrackerLike {
     total = 0;
     progress = 0;
@@ -421,7 +423,12 @@ export class FSController extends PuterController {
             const busboy = Busboy({ headers: req.headers });
 
             busboy.on('field', (fieldName, value, info) => {
-                if (info.nameTruncated || info.valueTruncated) {
+                if (
+                    (info as unknown as { filenameTruncated: string })
+                        .filenameTruncated ||
+                    info.nameTruncated ||
+                    info.valueTruncated
+                ) {
                     failParse(
                         new HttpError(
                             400,
@@ -810,7 +817,7 @@ export class FSController extends PuterController {
         res.json(updatedResponses);
     }
 
-    // ── Read-side routes ────────────────────────────────────────────────
+    // -- Read-side routes ------------------------------------------------
 
     @Post('/stat', { subdomain: 'api', requireVerified: true })
     async statEntry(req: Request, res: Response) {
@@ -910,7 +917,7 @@ export class FSController extends PuterController {
 
     @Post('/search', { subdomain: 'api', requireVerified: true })
     async searchEntries(req: Request, res: Response) {
-        this.#requireActor(req);
+        const actor = this.#requireActor(req);
         const userId = this.#getActorUserId(req);
         const body = this.#toObjectRecord(req.body);
         const query =
@@ -929,6 +936,7 @@ export class FSController extends PuterController {
             userId,
             query,
             limit ?? 200,
+            this.#appDataScopeForActor(actor),
         );
         res.json(results);
     }
@@ -1007,7 +1015,7 @@ export class FSController extends PuterController {
         }
     }
 
-    // ── Mutation routes ────────────────────────────────────────────────
+    // -- Mutation routes ------------------------------------------------
 
     @Post('/mkdir', { subdomain: 'api', requireVerified: true })
     async mkdirEntry(req: Request, res: Response) {
@@ -1205,7 +1213,7 @@ export class FSController extends PuterController {
         res.json(shortcut);
     }
 
-    // ── Read-side helpers ───────────────────────────────────────────────
+    // -- Read-side helpers -----------------------------------------------
 
     #requireActor(req: Request): Actor {
         const actor = req.actor;
@@ -1649,24 +1657,6 @@ export class FSController extends PuterController {
             normalizedFileMetadata.multipartPartSize = multipartPartSize;
         }
 
-        const bucket = this.#firstDefined(
-            metadataRecord.bucket,
-            fallbackRecord.bucket,
-        );
-        if (typeof bucket === 'string' && bucket.length > 0) {
-            normalizedFileMetadata.bucket = bucket;
-        }
-
-        const bucketRegion = this.#firstDefined(
-            metadataRecord.bucketRegion,
-            metadataRecord.bucket_region,
-            fallbackRecord.bucketRegion,
-            fallbackRecord.bucket_region,
-        );
-        if (typeof bucketRegion === 'string' && bucketRegion.length > 0) {
-            normalizedFileMetadata.bucketRegion = bucketRegion;
-        }
-
         const associatedAppId = this.#toNumber(
             this.#firstDefined(
                 metadataRecord.associatedAppId,
@@ -2034,56 +2024,7 @@ export class FSController extends PuterController {
     }
 
     async #toGuiFsEntry(entry: FSEntry): Promise<Record<string, unknown>> {
-        const dirpath = pathPosix.dirname(entry.path);
-        const extension = pathPosix.extname(entry.name).slice(1).toLowerCase();
-        const response = {
-            id: entry.uuid,
-            uid: entry.uuid,
-            uuid: entry.uuid,
-            parent_id: entry.parentUid,
-            parent_uid: entry.parentUid,
-            path: entry.path,
-            dirname: dirpath,
-            dirpath,
-            name: entry.name,
-            is_dir: entry.isDir,
-            is_shortcut: entry.isShortcut ? 1 : 0,
-            shortcut_to: entry.shortcutTo,
-            type: entry.isDir ? 'folder' : extension,
-            writable: true,
-            is_public: entry.isPublic,
-            thumbnail: entry.thumbnail,
-            immutable: entry.immutable,
-            metadata: entry.metadata,
-            modified: entry.modified,
-            created: entry.created,
-            accessed: entry.accessed,
-            size: entry.size,
-        };
-
-        if (
-            typeof response.thumbnail === 'string' &&
-            response.thumbnail.length > 0
-        ) {
-            const thumbnailEntry = {
-                uuid: entry.uuid,
-                thumbnail: response.thumbnail,
-            };
-            // emitAndWait — listener rewrites s3:// / legacy URLs into
-            // time-limited signed URLs on the payload object.
-            await this.clients.event.emitAndWait(
-                'thumbnail.read',
-                thumbnailEntry,
-                {},
-            );
-            response.thumbnail =
-                typeof thumbnailEntry.thumbnail === 'string' &&
-                thumbnailEntry.thumbnail.length > 0
-                    ? thumbnailEntry.thumbnail
-                    : null;
-        }
-
-        return response;
+        return toLegacyEntry(this.clients.event, entry);
     }
 
     async #emitGuiWriteEvent(
@@ -2093,7 +2034,7 @@ export class FSController extends PuterController {
     ): Promise<void> {
         const response = {
             ...(await this.#toGuiFsEntry(fsEntry)),
-            ...this.#toEventGuiMetadata(guiMetadata, false),
+            ...this.#toEventGuiMetadata(guiMetadata),
             from_new_service: true,
         };
         await this.clients.event.emit(
@@ -2142,6 +2083,20 @@ export class FSController extends PuterController {
     #isAppDataPath(targetPath: string): boolean {
         const pathParts = targetPath.split('/').filter(Boolean);
         return pathParts.length >= 2 && pathParts[1] === 'AppData';
+    }
+
+    // If `actor` is effectively scoped to an app (directly or through an
+    // access-token issuer chain), return that app's AppData root under the
+    // actor's user. Returns undefined for pure user actors. The store anchors
+    // search results to this path so app actors can't see entries outside
+    // their AppData via `/fs/search`.
+    #appDataScopeForActor(actor: Actor): string | undefined {
+        const app = effectiveActorApp(actor);
+        if (!app) return undefined;
+        const username = actor.user?.username;
+        if (typeof username !== 'string' || username.length === 0)
+            return undefined;
+        return `/${username}/AppData/${app.uid}`;
     }
 
     #estimateDataUrlSize(dataUrl: string): number {
@@ -2237,7 +2192,7 @@ export class FSController extends PuterController {
             return null;
         }
 
-        return { index, contentType, size };
+        return { index, contentType, size } as ThumbnailUploadPrepareItem;
     }
 
     async #attachSignedThumbnailUploadTargets(
@@ -2257,11 +2212,12 @@ export class FSController extends PuterController {
 
         const payload: ThumbnailUploadPreparePayload = {
             items: prepareItems.map(
-                (item): ThumbnailUploadPrepareItem => ({
-                    index: item.index,
-                    contentType: item.contentType,
-                    ...(item.size !== undefined ? { size: item.size } : {}),
-                }),
+                (item): ThumbnailUploadPrepareItem =>
+                    ({
+                        index: item.index,
+                        contentType: item.contentType,
+                        ...(item.size !== undefined ? { size: item.size } : {}),
+                    }) as ThumbnailUploadPrepareItem,
             ),
         };
         // emitAndWait — listeners populate `uploadUrl` / `thumbnailUrl` on

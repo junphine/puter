@@ -22,7 +22,7 @@ import type { Request, RequestHandler, Response } from 'express';
 import { contentType as contentTypeFromMime } from 'mime-types';
 import { posix as pathPosix } from 'node:path';
 import type { Actor } from '../../core/actor.js';
-import { isAccessTokenActor } from '../../core/actor.js';
+import { effectiveActorApp, isAccessTokenActor } from '../../core/actor.js';
 import { Context } from '../../core/context.js';
 import { HttpError } from '../../core/http/HttpError.js';
 import type { PuterRouter } from '../../core/http/PuterRouter.js';
@@ -57,6 +57,16 @@ type RouterCache = Map<string, RequestHandler | null>;
 
 const additionalRoutePaths: Record<string, string> = {};
 
+// Legacy `/batch` multipart upload caps. Each file is buffered fully into
+// memory before any quota / storage check runs, so without these limits an
+// authenticated caller could grow the process heap proportional to whatever
+// they sent. Streaming uploads go through `/writeFile`; this path is for
+// pre-v2 clients only.
+const BATCH_MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MiB per file
+const BATCH_MAX_FILES = 64;
+const BATCH_MAX_PARTS = 256;
+const BATCH_MAX_FIELD_SIZE = 1 * 1024 * 1024; // 1 MiB per operation/fileinfo JSON
+
 async function loadAdditionalRouter(
     key: string,
 ): Promise<RequestHandler | null> {
@@ -74,7 +84,7 @@ async function loadAdditionalRouter(
     }
 }
 
-// ── Controller ──────────────────────────────────────────────────────
+// -- Controller ------------------------------------------------------
 
 export class LegacyFSController extends PuterController {
     #additionalCache: RouterCache = new Map();
@@ -195,35 +205,7 @@ export class LegacyFSController extends PuterController {
             res.json({ recommended, recent });
         });
 
-        router.post('/suggest_apps', apiOptions, async (req, res) => {
-            const suggestSvc = this.services.suggestedApps;
-            if (!suggestSvc?.getSuggestedApps) {
-                res.json([]);
-                return;
-            }
-            const body = req.body ?? {};
-            // Client sends { uid } or { path } identifying a file entry.
-            // Resolve the entry to get its name/path for extension detection.
-            let entryName: string | undefined;
-            let entryPath: string | undefined;
-            if (body.uid || body.path) {
-                try {
-                    const entry = await resolveV1Selector(
-                        this.stores.fsEntry,
-                        body,
-                    );
-                    entryName = entry?.name;
-                    entryPath = entry?.path;
-                } catch {
-                    // If we can't resolve, fall back to empty
-                }
-            }
-            const suggestions = await suggestSvc.getSuggestedApps({
-                name: entryName,
-                path: entryPath,
-            });
-            res.json(suggestions);
-        });
+        router.post('/suggest_apps', apiOptions, this.suggestApps);
 
         // puter-js polls this to decide whether to purge its in-memory FS
         // cache. SocketService bumps a per-user Redis key on every
@@ -251,70 +233,11 @@ export class LegacyFSController extends PuterController {
             },
         );
 
-        // ── POST /readdir-subdomains ────────────────────────────────
-        router.post(
-            '/readdir-subdomains',
-            apiOptions,
-            async (req: Request, res: Response) => {
-                const userId = req.actor?.user?.id;
-                if (!userId)
-                    throw new HttpError(401, 'Authentication required', {
-                        legacyCode: 'unauthorized',
-                    });
-                const rows = await this.clients.db.read(
-                    'SELECT `subdomain`, `root_dir_id`, `uuid`, `ts` FROM `subdomains` WHERE `user_id` = ?',
-                    [userId],
-                );
-                res.json(rows);
-            },
-        );
-
-        // ── POST /update-fsentry-thumbnail ──────────────────────────
+        router.post('/readdir-subdomains', apiOptions, this.readdirSubdomains);
         router.post(
             '/update-fsentry-thumbnail',
             apiOptions,
-            async (req: Request, res: Response) => {
-                const userId = req.actor?.user?.id;
-                if (!userId)
-                    throw new HttpError(401, 'Authentication required', {
-                        legacyCode: 'unauthorized',
-                    });
-                const { uid, thumbnail } = (req.body ?? {}) as {
-                    uid?: string;
-                    thumbnail?: string;
-                };
-                if (!uid)
-                    throw new HttpError(400, 'Missing `uid`', {
-                        legacyCode: 'bad_request',
-                    });
-                if (!thumbnail)
-                    throw new HttpError(400, 'Missing `thumbnail`', {
-                        legacyCode: 'bad_request',
-                    });
-
-                const entry = await this.stores.fsEntry.getEntryByUuid(uid);
-                if (!entry || entry.userId !== userId)
-                    throw new HttpError(403, 'Access denied', {
-                        legacyCode: 'forbidden',
-                    });
-
-                // Emit thumbnail.created so the thumbnails extension can S3-upload.
-                // emitAndWait is required — the extension rewrites `event.url`
-                // from a data URL to an `s3://` pointer, and the DB write below
-                // needs to see that rewrite.
-                const event = { url: thumbnail };
-                await this.clients.event.emitAndWait(
-                    'thumbnail.created',
-                    event,
-                    {},
-                );
-
-                await this.clients.db.write(
-                    'UPDATE `fsentries` SET `thumbnail` = ? WHERE `uuid` = ?',
-                    [event.url, uid],
-                );
-                res.json({ thumbnail: event.url });
-            },
+            this.updateFsentryThumbnail,
         );
 
         for (const key of Object.keys(additionalRoutePaths)) {
@@ -328,7 +251,7 @@ export class LegacyFSController extends PuterController {
         }
     }
 
-    // ── Route implementations ───────────────────────────────────────────
+    // -- Route implementations -------------------------------------------
     //
     // Handlers are public arrow class fields so they auto-bind `this` and can
     // be passed directly to `router.post(...)` without `.bind(this)`. Express
@@ -756,8 +679,108 @@ export class LegacyFSController extends PuterController {
         res.send('');
     };
 
+    suggestApps = async (req: Request, res: Response): Promise<void> => {
+        const suggestSvc = this.services.suggestedApps;
+        if (!suggestSvc?.getSuggestedApps) {
+            res.json([]);
+            return;
+        }
+        const actor = this.#requireActor(req);
+        const body = asRecord(req.body);
+        let entryName: string | undefined;
+        let entryPath: string | undefined;
+        if (body.uid || body.path) {
+            try {
+                const entry = await resolveV1Selector(
+                    this.stores.fsEntry,
+                    body,
+                );
+                // Suggestions leak the entry's extension and existence;
+                // gate on `see` so app actors can't probe outside scope.
+                if (entry?.path) {
+                    await assertAccess(
+                        this.services.acl,
+                        this.services.fs,
+                        actor,
+                        entry.path,
+                        'see',
+                    );
+                }
+                entryName = entry?.name;
+                entryPath = entry?.path;
+            } catch {
+                // Unresolvable or ACL-denied → empty suggestions.
+            }
+        }
+        const suggestions = await suggestSvc.getSuggestedApps({
+            name: entryName,
+            path: entryPath,
+        });
+        res.json(suggestions);
+    };
+
+    readdirSubdomains = async (req: Request, res: Response): Promise<void> => {
+        const actor = this.#requireActor(req);
+        // Subdomain enumeration is a user-level concern; app actors would
+        // otherwise see root_dir uids pointing outside their AppData scope.
+        if (effectiveActorApp(actor)) {
+            res.json([]);
+            return;
+        }
+        const userId = this.#getActorUserId(req);
+        const rows = await this.clients.db.read(
+            'SELECT `subdomain`, `root_dir_id`, `uuid`, `ts` FROM `subdomains` WHERE `user_id` = ?',
+            [userId],
+        );
+        res.json(rows);
+    };
+
+    updateFsentryThumbnail = async (
+        req: Request,
+        res: Response,
+    ): Promise<void> => {
+        const actor = this.#requireActor(req);
+        const { uid, thumbnail } = asRecord(req.body) as {
+            uid?: string;
+            thumbnail?: string;
+        };
+        if (!uid)
+            throw new HttpError(400, 'Missing `uid`', {
+                legacyCode: 'bad_request',
+            });
+        if (!thumbnail)
+            throw new HttpError(400, 'Missing `thumbnail`', {
+                legacyCode: 'bad_request',
+            });
+
+        const entry = await this.stores.fsEntry.getEntryByUuid(uid);
+        if (!entry || !entry.path)
+            throw new HttpError(404, `Entry not found: uid=${uid}`, {
+                legacyCode: 'subject_does_not_exist',
+            });
+        await assertAccess(
+            this.services.acl,
+            this.services.fs,
+            actor,
+            entry.path,
+            'write',
+        );
+
+        // emitAndWait is required: the thumbnails extension rewrites
+        // `event.url` from a data URL to an `s3://` pointer, and the DB
+        // write below needs to see that rewrite.
+        const event = { url: thumbnail };
+        await this.clients.event.emitAndWait('thumbnail.created', event, {});
+
+        await this.clients.db.write(
+            'UPDATE `fsentries` SET `thumbnail` = ? WHERE `uuid` = ?',
+            [event.url, uid],
+        );
+        res.json({ thumbnail: event.url });
+    };
+
     search = async (req: Request, res: Response): Promise<void> => {
-        this.#requireActor(req);
+        const actor = this.#requireActor(req);
         const userId = this.#getActorUserId(req);
         const body = asRecord(req.body);
         const query = getString(body, 'query', 'text') ?? '';
@@ -766,7 +789,21 @@ export class LegacyFSController extends PuterController {
                 legacyCode: 'bad_request',
             });
 
-        const results = await this.services.fs.searchByName(userId, query, 200);
+        // App-under-user actors only see entries within their AppData root;
+        // user actors are unscoped. Mirrors the ACL short-circuit in
+        // ACLService.check.
+        const app = effectiveActorApp(actor);
+        const username = actor.user?.username;
+        const pathScope =
+            app && typeof username === 'string' && username.length > 0
+                ? `/${username}/AppData/${app.uid}`
+                : undefined;
+        const results = await this.services.fs.searchByName(
+            userId,
+            query,
+            200,
+            pathScope,
+        );
         const shaped = await Promise.all(
             results.map((r) => toLegacyEntry(this.clients.event, r)),
         );
@@ -888,7 +925,7 @@ export class LegacyFSController extends PuterController {
         return this.read(req, res, { realMime: true });
     };
 
-    // ── Signed-URL + meta routes ────────────────────────────────────────
+    // -- Signed-URL + meta routes ----------------------------------------
 
     /**
      * POST /sign
@@ -937,7 +974,10 @@ export class LegacyFSController extends PuterController {
                     legacyCode: 'not_found',
                 });
             grantApp = { uid: app.uid };
-            result.token = this.services.auth.getUserAppToken(actor, app.uid);
+            result.token = await this.services.auth.getUserAppToken(
+                actor,
+                app.uid,
+            );
         }
 
         for (const rawItem of items) {
@@ -1071,15 +1111,16 @@ export class LegacyFSController extends PuterController {
             );
         }
 
-        // `write` — multipart upload, streamed directly to the v2 write path.
-        // ACL re-check: if the caller is session-authenticated, verify they
-        // have write permission on the target. This prevents a read-only
-        // share recipient from using a leaked write signature.
-        if (operation === 'write' && req.actor) {
+        // ACL re-check: require an authenticated actor with write
+        // permission. A valid write signature alone is not sufficient —
+        // the caller must also pass ACL, preventing exploitation of
+        // leaked write URLs by read-only share recipients.
+        const callerActor = this.#requireActor(req);
+        if (operation === 'write') {
             await assertAccess(
                 this.services.acl,
                 this.services.fs,
-                req.actor,
+                callerActor,
                 targetEntry.path,
                 'write',
             );
@@ -1120,7 +1161,6 @@ export class LegacyFSController extends PuterController {
         // ops (mkdir/rename/copy/move/delete) require a caller actor with explicit
         // ACL on the affected paths — mirroring the unsigned counterparts above.
         const record = asRecord(req.body);
-        const callerActor = this.#requireActor(req);
         if (operation === 'mkdir') {
             await assertAccess(
                 this.services.acl,
@@ -1271,12 +1311,14 @@ export class LegacyFSController extends PuterController {
         }
 
         // Directory: return a signed listing of direct children.
+        // The caller only proved read access, so strip write_url from
+        // each child to prevent privilege escalation via /writeFile.
         if (entry.isDir) {
             const children = await this.services.fs.listDirectory(entry.uuid);
-            const signedChildren = children.map((child) => ({
-                ...signEntry(child, signingCfg),
-                path: child.path,
-            }));
+            const signedChildren = children.map((child) => {
+                const { write_url: _, ...rest } = signEntry(child, signingCfg);
+                return { ...rest, path: child.path };
+            });
             res.json(signedChildren);
             return;
         }
@@ -1349,6 +1391,20 @@ export class LegacyFSController extends PuterController {
             'read',
         );
 
+        // Downgrade the envelope when the caller only proved read.
+        // `/writeFile`'s ACL re-check would still block the write, but
+        // returning `write_url` to a read-only caller is the same
+        // privilege-leak shape that `/sign` and `/readdir` strip.
+        const writeOk = await this.services.acl.check(
+            actor,
+            {
+                path: entry.path,
+                resolveAncestors: () =>
+                    this.services.fs.getAncestorChain(entry.path),
+            },
+            'write',
+        );
+
         const suggested =
             (await this.services.suggestedApps?.getSuggestedApps({
                 name: entry.name,
@@ -1368,11 +1424,20 @@ export class LegacyFSController extends PuterController {
                 {},
                 { reason: 'open_item' },
             );
-            token = this.services.auth.getUserAppToken(actor, defaultAppUid);
+            token = await this.services.auth.getUserAppToken(
+                actor,
+                defaultAppUid,
+            );
         }
 
         const signingCfg = signingConfigFromAppConfig(this.config);
-        const signature = { ...signEntry(entry, signingCfg), path: entry.path };
+        const signed = signEntry(entry, signingCfg);
+        const signature = writeOk
+            ? { ...signed, path: entry.path }
+            : (() => {
+                  const { write_url: _, ...rest } = signed;
+                  return { ...rest, path: entry.path };
+              })();
         res.json({
             signature,
             token,
@@ -1538,7 +1603,7 @@ export class LegacyFSController extends PuterController {
     };
 
     // Helpers for writeFile
-    // ── GUI event emission ───────────────────────────────────────────
+    // -- GUI event emission -------------------------------------------
     //
     // Fire-and-forget `outer.gui.item.*` events so SocketService,
     // BroadcastService, WorkerDriver (hot-reload), and cache-invalidation
@@ -1668,7 +1733,7 @@ export class LegacyFSController extends PuterController {
         });
     }
 
-    // ── Batch route ─────────────────────────────────────────────────────
+    // -- Batch route -----------------------------------------------------
     //
     // `/batch` interleaves multipart JSON operations with optional file
     // uploads. puter-js uses it for `write`, `shortcut`, `mkdir`, `move`,
@@ -1977,7 +2042,46 @@ export class LegacyFSController extends PuterController {
             }> = [];
             const fileinfos: Array<Record<string, unknown>> = [];
             let parseError: Error | null = null;
-            const bb = Busboy({ headers: req.headers });
+            const bb = Busboy({
+                headers: req.headers,
+                limits: {
+                    fileSize: BATCH_MAX_FILE_SIZE,
+                    files: BATCH_MAX_FILES,
+                    parts: BATCH_MAX_PARTS,
+                    fieldSize: BATCH_MAX_FIELD_SIZE,
+                },
+            });
+
+            // Busboy emits these `*Limit` events when a configured cap is
+            // hit. Capture the first one as a 413 so callers get a clean
+            // signal instead of a silently-truncated upload.
+            bb.on('filesLimit', () => {
+                if (!parseError) {
+                    parseError = new HttpError(
+                        413,
+                        `Too many files in batch (max ${BATCH_MAX_FILES})`,
+                        { legacyCode: 'too_large' as never },
+                    );
+                }
+            });
+            bb.on('partsLimit', () => {
+                if (!parseError) {
+                    parseError = new HttpError(
+                        413,
+                        `Too many parts in batch (max ${BATCH_MAX_PARTS})`,
+                        { legacyCode: 'too_large' as never },
+                    );
+                }
+            });
+            bb.on('fieldsLimit', () => {
+                if (!parseError) {
+                    parseError = new HttpError(
+                        413,
+                        'Too many fields in batch',
+                        { legacyCode: 'too_large' as never },
+                    );
+                }
+            });
 
             bb.on('field', (fieldName, value) => {
                 try {
@@ -2004,8 +2108,24 @@ export class LegacyFSController extends PuterController {
             // For streaming uploads use the signed `/writeFile` endpoint.
             bb.on('file', (_fieldName, stream, info) => {
                 const chunks: Buffer[] = [];
+                let truncated = false;
                 stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+                // Busboy emits `limit` after writing the first byte past
+                // `fileSize`. The stream continues being drained so the
+                // multipart parser stays in sync, but we discard the (now
+                // truncated) buffer and mark the batch as failed.
+                stream.on('limit', () => {
+                    truncated = true;
+                    if (!parseError) {
+                        parseError = new HttpError(
+                            413,
+                            `File in batch exceeds ${BATCH_MAX_FILE_SIZE} bytes`,
+                            { legacyCode: 'too_large' as never },
+                        );
+                    }
+                });
                 stream.on('end', () => {
+                    if (truncated) return;
                     files.push({
                         content: Buffer.concat(chunks),
                         mimeType:
@@ -2065,7 +2185,7 @@ export class LegacyFSController extends PuterController {
         return { error: true, status: 500, message: 'Unknown batch error' };
     }
 
-    // ── Helpers ─────────────────────────────────────────────────────────
+    // -- Helpers ---------------------------------------------------------
 
     #parsePositiveIntegerQuery(
         query: Record<string, unknown>,

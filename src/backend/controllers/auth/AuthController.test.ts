@@ -30,6 +30,7 @@
  */
 
 import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { EventClient } from '../../clients/event/EventClient.js';
@@ -2079,6 +2080,104 @@ describe('AuthController session endpoints', () => {
             ),
         ).rejects.toMatchObject({ statusCode: 403 });
     });
+
+    it('rename-session: 400 when uuid param is missing', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleRenameSession(
+                makeReq({ label: 'x' }, { actor, params: {} }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rename-session: 400 when label is the wrong type', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleRenameSession(
+                makeReq(
+                    { label: 123 as unknown as string },
+                    { actor, params: { uuid: 'whatever' } },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rename-session: 400 when label field is missing entirely', async () => {
+        // Guards against accidental "PATCH with empty body silently clears
+        // the label". Type guard rejects `undefined` before reaching the
+        // service layer.
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleRenameSession(
+                makeReq({}, { actor, params: { uuid: 'whatever' } }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('rename-session: 404 when the uuid belongs to another user', async () => {
+        const { user: u1 } = await makeUserAndActor();
+        const { actor: a2 } = await makeUserAndActor();
+        const sessionRes = await server.services.auth.createSessionToken(
+            u1,
+            {},
+        );
+        const uuid = (sessionRes.session as { uuid: string }).uuid;
+        await expect(
+            controller.handleRenameSession(
+                makeReq(
+                    { label: 'pwned' },
+                    { actor: a2, params: { uuid } },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    it('rename-session: success updates the row label', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const sessionRes = await server.services.auth.createSessionToken(
+            user,
+            {},
+        );
+        const uuid = (sessionRes.session as { uuid: string }).uuid;
+        const res = makeRes();
+        await controller.handleRenameSession(
+            makeReq({ label: 'My Phone' }, { actor, params: { uuid } }),
+            res,
+        );
+        expect(res.body).toEqual({});
+        const rows = await server.clients.db.read(
+            'SELECT `label` FROM `sessions` WHERE `uuid` = ?',
+            [uuid],
+        );
+        expect((rows[0] as { label: string }).label).toBe('My Phone');
+    });
+
+    it('rename-session: accepts null to clear the label', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const sessionRes = await server.services.auth.createSessionToken(
+            user,
+            {},
+        );
+        const uuid = (sessionRes.session as { uuid: string }).uuid;
+        // Seed a non-null label so the clear-to-null transition is observable.
+        await server.clients.db.write(
+            'UPDATE `sessions` SET `label` = ? WHERE `uuid` = ?',
+            ['something', uuid],
+        );
+        await controller.handleRenameSession(
+            makeReq({ label: null }, { actor, params: { uuid } }),
+            makeRes(),
+        );
+        const rows = await server.clients.db.read(
+            'SELECT `label` FROM `sessions` WHERE `uuid` = ?',
+            [uuid],
+        );
+        expect((rows[0] as { label: string | null }).label).toBeNull();
+    });
 });
 
 // ── Dev-app grants/revokes ─────────────────────────────────────────
@@ -3404,5 +3503,569 @@ describe('AuthController.handleRevokeSession additional branches', () => {
         );
         const body = res.body as { sessions: unknown[] };
         expect(Array.isArray(body.sessions)).toBe(true);
+    });
+
+    it('refuses to revoke the caller’s OWN current session row (400)', async () => {
+        // Invariant: a self-revoke leaves the client in an ambiguous
+        // identity state because the response can't write fresh auth
+        // state. /logout is the only path that should end the session
+        // you're currently authenticated under.
+        const { user, actor } = await makeUserAndActor();
+        const sessionRes = await server.services.auth.createSessionToken(
+            user,
+            {},
+        );
+        const sessionUid = (sessionRes.session as { uuid: string }).uuid;
+        const actorWithSession = {
+            ...actor,
+            session: { uid: sessionUid },
+        } as Actor;
+        await expect(
+            controller.handleRevokeSession(
+                makeReq({ uuid: sessionUid }, { actor: actorWithSession }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            legacyCode: 'bad_request',
+        });
+    });
+
+    it('still allows revoking a DIFFERENT session belonging to the same user', async () => {
+        // Sanity check that the self-revoke guard only blocks the
+        // caller's own uuid — sibling rows must still be revokable
+        // (that's the whole point of manage-sessions).
+        const { user, actor } = await makeUserAndActor();
+        const callerSession = await server.services.auth.createSessionToken(
+            user,
+            {},
+        );
+        const targetSession = await server.services.auth.createSessionToken(
+            user,
+            {},
+        );
+        const actorWithSession = {
+            ...actor,
+            session: {
+                uid: (callerSession.session as { uuid: string }).uuid,
+            },
+        } as Actor;
+        const res = makeRes();
+        await controller.handleRevokeSession(
+            makeReq(
+                { uuid: (targetSession.session as { uuid: string }).uuid },
+                { actor: actorWithSession },
+            ),
+            res,
+        );
+        expect((res.body as { sessions: unknown[] }).sessions).toBeDefined();
+    });
+});
+
+// ── handleMigrateToken ──────────────────────────────────────────────
+
+describe('AuthController.handleMigrateToken', () => {
+    const TEST_ORIGIN = 'https://migrate.test.local';
+
+    // PuterServer keeps config in a private field (#config), so we go
+    // through the controller — IController stores it as `protected
+    // config` which TS marks but JS doesn't enforce, and the controller
+    // is the actual consumer of #isMigrateTokenOriginAllowed anyway.
+    const controllerConfig = () =>
+        (controller as { config: Record<string, unknown> }).config;
+
+    // Mints a v1-shaped JWT signed under the test server's legacy
+    // secret. The body matches what migrateLegacyToken expects per
+    // `decoded.type`.
+    const mintV1Token = (payload: Record<string, unknown>): string => {
+        const legacy = controllerConfig().jwt_secret as string | undefined;
+        if (!legacy) throw new Error('test config missing jwt_secret');
+        return jwt.sign(payload, legacy);
+    };
+
+    beforeAll(() => {
+        // Make the origin allow-check pass for these tests. We mutate
+        // the live config because setupTestServer is shared across the
+        // file; the original value is undefined (default config has no
+        // `origin`) so we don't need to restore.
+        controllerConfig().origin = TEST_ORIGIN;
+    });
+
+    it('rejects when the Origin header is missing', async () => {
+        await expect(
+            controller.handleMigrateToken(makeReq({}), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 403 });
+    });
+
+    it('rejects when the Origin header is not in config.origin or the allowlist', async () => {
+        const { user } = await makeUserAndActor();
+        const v1 = mintV1Token({
+            type: 'access-token',
+            token_uid: uuidv4(),
+            user_uid: user.uuid,
+        });
+        await expect(
+            controller.handleMigrateToken(
+                makeReq(
+                    {},
+                    {
+                        headers: {
+                            origin: 'https://not-allowed.example',
+                            authorization: `Bearer ${v1}`,
+                        },
+                    },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 403 });
+    });
+
+    it('normalizes trailing slash on the request Origin (B4)', async () => {
+        // The Origin header per spec doesn't carry a trailing slash, but
+        // a misconfigured proxy or a deployment with config.origin
+        // ending in `/` would otherwise force every call to reject.
+        const { user } = await makeUserAndActor();
+        const v1 = mintV1Token({
+            type: 'access-token',
+            token_uid: uuidv4(),
+            user_uid: user.uuid,
+        });
+        const res = makeRes();
+        await controller.handleMigrateToken(
+            makeReq(
+                {},
+                {
+                    headers: {
+                        origin: `${TEST_ORIGIN}/`, // trailing slash
+                        authorization: `Bearer ${v1}`,
+                    },
+                },
+            ),
+            res,
+        );
+        expect((res.body as { kind: string }).kind).toBe('access_token');
+    });
+
+    it('normalizes case on the request Origin (B4)', async () => {
+        const { user } = await makeUserAndActor();
+        const v1 = mintV1Token({
+            type: 'access-token',
+            token_uid: uuidv4(),
+            user_uid: user.uuid,
+        });
+        const res = makeRes();
+        await controller.handleMigrateToken(
+            makeReq(
+                {},
+                {
+                    headers: {
+                        origin: TEST_ORIGIN.toUpperCase(),
+                        authorization: `Bearer ${v1}`,
+                    },
+                },
+            ),
+            res,
+        );
+        expect((res.body as { kind: string }).kind).toBe('access_token');
+    });
+
+    it('returns 409 reauth_required for v1 web/session tokens', async () => {
+        // Web tokens never migrate silently — they always go through
+        // the interactive reauth flow. The body code is what puter.js /
+        // GUI key on; the 409 status is what tells SDK code "this
+        // isn't a generic auth failure, route through reauth".
+        const { user } = await makeUserAndActor();
+        const v1 = mintV1Token({
+            type: 'session',
+            user_uid: user.uuid,
+            uuid: uuidv4(),
+        });
+        await expect(
+            controller.handleMigrateToken(
+                makeReq(
+                    {},
+                    {
+                        headers: {
+                            origin: TEST_ORIGIN,
+                            authorization: `Bearer ${v1}`,
+                        },
+                    },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 409,
+            code: 'reauth_required',
+        });
+    });
+
+    it('does NOT set the puter_token_v2 cookie when migrating an access token (B3)', async () => {
+        // Access tokens are programmatic — they ride in Authorization
+        // headers, not browser cookies. Setting a cookie here would
+        // confuse cookie-only middleware downstream.
+        const { user } = await makeUserAndActor();
+        const v1 = mintV1Token({
+            type: 'access-token',
+            token_uid: uuidv4(),
+            user_uid: user.uuid,
+        });
+        const res = makeRes();
+        await controller.handleMigrateToken(
+            makeReq(
+                {},
+                {
+                    headers: {
+                        origin: TEST_ORIGIN,
+                        authorization: `Bearer ${v1}`,
+                    },
+                },
+            ),
+            res,
+        );
+        expect(res.cookies.puter_token_v2).toBeUndefined();
+        expect((res.body as { kind: string }).kind).toBe('access_token');
+        expect((res.body as { token: string }).token).toBeTruthy();
+    });
+
+    it('sets the puter_token_v2 cookie when migrating an app-under-user token (B3)', async () => {
+        // App tokens DO get a cookie companion — the app runs inside an
+        // iframe in the GUI, and the GUI's cookie-only middleware
+        // authenticates subsequent calls from the iframe via the cookie
+        // rather than the client having to plumb Authorization through
+        // every request.
+        const { user } = await makeUserAndActor();
+        const appUid = `app-${uuidv4()}`;
+        const v1 = mintV1Token({
+            type: 'app-under-user',
+            user_uid: user.uuid,
+            app_uid: appUid,
+        });
+        const res = makeRes();
+        await controller.handleMigrateToken(
+            makeReq(
+                {},
+                {
+                    headers: {
+                        origin: TEST_ORIGIN,
+                        authorization: `Bearer ${v1}`,
+                    },
+                },
+            ),
+            res,
+        );
+        expect((res.body as { kind: string }).kind).toBe('app');
+        const cookie = res.cookies.puter_token_v2;
+        expect(cookie).toBeDefined();
+        expect(cookie.value).toBe((res.body as { token: string }).token);
+        expect(cookie.opts?.httpOnly).toBe(true);
+    });
+});
+
+// -- auth_id preservation on forced re-login --
+
+describe('AuthController auth_id preservation on reauth', () => {
+    const password = 'correct-horse-battery';
+    const mintReauth = (uuid: string): string =>
+        server.services.auth.signReauthToken(uuid);
+
+    it('handleLogin with matching reauth_token completes login as the same user', async () => {
+        const u = `aid_${Math.random().toString(36).slice(2, 10)}`;
+        const ip = `127.0.${Math.floor(Math.random() * 200)}.1`;
+        await controller.handleSignup(
+            makeReq(
+                { username: u, email: `${u}@test.local`, password },
+                { ip },
+            ),
+            makeRes(),
+        );
+        const seeded = await server.stores.user.getByUsername(u);
+
+        const res = makeRes();
+        await controller.handleLogin(
+            makeReq(
+                {
+                    username: u,
+                    password,
+                    reauth_token: mintReauth(seeded!.uuid),
+                },
+                { ip },
+            ),
+            res,
+        );
+        expect(isCompleteLoginResponse(res.body)).toBe(true);
+        expect((res.body as { user: { uuid: string } }).user.uuid).toBe(
+            seeded!.uuid,
+        );
+    });
+
+    it('handleLogin with mismatched reauth_token is rejected 409', async () => {
+        const a = `aida_${Math.random().toString(36).slice(2, 10)}`;
+        const b = `aidb_${Math.random().toString(36).slice(2, 10)}`;
+        const ip = `127.0.${Math.floor(Math.random() * 200)}.2`;
+        await controller.handleSignup(
+            makeReq(
+                { username: a, email: `${a}@test.local`, password },
+                { ip },
+            ),
+            makeRes(),
+        );
+        await controller.handleSignup(
+            makeReq(
+                { username: b, email: `${b}@test.local`, password },
+                { ip },
+            ),
+            makeRes(),
+        );
+        const userB = await server.stores.user.getByUsername(b);
+
+        await expect(
+            controller.handleLogin(
+                makeReq(
+                    {
+                        username: a,
+                        password,
+                        reauth_token: mintReauth(userB!.uuid),
+                    },
+                    { ip },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 409,
+            fields: { code: 'auth_id_mismatch' },
+        });
+    });
+
+    it('handleLogin with reauth_token for an unknown user returns 404', async () => {
+        const u = `aidu_${Math.random().toString(36).slice(2, 10)}`;
+        const ip = `127.0.${Math.floor(Math.random() * 200)}.3`;
+        await controller.handleSignup(
+            makeReq(
+                { username: u, email: `${u}@test.local`, password },
+                { ip },
+            ),
+            makeRes(),
+        );
+        await expect(
+            controller.handleLogin(
+                makeReq(
+                    {
+                        username: u,
+                        password,
+                        reauth_token: mintReauth(uuidv4()),
+                    },
+                    { ip },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    it('handleLogin with a non-string reauth_token returns 400', async () => {
+        const u = `aidb_${Math.random().toString(36).slice(2, 10)}`;
+        const ip = `127.0.${Math.floor(Math.random() * 200)}.4`;
+        await controller.handleSignup(
+            makeReq(
+                { username: u, email: `${u}@test.local`, password },
+                { ip },
+            ),
+            makeRes(),
+        );
+        await expect(
+            controller.handleLogin(
+                makeReq({ username: u, password, reauth_token: 42 }, { ip }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('handleLogin with a forged/garbage reauth_token returns 401', async () => {
+        const u = `aidf_${Math.random().toString(36).slice(2, 10)}`;
+        const ip = `127.0.${Math.floor(Math.random() * 200)}.9`;
+        await controller.handleSignup(
+            makeReq(
+                { username: u, email: `${u}@test.local`, password },
+                { ip },
+            ),
+            makeRes(),
+        );
+        await expect(
+            controller.handleLogin(
+                makeReq(
+                    { username: u, password, reauth_token: 'not-a-jwt' },
+                    { ip },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 401 });
+    });
+
+    it('handleLogin OTP branch echoes auth_id into the OTP JWT', async () => {
+        const u = `aidotp_${Math.random().toString(36).slice(2, 10)}`;
+        const ip = `127.0.${Math.floor(Math.random() * 200)}.5`;
+        await controller.handleSignup(
+            makeReq(
+                { username: u, email: `${u}@test.local`, password },
+                { ip },
+            ),
+            makeRes(),
+        );
+        const seeded = await server.stores.user.getByUsername(u);
+        await server.stores.user.update(seeded!.id, {
+            otp_enabled: 1,
+            otp_secret: 'TESTSECRETBASE32',
+        });
+
+        const res = makeRes();
+        await controller.handleLogin(
+            makeReq(
+                {
+                    username: u,
+                    password,
+                    reauth_token: mintReauth(seeded!.uuid),
+                },
+                { ip },
+            ),
+            res,
+        );
+        expect(res.statusCode).toBe(202);
+        const body = res.body as { otp_jwt_token: string };
+        const decoded = server.services.token.verify(
+            'otp',
+            body.otp_jwt_token,
+        ) as {
+            user_uid: string;
+            auth_id?: string;
+        };
+        expect(decoded.auth_id).toBe(seeded!.uuid);
+    });
+
+    it('handleSignup is_temp + matching reauth_token returns the SAME temp user', async () => {
+        const tempRes1 = makeRes();
+        const ip = `127.0.${Math.floor(Math.random() * 200)}.6`;
+        await controller.handleSignup(
+            makeReq({ is_temp: true }, { ip }),
+            tempRes1,
+        );
+        const body1 = tempRes1.body as { user: { uuid: string } };
+        const tempUuid = body1.user.uuid;
+        const tempUser1 = await server.stores.user.getByUuid(tempUuid);
+        expect(tempUser1).toBeTruthy();
+        const markerId = tempUser1!.id;
+
+        const tempRes2 = makeRes();
+        await controller.handleSignup(
+            makeReq(
+                { is_temp: true, reauth_token: mintReauth(tempUuid) },
+                { ip },
+            ),
+            tempRes2,
+        );
+        expect(isCompleteLoginResponse(tempRes2.body)).toBe(true);
+        const body2 = tempRes2.body as {
+            user: { uuid: string; is_temp: boolean };
+        };
+        expect(body2.user.uuid).toBe(tempUuid);
+        expect(body2.user.is_temp).toBe(true);
+
+        const tempUser2 = await server.stores.user.getByUuid(tempUuid);
+        expect(tempUser2!.id).toBe(markerId);
+    });
+
+    it('handleSignup is_temp + reauth_token pointing at a permanent user is rejected', async () => {
+        const u = `aidperm_${Math.random().toString(36).slice(2, 10)}`;
+        const ip = `127.0.${Math.floor(Math.random() * 200)}.7`;
+        await controller.handleSignup(
+            makeReq(
+                { username: u, email: `${u}@test.local`, password },
+                { ip },
+            ),
+            makeRes(),
+        );
+        const seeded = await server.stores.user.getByUsername(u);
+
+        await expect(
+            controller.handleSignup(
+                makeReq(
+                    {
+                        is_temp: true,
+                        reauth_token: mintReauth(seeded!.uuid),
+                    },
+                    { ip },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('handleSignup is_temp + reauth_token for an unknown user returns 404', async () => {
+        const ip = `127.0.${Math.floor(Math.random() * 200)}.8`;
+        await expect(
+            controller.handleSignup(
+                makeReq(
+                    {
+                        is_temp: true,
+                        reauth_token: mintReauth(uuidv4()),
+                    },
+                    { ip },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    it('handleSignup is_temp rejects a forged reauth_token (401)', async () => {
+        const ip = `127.0.${Math.floor(Math.random() * 200)}.10`;
+        await expect(
+            controller.handleSignup(
+                makeReq(
+                    { is_temp: true, reauth_token: 'not-a-jwt' },
+                    { ip },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 401 });
+    });
+
+    it('rate-limits reauth_token login attempts per IP', async () => {
+        const ip = `10.99.${Math.floor(Math.random() * 200)}.${Math.floor(Math.random() * 200)}`;
+        const u = `aidrl_${Math.random().toString(36).slice(2, 10)}`;
+        await controller.handleSignup(
+            makeReq(
+                { username: u, email: `${u}@test.local`, password },
+                { ip },
+            ),
+            makeRes(),
+        );
+        const seeded = await server.stores.user.getByUsername(u);
+
+        for (let i = 0; i < 5; i++) {
+            const res = makeRes();
+            await controller.handleLogin(
+                makeReq(
+                    {
+                        username: u,
+                        password,
+                        reauth_token: mintReauth(seeded!.uuid),
+                    },
+                    { ip },
+                ),
+                res,
+            );
+            expect(isCompleteLoginResponse(res.body)).toBe(true);
+        }
+        await expect(
+            controller.handleLogin(
+                makeReq(
+                    {
+                        username: u,
+                        password,
+                        reauth_token: mintReauth(seeded!.uuid),
+                    },
+                    { ip },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 429 });
     });
 });

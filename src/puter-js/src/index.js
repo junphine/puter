@@ -18,6 +18,7 @@ import { PTLSSocket } from './modules/networking/PTLS.js';
 import { pFetch } from './modules/networking/requests.js';
 import OS from './modules/OS.js';
 import Perms from './modules/Perms.js';
+import PuterDialog from './modules/PuterDialog.js';
 import UI from './modules/UI.js';
 import Util from './modules/Util.js';
 import { WorkersHandler } from './modules/Workers.js';
@@ -91,6 +92,14 @@ class Lock {
 //       (using defaultGUIOrigin breaks locally-hosted apps)
 const PROD_ORIGIN = 'https://puter.com';
 
+// localStorage keys for the auth token. v1 is the legacy key. v2 is
+// the new key written after the token rotation in the v1→v2 cutover.
+// Reads prefer v2; v1 is only consulted to drive the silent-migration
+// path (access_token / app kinds) or — for kind='web' — to fail over
+// to the interactive reauth flow.
+const STORAGE_KEY_V1 = 'puter.auth.token';
+const STORAGE_KEY_V2 = 'puter.auth.token.v2';
+
 const puterInit = (function () {
     'use strict';
 
@@ -142,6 +151,12 @@ const puterInit = (function () {
 
         // Event handling properties
         eventHandlers = {};
+
+        // Reauth coordinator state. When the backend signals
+        // `401 { code: 'reauth_required' }`, in-flight requests await this
+        // promise; the first caller drives the interactive flow, everyone
+        // else replays after it resolves.
+        _reauthInflight = null;
 
         // debug flag
         debugMode = false;
@@ -456,17 +471,40 @@ const puterInit = (function () {
                 );
                 try {
                     let selectedAuthToken = bootstrapAuthToken;
+                    let needsSilentMigration = false;
                     if ( bootstrapAuthToken ) {
+                        // URL-param tokens may still be v1 (host apps that
+                        // haven't rebuilt yet). Set immediately so submodules
+                        // can run, then attempt silent migration in the
+                        // background.
                         this.setAuthToken(bootstrapAuthToken);
+                        needsSilentMigration = true;
                     } else {
-                        const storedAuthToken = this.normalizeAuthTokenCandidate(
-                            localStorage.getItem('puter.auth.token'),
+                        // Prefer the v2 storage key. Fall back to v1
+                        // and queue a silent migrate-token call.
+                        const v2 = this.normalizeAuthTokenCandidate(
+                            localStorage.getItem(STORAGE_KEY_V2),
                         );
-                        // If the authToken is already set in localStorage, then we don't need to show the dialog
-                        if ( storedAuthToken ) {
-                            this.setAuthToken(storedAuthToken);
-                            selectedAuthToken = storedAuthToken;
+                        if ( v2 ) {
+                            this.setAuthToken(v2);
+                            selectedAuthToken = v2;
+                        } else {
+                            const v1 = this.normalizeAuthTokenCandidate(
+                                localStorage.getItem(STORAGE_KEY_V1),
+                            );
+                            if ( v1 ) {
+                                this.setAuthToken(v1);
+                                selectedAuthToken = v1;
+                                needsSilentMigration = true;
+                            }
                         }
+                    }
+                    if ( needsSilentMigration && selectedAuthToken ) {
+                        // Fire-and-forget. On success, setAuthToken inside the
+                        // migration helper updates submodules with the v2
+                        // token. On failure the next 401 reauth_required
+                        // triggers the interactive flow.
+                        this._silentMigrateV1Token(selectedAuthToken);
                     }
                     const tokenAppID = this.getAppIDFromAuthToken(selectedAuthToken);
                     if ( !tokenAppID && !this.appID ) {
@@ -489,10 +527,25 @@ const puterInit = (function () {
                 // initialize submodules
                 this.initSubmodules();
                 try {
-                    // If the authToken is already set in localStorage, then we don't need to show the dialog
-                    const storedAuthToken = this.normalizeAuthTokenCandidate(localStorage.getItem('puter.auth.token'));
-                    if ( storedAuthToken ) {
-                        this.setAuthToken(storedAuthToken);
+                    // Prefer the v2 storage key. Fall back to v1 and
+                    // run a silent migration in the background.
+                    const v2 = this.normalizeAuthTokenCandidate(
+                        localStorage.getItem(STORAGE_KEY_V2),
+                    );
+                    if ( v2 ) {
+                        this.setAuthToken(v2);
+                    } else {
+                        const v1 = this.normalizeAuthTokenCandidate(
+                            localStorage.getItem(STORAGE_KEY_V1),
+                        );
+                        if ( v1 ) {
+                            this.setAuthToken(v1);
+                            // For kind='access_token' the backend will swap
+                            // this for a v2 token. For kind='web' it'll
+                            // refuse (409) and the next request bounces us
+                            // through the reauth popup.
+                            this._silentMigrateV1Token(v1);
+                        }
                     }
                     // if appID is already set in localStorage, then we don't need to show the dialog
                     if ( !this.appID && localStorage.getItem('puter.app.id') ) {
@@ -505,6 +558,11 @@ const puterInit = (function () {
 
                 // Print a CTA for developers to publish their app on the Puter App Store
                 this.printDevCTA();
+
+                // If the page was opened directly from disk (file:// protocol),
+                // Puter.js cannot function. Warn the developer immediately on
+                // load rather than waiting for an action that triggers auth.
+                this.warnUnsupportedProtocol();
             } else if ( this.env === 'web-worker' || this.env === 'service-worker' || this.env === 'nodejs' ) {
                 this.initSubmodules();
             }
@@ -641,10 +699,14 @@ const puterInit = (function () {
             if ( this.env === 'web' || this.env === 'app' ) {
                 try {
                     if ( normalizedAuthToken ) {
-                        localStorage.setItem('puter.auth.token', normalizedAuthToken);
+                        localStorage.setItem(STORAGE_KEY_V2, normalizedAuthToken);
                     } else {
-                        localStorage.removeItem('puter.auth.token');
+                        localStorage.removeItem(STORAGE_KEY_V2);
                     }
+                    // Always clear the legacy v1 key on a write — once we
+                    // have a v2 token, the v1 one must not linger or it
+                    // would be picked up by older code paths.
+                    localStorage.removeItem(STORAGE_KEY_V1);
                 } catch ( error ) {
                     // Handle the error here
                     console.error('Error accessing localStorage:', error);
@@ -700,7 +762,8 @@ const puterInit = (function () {
             // If the SDK is running on a 3rd-party site or an app, then save the authToken in localStorage
             if ( this.env === 'web' || this.env === 'app' ) {
                 try {
-                    localStorage.removeItem('puter.auth.token');
+                    localStorage.removeItem(STORAGE_KEY_V2);
+                    localStorage.removeItem(STORAGE_KEY_V1);
                 } catch ( error ) {
                     // Handle the error here
                     console.error('Error accessing localStorage:', error);
@@ -708,6 +771,192 @@ const puterInit = (function () {
             }
             // reinitialize submodules
             this.updateSubmodules();
+        };
+
+        /**
+         * Reauth coordinator. Called by the network layer (lib/utils.js)
+         * when the backend returns
+         * `401 { code: 'reauth_required', reason, auth_id }`.
+         *
+         * Behavior is environment-specific:
+         *   - `web` / `app`: clear the stored token, emit an event, and
+         *     drive the existing puter.com login popup. Returns a promise
+         *     that resolves when the user signs in (so callers can replay)
+         *     or rejects if reauth fails / is canceled.
+         *   - `gui`: no-op — the GUI environment renders its own modal
+         *     and host code is responsible for the flow.
+         *   - workers / nodejs: there's no UI surface to drive, so reject
+         *     with a structured error and let worker code react.
+         *
+         * Idempotent: parallel callers share a single in-flight promise.
+         * @param {{ reason?: string, auth_id?: string }} signal
+         */
+        triggerReauth = async function (signal = {}) {
+            const { reason, auth_id } = signal;
+            if ( this._reauthInflight ) return this._reauthInflight;
+
+            // Emit before clearing so listeners can read state if needed.
+            this._emitReauthEvent({ reason, auth_id });
+
+            // Drop the stored token immediately so a failed/canceled reauth
+            // doesn't leave a poisoned value in localStorage. The new token
+            // (if reauth succeeds) is written by setAuthToken downstream.
+            this.authToken = null;
+            if ( this.env === 'web' || this.env === 'app' ) {
+                try {
+                    localStorage.removeItem(STORAGE_KEY_V2);
+                    localStorage.removeItem(STORAGE_KEY_V1);
+                } catch ( e ) {
+                    console.error('Error accessing localStorage:', e);
+                }
+            }
+            this.updateSubmodules();
+
+            this._reauthInflight = (async () => {
+                if ( this.env === 'gui' ) {
+                    // GUI handles its own modal at the layer above puter-js.
+                    return;
+                }
+                if (
+                    this.env === 'web-worker' ||
+                    this.env === 'service-worker' ||
+                    this.env === 'nodejs'
+                ) {
+                    const err = new Error('reauth_required');
+                    err.code = 'reauth_required';
+                    err.reason = reason;
+                    err.auth_id = auth_id;
+                    throw err;
+                }
+                if ( this.env === 'web' ) {
+                    // Drives the puter.com login popup. On success, the
+                    // postMessage handler at the bottom of this file calls
+                    // setAuthToken() and updates this.authToken.
+                    await this.ui.authenticateWithPuter({ auth_id, reason });
+                    return;
+                }
+                if ( this.env === 'app' ) {
+                    // We're inside an iframe in the GUI. Ask the parent to
+                    // surface the reauth modal; once the user signs in there,
+                    // the existing `puter.token` postMessage delivers the
+                    // fresh token back to us.
+                    //
+                    // targetOrigin is locked to the expected GUI origin —
+                    // postMessage('*') would leak reauth signal + auth_id
+                    // to any embedding parent (including a malicious one),
+                    // and the message body is only meaningful to the GUI.
+                    try {
+                        globalThis.parent?.postMessage?.({
+                            msg: 'reauth_required',
+                            appInstanceID: this.appInstanceID,
+                            reason,
+                            auth_id,
+                        }, this.defaultGUIOrigin);
+                    } catch ( e ) {
+                        // Best-effort: if postMessage isn't available
+                        // (sandboxed iframe), fall through to error.
+                    }
+                    // Wait for the parent to deliver a fresh token.
+                    // Validate both event.origin AND event.source — origin
+                    // alone lets any same-origin frame on the GUI domain
+                    // deliver a token; pinning source to globalThis.parent
+                    // ensures the message came from the actual embedder.
+                    await new Promise((resolve, reject) => {
+                        const expectedSource = globalThis.parent;
+                        const onToken = (event) => {
+                            if ( event.origin !== this.defaultGUIOrigin ) return;
+                            if ( expectedSource && event.source !== expectedSource ) return;
+                            if ( event.data?.msg !== 'puter.token' ) return;
+                            globalThis.removeEventListener('message', onToken);
+                            resolve();
+                        };
+                        globalThis.addEventListener?.('message', onToken);
+                        // Give the user a generous window to re-auth.
+                        setTimeout(() => {
+                            globalThis.removeEventListener?.('message', onToken);
+                            reject(new Error('reauth_timeout'));
+                        }, 5 * 60 * 1000);
+                    });
+                }
+            })();
+
+            try {
+                await this._reauthInflight;
+            } finally {
+                this._reauthInflight = null;
+            }
+        };
+
+        _emitReauthEvent = function ({ reason, auth_id }) {
+            try {
+                const handlers = this.eventHandlers?.['puter.auth.reauth_required'];
+                if ( Array.isArray(handlers) ) {
+                    for ( const h of handlers ) {
+                        try { h({ reason, auth_id }); } catch ( e ) { /* swallow per-handler errors */ }
+                    }
+                }
+            } catch ( e ) {
+                // Never let event delivery break the reauth flow itself.
+            }
+        };
+
+        /**
+         * Register a listener for SDK events. Used by host apps to react
+         * to `puter.auth.reauth_required`.
+         */
+        on = function (eventName, handler) {
+            if ( ! this.eventHandlers[eventName] ) this.eventHandlers[eventName] = [];
+            this.eventHandlers[eventName].push(handler);
+            return () => this.off(eventName, handler);
+        };
+
+        off = function (eventName, handler) {
+            const handlers = this.eventHandlers[eventName];
+            if ( ! handlers ) return;
+            const idx = handlers.indexOf(handler);
+            if ( idx >= 0 ) handlers.splice(idx, 1);
+        };
+
+        /**
+         * Best-effort silent v1→v2 token migration via the backend
+         * `/auth/migrate-token` endpoint. Used at boot
+         * when only a legacy `puter.auth.token` is present; on success the
+         * v2 token is set via setAuthToken (which clears the v1 key).
+         *
+         * Returns true on successful migration, false otherwise.
+         * Failures fall through to the existing 401-reauth path: any
+         * subsequent API call against the v1 token will receive a
+         * `reauth_required` and route through triggerReauth.
+         */
+        _silentMigrateV1Token = async function (v1Token) {
+            if ( ! v1Token ) return false;
+            try {
+                const resp = await fetch(`${this.APIOrigin}/auth/migrate-token`, {
+                    method: 'POST',
+                    headers: {
+                        Authorization: `Bearer ${v1Token}`,
+                        'Content-Type': 'application/json',
+                    },
+                    credentials: 'include',
+                    body: JSON.stringify({}),
+                });
+                if ( ! resp.ok ) {
+                    // 409 = backend refuses silent migration for this kind
+                    // (web sessions). Any caller will then 401 reauth_required
+                    // and the interactive flow takes over.
+                    return false;
+                }
+                const data = await resp.json().catch(() => null);
+                const token = data?.token;
+                if ( typeof token === 'string' && token.length > 0 ) {
+                    this.setAuthToken(token);
+                    return true;
+                }
+                return false;
+            } catch ( e ) {
+                // Network errors etc. — fall back to reauth on next 401.
+                return false;
+            }
         };
 
         exit = function (statusCode = 0) {
@@ -914,6 +1163,33 @@ const puterInit = (function () {
                 `color: ${mutedColor}; font-size: 11px;`,
                 `color: ${mutedColor}; font-size: 11px; font-style: italic;`
             );
+        };
+
+        /**
+         * Shows the "Unsupported Protocol" warning dialog when the SDK is
+         * loaded directly from the file:// protocol. Runs once on load (when
+         * the DOM is ready) so the developer is told to use a web server
+         * immediately, instead of only when an action triggers the auth flow.
+         * @private
+         */
+        warnUnsupportedProtocol = function () {
+            if ( globalThis.location?.protocol !== 'file:' ) return;
+            if ( this._fileProtocolWarned ) return;
+            this._fileProtocolWarned = true;
+
+            const showDialog = () => {
+                // On file:// PuterDialog renders the "Unsupported Protocol"
+                // warning instead of the auth consent content.
+                const dialog = new PuterDialog(() => {}, () => {});
+                document.body.appendChild(dialog);
+                dialog.open();
+            };
+
+            if ( document.readyState === 'loading' ) {
+                document.addEventListener('DOMContentLoaded', showDialog, { once: true });
+            } else {
+                showDialog();
+            }
         };
 
         /**

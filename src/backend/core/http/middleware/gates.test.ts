@@ -136,6 +136,53 @@ describe('requireAuthGate', () => {
         });
         expectHttpError(got, 403, 'forbidden');
     });
+
+    // ── Reauth signal ───────────────────────────────────────────────
+
+    it('returns 401 reauth_required for a legacy v1 token', () => {
+        const got = runGate(requireAuthGate(), {
+            requiresReauth: { reason: 'token_v1', auth_id: 'u-1' },
+        });
+        expectHttpError(got, 401, 'reauth_required');
+        expect((got as HttpError).fields).toMatchObject({
+            code: 'reauth_required',
+            reason: 'token_v1',
+            auth_id: 'u-1',
+        });
+    });
+
+    it('returns 401 reauth_required with reason=session_revoked', () => {
+        const got = runGate(requireAuthGate(), {
+            requiresReauth: { reason: 'session_revoked', auth_id: 'u-2' },
+        });
+        expectHttpError(got, 401, 'reauth_required');
+        expect((got as HttpError).fields).toMatchObject({
+            reason: 'session_revoked',
+            auth_id: 'u-2',
+        });
+    });
+
+    it('returns 401 reauth_required with reason=session_expired', () => {
+        const got = runGate(requireAuthGate(), {
+            requiresReauth: { reason: 'session_expired' },
+        });
+        expectHttpError(got, 401, 'reauth_required');
+        expect((got as HttpError).fields).toMatchObject({
+            reason: 'session_expired',
+        });
+        // No auth_id field at all when none was supplied (vs. set-to-undefined).
+        expect((got as HttpError).fields?.auth_id).toBeUndefined();
+    });
+
+    it('reauth_required takes priority over tokenAuthFailed', () => {
+        // Both flags set: the structured reauth signal wins. v2 clients
+        // key on `code === 'reauth_required'`; v1 clients still see a 401.
+        const got = runGate(requireAuthGate(), {
+            requiresReauth: { reason: 'token_v1', auth_id: 'u-1' },
+            tokenAuthFailed: true,
+        });
+        expectHttpError(got, 401, 'reauth_required');
+    });
 });
 
 // ── requireUserActorGate ────────────────────────────────────────────
@@ -225,6 +272,35 @@ describe('adminOnlyGate', () => {
             403,
             'forbidden',
         );
+    });
+
+    it('admits the built-ins regardless of case', () => {
+        // On a SQLite self-host with case-sensitive (BINARY) collation, a
+        // user row could exist with `Admin`/`SYSTEM` capitalization. The
+        // gate must still admit those — case is normalized on both sides.
+        for (const username of ['Admin', 'ADMIN', 'sYsTeM']) {
+            const got = runGate(adminOnlyGate(), {
+                actor: { user: { uuid: 'u-1', username } },
+            });
+            expect(got).toBeUndefined();
+        }
+    });
+
+    it('admits case-mismatched extras (allowlist lowercased on construction)', () => {
+        // Pass an extra in mixed case; the gate must accept the same name
+        // in any case — the on-disk username row may be either, depending
+        // on the DB's column collation.
+        const gate = adminOnlyGate(['Daniel']);
+        expect(
+            runGate(gate, {
+                actor: { user: { uuid: 'u-1', username: 'daniel' } },
+            }),
+        ).toBeUndefined();
+        expect(
+            runGate(gate, {
+                actor: { user: { uuid: 'u-1', username: 'DANIEL' } },
+            }),
+        ).toBeUndefined();
     });
 });
 

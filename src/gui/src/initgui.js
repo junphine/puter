@@ -396,7 +396,9 @@ window.initgui = async function (options) {
         if ( r.ok ) {
             const { token } = await r.json();
             window.auth_token = token;
-            localStorage.setItem('auth_token', token);
+            // Write the v2 key; drop legacy v1 key.
+            localStorage.setItem(window.AUTH_TOKEN_KEY_V2 || 'auth_token_v2', token);
+            try { localStorage.removeItem(window.AUTH_TOKEN_KEY_V1 || 'auth_token'); } catch ( e ) { /* ignore */ }
             if ( typeof puter !== 'undefined' ) puter.setAuthToken(token, window.api_origin);
             const tokenChanged = token !== window.auth_token;
             if ( tokenChanged ) {

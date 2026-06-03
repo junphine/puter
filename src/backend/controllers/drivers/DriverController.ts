@@ -26,8 +26,6 @@ import {
     checkDriverRateLimit,
 } from '../../core/http/middleware/rateLimit.js';
 import type { PuterRouter } from '../../core/http/PuterRouter.js';
-import type { PermissionService } from '../../services/permission/PermissionService.js';
-import type { WithLifecycle } from '../../types';
 import type { DriverMeta } from '../../drivers/meta.js';
 import {
     isDriverStreamResult,
@@ -35,124 +33,49 @@ import {
     resolveDriverMethodConcurrent,
     resolveDriverMethodRateLimit,
 } from '../../drivers/meta.js';
+import type { PermissionService } from '../../services/permission/PermissionService.js';
+import type { WithLifecycle } from '../../types';
 import { PuterController } from '../types.js';
 
 type DriverInstance = WithLifecycle & Record<string, unknown>;
 
-// ── /drivers/xd payload ─────────────────────────────────────────────
-//
-// Self-contained HTML/JS shipped to the iframe consumer. Listens for
-// postMessage events shaped as `{ id, interface, method, params }`,
-// forwards to `/drivers/call`, and posts `{ id, result }` back to the
-// originating window.
-//
-// Wire-shape note: the postMessage uses `params` (puter-js's historical
-// name) but `/drivers/call` expects `args`; this bridge translates.
+const extractUpstreamStatus = (e: {
+    status?: number;
+    statusCode?: number;
+    response?: { status?: number };
+    $metadata?: { httpStatusCode?: number };
+    message?: string;
+}): number | undefined => {
+    const direct = e.status ?? e.statusCode;
+    if (typeof direct === 'number') return direct;
+    const fromResponse = e.response?.status;
+    if (typeof fromResponse === 'number') return fromResponse;
+    const fromAws = e.$metadata?.httpStatusCode;
+    if (typeof fromAws === 'number') return fromAws;
+    // Message sniff (e.g. "... failed with status 422 ...").
+    // Only trust if it's adjacent to a status-indicating word to
+    // avoid matching random 4xx/5xx-looking numbers in payloads.
+    const msg = e.message;
+    if (typeof msg === 'string') {
+        const m = msg.match(/\bstatus(?:\s+code)?\s*[:=]?\s*(4\d\d|5\d\d)\b/i);
+        if (m) return Number(m[1]);
+    }
+    return undefined;
+};
 
-const XD_SCRIPT = /* js */ `
-(function () {
-    const call = async ({ interface_name, method_name, params }) => {
-        const response = await fetch('/drivers/call', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                interface: interface_name,
-                method: method_name,
-                args: params,
-            }),
-        });
-        return await response.json();
-    };
-
-    const fcall = async ({ interface_name, method_name, params }) => {
-        const form = new FormData();
-        form.append('interface', interface_name);
-        form.append('method', method_name);
-        for (const k in params) {
-            form.append(k, params[k]);
-        }
-        const response = await fetch('/drivers/call', {
-            method: 'POST',
-            body: form,
-        });
-        return await response.json();
-    };
-
-    window.addEventListener('message', async (event) => {
-        const { id, interface: iface, method, params } = event.data || {};
-        let has_file = false;
-        for (const k in params) {
-            if (params[k] instanceof File) {
-                has_file = true;
-                break;
-            }
-        }
-        const result = has_file
-            ? await fcall({ interface_name: iface, method_name: method, params })
-            : await call({ interface_name: iface, method_name: method, params });
-        if (event.source) {
-            event.source.postMessage({ id, result }, event.origin);
-        }
-    });
-})();
-`;
-
-const XD_HTML = `<!DOCTYPE html>
-<html>
-    <head>
-        <title>Puter Driver API</title>
-        <script>
-            document.addEventListener('DOMContentLoaded', function () {
-                ${XD_SCRIPT}
-            });
-        </script>
-    </head>
-    <body></body>
-</html>`;
-
-// ── Controller ──────────────────────────────────────────────────────
-
-/**
- * Routes driver RPC calls through a unified HTTP surface.
- *
- * - `POST /drivers/call` — invoke `<iface>.<method>(args)` on the
- *   registered driver after a per-actor permission + rate-limit check.
- *   Stream-shaped results are piped directly; everything else is
- *   returned as JSON.
- * - `GET /drivers/list-interfaces` — enumerate registered driver
- *   interfaces with their default + alternate implementations.
- * - `GET /drivers/xd` — legacy iframe bridge; serves an HTML page that
- *   proxies `postMessage` RPCs to `/drivers/call` on the same origin.
- *
- * Holds an internal iface → driverName → instance map built at
- * construction time from `this.drivers`. Extensions that register
- * additional drivers end up in that bag before this controller is
- * instantiated, so they show up here automatically.
- */
-/**
- * Catch-all upstream-error translator for the driver boundary.
- *
- * Drivers that wrap a third-party SDK (OpenAI, Anthropic, etc.) often
- * let the SDK's own error class bubble — those carry an HTTP `.status`
- * but are plain `Error` subclasses, not `HttpError`s, so they would
- * otherwise hit the global error handler as unexpected 500s and page
- * PagerDuty. Repackage them with `upstream_*` legacy codes so the
- * alarm gate (server.ts) treats them as upstream failures and only
- * pages on the two we actually care about (rate-limit / auth).
- *
- * `HttpError`s thrown by drivers pass through untouched.
- */
 const translateProviderError = (err: unknown): unknown => {
     if (isHttpError(err)) return err;
     if (!err || typeof err !== 'object') return err;
     const e = err as {
         status?: number;
         statusCode?: number;
+        response?: { status?: number };
+        $metadata?: { httpStatusCode?: number };
         message?: string;
         error?: { code?: string; type?: string; message?: string };
         code?: string;
     };
-    const status = e.status ?? e.statusCode;
+    const status = extractUpstreamStatus(e);
     if (typeof status !== 'number') return err;
 
     const msg = e.error?.message ?? e.message ?? 'Upstream provider error';
@@ -203,7 +126,7 @@ export class DriverController extends PuterController {
         this.#buildIfaceMap();
     }
 
-    // ── Lookup API (used by tests / internals) ──────────────────────
+    // -- Lookup API (used by tests / internals) ----------------------
 
     /** Resolve a driver by interface + optional name (default when omitted). */
     resolve(interfaceName: string, driverName?: string): DriverInstance | null {
@@ -227,7 +150,7 @@ export class DriverController extends PuterController {
         return this.#defaults.get(interfaceName);
     }
 
-    // ── Route registration ──────────────────────────────────────────
+    // -- Route registration ------------------------------------------
 
     registerRoutes(router: PuterRouter): void {
         router.post(
@@ -240,14 +163,9 @@ export class DriverController extends PuterController {
             { subdomain: 'api', requireAuth: true },
             this.#handleListInterfaces,
         );
-        router.get(
-            '/xd',
-            { subdomain: 'api', requireAuth: true },
-            this.#handleXd,
-        );
     }
 
-    // ── Handlers ────────────────────────────────────────────────────
+    // -- Handlers ----------------------------------------------------
 
     #handleCall = async (req: Request, res: Response): Promise<void> => {
         const {
@@ -335,6 +253,19 @@ export class DriverController extends PuterController {
         if (
             !(await checkDriverRateLimit(req, ifaceName, method, rateLimitSpec))
         ) {
+            // De-dupe on (iface, method) so a hot loop across many users
+            // aggregates as occurrences on a single low-severity alarm
+            // instead of fanning out one per user.
+            this.clients.alarm.create(
+                `driver_rate_limit_hit:${ifaceName}:${method}`,
+                `Driver rate limit hit on ${ifaceName}:${method}`,
+                {
+                    iface: ifaceName,
+                    method,
+                    userUuid: req.actor?.user?.uuid,
+                },
+                'info',
+            );
             throw new HttpError(429, 'Too many requests.', {
                 legacyCode: 'too_many_requests',
             });
@@ -357,6 +288,16 @@ export class DriverController extends PuterController {
                 concurrentSpec,
             );
             if (!handle.ok) {
+                this.clients.alarm.create(
+                    `driver_concurrent_limit_hit:${ifaceName}:${method}`,
+                    `Driver concurrency limit hit on ${ifaceName}:${method}`,
+                    {
+                        iface: ifaceName,
+                        method,
+                        userUuid: req.actor?.user?.uuid,
+                    },
+                    'info',
+                );
                 throw new HttpError(429, 'Too many concurrent requests.', {
                     legacyCode: 'too_many_requests',
                 });
@@ -433,12 +374,7 @@ export class DriverController extends PuterController {
         res.json(out);
     };
 
-    #handleXd = (_req: Request, res: Response): void => {
-        res.type('text/html');
-        res.send(XD_HTML);
-    };
-
-    // ── Internals ───────────────────────────────────────────────────
+    // -- Internals ---------------------------------------------------
 
     #buildIfaceMap(): void {
         const bag = this.drivers as unknown as Record<string, DriverInstance>;
