@@ -3,20 +3,20 @@
     "env": "dev",
     "port": 4100,
     "protocol": "http",
-    "domain": "puter.localhost",
+    "domain": "puter.srv.cn",
     "cookie_name": "puter_auth_token",
-    "jwt_secret": "dev-jwt-secret-change-me",
-    "url_signature_secret": "dev-url-signature-secret-change-me",
+    "jwt_secret": "qazxsw",
+    "url_signature_secret": "qazxsw",
     "allow_all_host_values": true,
     "allow_no_host_header": true,
     "no_devwatch": false,
     "enable_public_folders": true,
     "is_storage_limited": false,
-    "min_pass_length": 6,
-    "static_hosting_domain": "site.puter.localhost",
-    "static_hosting_domain_alt": "host.puter.localhost",
-    "private_app_hosting_domain": "app.puter.localhost",
-    "private_app_hosting_domain_alt": "dev.puter.localhost",
+    "min_pass_length": 5,
+    "static_hosting_domain": "site.puter.srv.cn",
+    "static_hosting_domain_alt": "host.puter.srv.cn",
+    "private_app_hosting_domain": "app.puter.srv.cn",
+    "private_app_hosting_domain_alt": "dev.puter.srv.cn",
     "captcha": { "enabled": false },
     "default_user_group": "78b1b1dd-c959-44d2-b02c-8735671f9997",
     "default_temp_group": "b7220104-7905-4985-b996-649fdcdb3c8f",
@@ -25,19 +25,171 @@
     "gui_assets_root": "./src/gui",
     "puterjs_root": "./src/puter-js/dist",
     "builtin_apps": {
-        "dev-center": "./src/dev-center"
+        "dev-center": "./src/dev-center",
+        "notepad": "./apps/notepad"
     },
     "extensions": [
-        "./extensions"
+        "extensions"
     ],
     "database": {
-        "engine": "sqlite",
-        "path": "volatile/runtime/puter-database.sqlite"
+        "engine": "mysql",        
+        "targetVersion": 0,
+        "host": "127.0.0.1",
+        "port": 3306,
+        "user": "root",
+        "password": "123456",
+        "database": "puter",
+        "migrationPaths": ["./src/backend/clients/database/migrations/mysql"]
     },
+    "dynamo": {
+        "endpoint": "http://localhost:7890",
+        "bootstrapTables": true,
+        "aws": {
+            "access_key": "empty",
+            "secret_key": "empty",
+            "region": "local"
+        }
+     },
     "s3": {
+        "s3Config": {
+            "useCredentialChain": false,
+            "endpoint": "http://127.0.0.1:8787/s3",
+            "publicEndpoint": "http://127.0.0.1:8787/s3",
+            "accessKeyId": "rustfsadmin",
+            "secretAccessKey": "rustfsadmin",
+            "region": "us-west-2",
+            "forcePathStyle": true
+        },
         "localConfig": {
             "dataDir": "volatile/runtime/fauxqs-data",
             "s3StorageDir": "volatile/runtime/fauxqs-s3-data"
         }
+    },   
+    "s3_bucket": "puter-local",
+    "s3_region": "us-west-2",
+
+    "thumbnailStore": {
+        "name": "puter-thumb",
+        "endpoint": "http://127.0.0.1:8787/s3",
+        "region": "auto",
+        "credentials": {
+            "accessKeyId": "rustfsadmin",
+            "secretAccessKey": "rustfsadmin"
+        },
+        "forcePathStyle": true
+    },
+    "redis": {        
+        "useMock": false,
+        "tls": false,
+        "startupNodes": [
+            {
+                "host": "127.0.0.1",
+                "port": 11212
+            }
+        ]     
+    },
+    "email": {
+        "from": "\"Puter\" <junphine@126.com>",
+        "host": "smtp.126.com",
+        "port": 25,
+        "secure": false,
+        "service": "",
+        "auth": {
+            "user": "junphine@126.com",
+            "pass": "XLNGh3BrmG2ja3me"
+        }
+    },
+    "providers": {
+        "_": "All AI / integration drivers read from here. Provider id = driver-side identifier.",
+        "claude": {
+            "apiKey": ""
+        },
+        "alibaba": {
+            "apiKey": "sk-c255b2d0e7954c479f78d7c146248305"
+        },
+        "openai-completion": {
+            "apiKey": ""
+        },
+        "gemini": {
+            "apiKey": ""
+        },
+        "groq": {
+            "apiKey": ""
+        },
+        "deepseek": {
+            "apiKey": "sk-558a1f1b9957484eb52de0ddc2f9524a"
+        },
+        "mistral": {
+            "apiKey": ""
+        },
+        "xai": {
+            "apiKey": ""
+        },
+        "openrouter": {
+            "apiKey": "",
+            "apiBaseUrl": "https://openrouter.ai/api/v1"
+        },
+        "together-ai": {
+            "apiKey": ""
+        },
+        "ollama": {
+            "enabled": false,
+            "apiBaseUrl": "http://localhost:11434"
+        },
+        "openai-image-generation": {
+            "apiKey": ""
+        },
+        "gemini-image-generation": {
+            "apiKey": ""
+        },
+        "together-image-generation": {
+            "apiKey": ""
+        },
+        "cloudflare-image-generation": {
+            "apiToken": "",
+            "accountId": "",
+            "apiBaseUrl": "https://api.cloudflare.com/client/v4"
+        },
+        "xai-image-generation": {
+            "apiKey": ""
+        },
+        "openai-video-generation": {
+            "apiKey": ""
+        },
+        "together-video-generation": {
+            "apiKey": ""
+        },
+        "gemini-video-generation": {
+            "apiKey": ""
+        },
+        "openai": {
+            "apiKey": ""
+        },
+        "elevenlabs": {
+            "apiKey": "",
+            "apiBaseUrl": "https://api.elevenlabs.io",
+            "defaultVoiceId": "",
+            "speechToSpeechModelId": ""
+        },
+        "aws-polly": {
+            "access_key": "",
+            "secret_key": "",
+            "region": "us-west-2"
+        },
+        "aws-textract": {
+            "access_key": "",
+            "secret_key": "",
+            "region": "us-west-2"
+        },
+        "mistral-ocr": {
+            "apiKey": ""
+        }
+    },
+    "~workers": {
+        "XAUTHKEY": "cfk_ymkRsir14Uv9ynSY2Hg1R9wWavePniHtXPbuJdnLa150bc28",
+        "ACCOUNTID": "5a23a5635b28de86f83dafd8f4e05e23",
+        "namespace": "",
+        "internetExposedUrl": "https://api.puter.com",
+        "loggingUrl": ""
     }
 }

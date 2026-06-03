@@ -356,6 +356,8 @@ export class SubdomainStore extends PuterStore {
         } catch {
             return;
         }
+        // add@byron
+        if(!cacheKeys) return;
         const keysToInvalidate = [...cacheKeys, trackerKey];
         if (keysToInvalidate.length === 0) return;
         await this.publishCacheKeys({

@@ -34,7 +34,7 @@ const formatRedisError = (error: unknown): string => {
     return String(error);
 };
 
-const attachClusterEventHandlers = (clusterClient: Cluster): void => {
+const attachClusterEventHandlers = (clusterClient: Cluster|Redis): void => {
     clusterClient.once('connect', () => {
         console.log('[redis] cluster transport connected');
     });
@@ -66,7 +66,7 @@ const attachClusterEventHandlers = (clusterClient: Cluster): void => {
     });
 };
 
-const buildCluster = (config: IConfig): Cluster => {
+const buildCluster = (config: IConfig): Cluster|Redis => {
     const redisConfig = config.redis ?? {};
     const startupNodes = redisConfig.startupNodes ?? [];
     const useMock = redisConfig.useMock ?? startupNodes.length === 0;
@@ -83,6 +83,14 @@ const buildCluster = (config: IConfig): Cluster => {
     // `redis.tls: false` to opt out.
     const tlsEnabled = redisConfig.tls !== false;
 
+    if(startupNodes.length==1){
+        const redis = new Redis(startupNodes[0]);
+
+        attachClusterEventHandlers(redis);
+        console.log('connecting to redis from config');
+        return redis;      
+    }    
+   
     const cluster = new Redis.Cluster(
         startupNodes as ConstructorParameters<typeof Redis.Cluster>[0],
         {
@@ -116,7 +124,7 @@ const buildCluster = (config: IConfig): Cluster => {
  * facing value below is a constructor that returns that shape. Mirrors
  * the `DatabaseClientFactory` pattern.
  */
-export type RedisClient = Cluster & WithLifecycle;
+export type RedisClient = Cluster & WithLifecycle | Redis;
 
 export const RedisClient = class RedisClient {
     constructor(config: IConfig) {
@@ -124,7 +132,8 @@ export const RedisClient = class RedisClient {
 
         const onServerShutdown = async (): Promise<void> => {
             try {
-                await cluster.quit();
+                await cluster.quit && cluster.quit();
+                cluster.disconnect();
             } catch (error) {
                 console.warn(
                     '[redis] failed to quit redis client cleanly',
