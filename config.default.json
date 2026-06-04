@@ -59,7 +59,7 @@
             "publicEndpoint": "http://127.0.0.1:8787/s3",
             "accessKeyId": "rustfsadmin",
             "secretAccessKey": "rustfsadmin",
-            "region": "us-west-2",
+            "region": "igfs",
             "forcePathStyle": true
         },
         "localConfig": {
@@ -68,7 +68,7 @@
         }
     },   
     "s3_bucket": "puter-local",
-    "s3_region": "us-west-2",
+    "s3_region": "igfs",
 
     "thumbnailStore": {
         "name": "puter-thumb",
@@ -81,7 +81,7 @@
         "forcePathStyle": true
     },
     "redis": {        
-        "useMock": false,
+        "useMock": true,
         "tls": false,
         "startupNodes": [
             {
@@ -101,8 +101,7 @@
             "pass": "XLNGh3BrmG2ja3me"
         }
     },
-    "providers": {
-        "_": "All AI / integration drivers read from here. Provider id = driver-side identifier.",
+    "providers": {        
         "claude": {
             "apiKey": ""
         },
