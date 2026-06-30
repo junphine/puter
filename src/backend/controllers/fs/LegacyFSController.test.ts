@@ -206,6 +206,78 @@ describe('LegacyFSController.mkdir', () => {
         expect(fetched?.isDir).toBe(true);
     });
 
+    it('dedupes an existing directory when dedupe_name is true', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const parent = `/${username}/Documents`;
+
+        await withActor(actor, () =>
+            controller.mkdir(
+                makeReq({
+                    body: { parent, path: 'hello' },
+                    actor,
+                }),
+                makeRes().res,
+            ),
+        );
+
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.mkdir(
+                makeReq({
+                    body: { parent, path: 'hello', dedupe_name: true },
+                    actor,
+                }),
+                res,
+            ),
+        );
+
+        const body = captured.body as Record<string, unknown>;
+        expect(body).toMatchObject({
+            path: `${parent}/hello (1)`,
+            name: 'hello (1)',
+            is_dir: true,
+        });
+        expect(
+            await server.stores.fsEntry.getEntryByPath(`${parent}/hello (1)`),
+        ).toMatchObject({ isDir: true });
+    });
+
+    it('requires parent write when deduping an existing directory', async () => {
+        const { actor: userActor } = await makeUser();
+        const username = userActor.user!.username!;
+        const appUid = `app-legacy-mkdir-${uuidv4()}`;
+        const appActor: Actor = { ...userActor, app: { uid: appUid } };
+        const parent = `/${username}/AppData`;
+
+        await withActor(userActor, () =>
+            controller.mkdir(
+                makeReq({
+                    body: { parent, path: appUid },
+                    actor: userActor,
+                }),
+                makeRes().res,
+            ),
+        );
+
+        await expect(
+            withActor(appActor, () =>
+                controller.mkdir(
+                    makeReq({
+                        body: { parent, path: appUid, dedupe_name: true },
+                        actor: appActor,
+                    }),
+                    makeRes().res,
+                ),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+        expect(
+            await server.stores.fsEntry.getEntryByPath(
+                `${parent}/${appUid} (1)`,
+            ),
+        ).toBeNull();
+    });
+
     it("rejects writing into another user's home with a 4xx", async () => {
         const a = await makeUser();
         const b = await makeUser();
@@ -693,6 +765,121 @@ describe('LegacyFSController.copy', () => {
             `/${username}/Pictures/renamed-copy`,
         );
     });
+
+    it('copies an empty file (no backing S3 object) without erroring', async () => {
+        // Empty files created via /touch have size 0 and no S3 object —
+        // bucket is null. Copy must clone them as empty-file entries rather
+        // than issuing a CopyObject, which would throw S3 NoSuchKey.
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const src = `/${username}/Documents/empty.txt`;
+        await withActor(actor, () =>
+            controller.touch(
+                makeReq({ body: { path: src }, actor }),
+                makeRes().res,
+            ),
+        );
+
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.copy(
+                makeReq({
+                    body: { source: src, destination: `/${username}/Pictures` },
+                    actor,
+                }),
+                res,
+            ),
+        );
+
+        const body = captured.body as Array<{ copied: { path: string } }>;
+        expect(body[0].copied.path).toBe(`/${username}/Pictures/empty.txt`);
+        const copied = await server.stores.fsEntry.getEntryByPath(
+            `/${username}/Pictures/empty.txt`,
+        );
+        expect(copied).not.toBeNull();
+        expect(copied!.size).toBe(0);
+        // Original is untouched.
+        expect(await server.stores.fsEntry.getEntryByPath(src)).not.toBeNull();
+    });
+
+    it('copying a ghost file (S3 object missing) 404s and cleans up the orphan', async () => {
+        // A real file whose backing S3 object has vanished keeps a non-null
+        // bucket, so it isn't an empty file. CopyObject would throw S3
+        // NoSuchKey; copy must surface a clean 404 and remove the orphan row
+        // rather than bubbling a 500. Mirrors readContent's ghost handling.
+        const { actor, userId } = await makeUser();
+        const username = actor.user!.username!;
+        const src = `/${username}/Documents/ghost.txt`;
+        const content = Buffer.from('i will be deleted from s3');
+        await server.services.fs.write(userId, {
+            fileMetadata: {
+                path: src,
+                size: content.byteLength,
+                contentType: 'text/plain',
+            },
+            fileContent: content,
+        });
+
+        // Delete the backing S3 object directly, leaving the DB row behind.
+        const entry = (await server.stores.fsEntry.getEntryByPath(src))!;
+        await server.stores.s3Object.deleteObject(
+            server.stores.s3Object.resolveBucket(entry.bucket),
+            entry.uuid,
+            server.stores.s3Object.resolveRegion(entry.bucketRegion),
+        );
+
+        const { res } = makeRes();
+        await expect(
+            withActor(actor, () =>
+                controller.copy(
+                    makeReq({
+                        body: {
+                            source: src,
+                            destination: `/${username}/Pictures`,
+                        },
+                        actor,
+                    }),
+                    res,
+                ),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+
+        // The ghost handler removed the orphaned source row.
+        expect(await server.stores.fsEntry.getEntryByPath(src)).toBeNull();
+        // No partial copy was left behind.
+        expect(
+            await server.stores.fsEntry.getEntryByPath(
+                `/${username}/Pictures/ghost.txt`,
+            ),
+        ).toBeNull();
+    });
+
+    it('reads an empty file as empty content without deleting it', async () => {
+        // Reading an empty file (no S3 object) must not throw NoSuchKey nor
+        // trip the ghost-file cleanup, which would delete the entry.
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const src = `/${username}/Documents/readme-empty.txt`;
+        await withActor(actor, () =>
+            controller.touch(
+                makeReq({ body: { path: src }, actor }),
+                makeRes().res,
+            ),
+        );
+        const entry = (await server.stores.fsEntry.getEntryByPath(src))!;
+
+        const download = await server.services.fs.readContent(entry);
+        const chunks: Buffer[] = [];
+        for await (const chunk of download.body) {
+            chunks.push(Buffer.from(chunk as Uint8Array));
+        }
+        expect(Buffer.concat(chunks).byteLength).toBe(0);
+        expect(download.contentLength).toBe(0);
+        // The entry must still exist — the ghost handler must NOT have run.
+        expect(
+            await server.stores.fsEntry.getEntryByPath(src),
+        ).not.toBeNull();
+    });
 });
 
 // ── move ────────────────────────────────────────────────────────────
@@ -1009,6 +1196,76 @@ describe('LegacyFSController.sign', () => {
                 ),
             ),
         ).rejects.toMatchObject({ statusCode: 404 });
+    });
+
+    it('refuses an app actor signing for a different app (403)', async () => {
+        // An app-under-user actor may only mint a token for its own app;
+        // requesting a different app's UID is rejected.
+        const { actor: userActor } = await makeUser();
+        const targetApp = await (
+            server.stores.app.create as unknown as (
+                fields: Record<string, unknown>,
+                opts: { ownerUserId: number },
+            ) => Promise<{ uid: string; id: number }>
+        )(
+            {
+                name: `victim-${uuidv4()}`,
+                title: 'Victim app',
+                index_url: 'https://example.test/victim.html',
+            },
+            { ownerUserId: userActor.user!.id! },
+        );
+        const attackerActor: Actor = {
+            ...userActor,
+            app: { uid: `attacker-${uuidv4()}` },
+        };
+
+        const { res } = makeRes();
+        await expect(
+            withActor(attackerActor, () =>
+                controller.sign(
+                    makeReq({
+                        body: {
+                            items: [{}],
+                            app_uid: targetApp.uid,
+                        },
+                        actor: attackerActor,
+                    }),
+                    res,
+                ),
+            ),
+        ).rejects.toMatchObject({ statusCode: 403, legacyCode: 'forbidden' });
+    });
+
+    it('lets an app actor sign for its own app', async () => {
+        const { actor: userActor } = await makeUser();
+        const ownApp = await (
+            server.stores.app.create as unknown as (
+                fields: Record<string, unknown>,
+                opts: { ownerUserId: number },
+            ) => Promise<{ uid: string; id: number }>
+        )(
+            {
+                name: `self-${uuidv4()}`,
+                title: 'Self app',
+                index_url: 'https://example.test/self.html',
+            },
+            { ownerUserId: userActor.user!.id! },
+        );
+        const appActor: Actor = { ...userActor, app: { uid: ownApp.uid } };
+
+        const { res, captured } = makeRes();
+        await withActor(appActor, () =>
+            controller.sign(
+                makeReq({
+                    body: { items: [{}], app_uid: ownApp.uid },
+                    actor: appActor,
+                }),
+                res,
+            ),
+        );
+        const body = captured.body as { token?: string };
+        expect(typeof body.token).toBe('string');
     });
 });
 

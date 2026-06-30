@@ -37,12 +37,22 @@ export interface UserRow {
     email?: string | null;
     /** True when an admin has suspended the account. */
     suspended?: boolean;
+    /** When the account was suspended, as unix seconds; null while not suspended. */
+    suspended_at?: number | null;
     /** True when the user has confirmed the email currently on file. */
     email_confirmed?: boolean;
     /** True for accounts that must confirm email before taking most actions. */
     requires_email_confirmation?: boolean;
     /** Metadata JSON blob; decoded on read when the DB returns it as a string. */
     metadata?: Record<string, unknown>;
+    /** Abuse v2 reputation score recorded at signup (DB default 100). */
+    reputation?: number;
+    /** E.164 phone number collected during SMS verification. */
+    phone?: string | null;
+    /** True while the account must complete SMS phone verification before use. */
+    requires_phone_verification?: boolean;
+    /** True while the account must complete credit-card verification before use. */
+    requires_card_verification?: boolean;
     password?: string;
     [k: string]: unknown;
 }
@@ -84,10 +94,13 @@ const LATIN1_USER_COLUMNS: ReadonlySet<string> = new Set([
     'email',
     'username',
     'clean_email',
+    'phone',
 ]);
 const USER_BOOLEAN_COLUMNS: ReadonlySet<string> = new Set([
     'requires_email_confirmation',
     'email_confirmed',
+    'requires_phone_verification',
+    'requires_card_verification',
     'dev_approved_for_incentive_program',
     'dev_joined_incentive_program',
     'suspended',
@@ -324,6 +337,10 @@ export class UserStore extends PuterStore {
         signup_server?: string | null;
         referrer?: string | null;
         last_activity_ts?: string | null;
+        reputation?: number | null;
+        phone?: string | null;
+        requires_phone_verification?: boolean;
+        requires_card_verification?: boolean;
     }): Promise<UserRow> {
         assertLatin1Writable(fields as Record<string, unknown>);
         const result = await this.clients.db.write(
@@ -344,8 +361,12 @@ export class UserStore extends PuterStore {
              signup_origin,
              signup_server,
              referrer,
-             last_activity_ts)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)${this.clients.db.returningIdClause()}`,
+             last_activity_ts,
+             reputation,
+             phone,
+             requires_phone_verification,
+             requires_card_verification)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)${this.clients.db.returningIdClause()}`,
             [
                 fields.username,
                 fields.email,
@@ -368,6 +389,15 @@ export class UserStore extends PuterStore {
                 fields.signup_server ?? null,
                 fields.referrer ?? null,
                 fields.last_activity_ts ?? null,
+                // Default matches the DB column default + v2's STARTING_REPUTATION.
+                fields.reputation ?? 100,
+                fields.phone ?? null,
+                this.clients.db.booleanValue(
+                    Boolean(fields.requires_phone_verification),
+                ),
+                this.clients.db.booleanValue(
+                    Boolean(fields.requires_card_verification),
+                ),
             ],
         );
 
@@ -577,6 +607,13 @@ export class UserStore extends PuterStore {
             requires_email_confirmation: asBool(
                 rest.requires_email_confirmation,
             ),
+            requires_phone_verification: asBool(
+                rest.requires_phone_verification,
+            ),
+            requires_card_verification: asBool(rest.requires_card_verification),
+            phone: rest.phone == null ? null : String(rest.phone),
+            reputation:
+                rest.reputation == null ? undefined : Number(rest.reputation),
             metadata,
         };
     }

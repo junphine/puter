@@ -26,6 +26,8 @@ import UIWindowAuthMe from './UI/UIWindowAuthMe.js';
 import UIWindowChangeUsername from './UI/UIWindowChangeUsername.js';
 import UIWindowCopyToken from './UI/UIWindowCopyToken.js';
 import UIWindowEmailConfirmationRequired from './UI/UIWindowEmailConfirmationRequired.js';
+import UIWindowPhoneVerificationRequired from './UI/UIWindowPhoneVerificationRequired.js';
+import UIWindowCardVerificationRequired from './UI/UIWindowCardVerificationRequired.js';
 import UIWindowLogin from './UI/UIWindowLogin.js';
 import UIWindowLoginInProgress from './UI/UIWindowLoginInProgress.js';
 import UIWindowNewPassword from './UI/UIWindowNewPassword.js';
@@ -35,6 +37,8 @@ import UIWindowSessionList from './UI/UIWindowSessionList.js';
 import UIWindowSignup from './UI/UIWindowSignup.js';
 import UIWindowRecoverPassword from './UI/UIWindowRecoverPassword.js';
 import { PROCESS_RUNNING } from './definitions.js';
+import create_access_token from './helpers/create_access_token.js';
+import init_device_signals from './helpers/device_signals.js';
 import item_icon from './helpers/item_icon.js';
 import update_last_touch_coordinates from './helpers/update_last_touch_coordinates.js';
 import update_mouse_position from './helpers/update_mouse_position.js';
@@ -304,6 +308,11 @@ window.initgui = async function (options) {
     window.url = url;
     const url_paths = window.location.pathname.split('/').filter(element => element);
     window.url_paths = url_paths;
+
+    // Install device signal helpers; collection is lazy. The fingerprint is
+    // on by default (gui_params.thumbmarkEnabled = false kills it); the Prelude
+    // dispatch id needs gui_params.preludeSdkKey.
+    init_device_signals();
 
     let picked_a_user_for_sdk_login = false;
 
@@ -662,10 +671,41 @@ window.initgui = async function (options) {
         }
 
         if ( whoami ) {
+            // is phone verification required? (hard gate for low-rep signups)
+            if ( whoami.requires_phone_verification ) {
+                let is_verified;
+                do {
+                    is_verified = await UIWindowPhoneVerificationRequired({
+                        show_close_button: false,
+                        stay_on_top: true,
+                        has_head: false,
+                        window_options: {
+                            is_draggable: false,
+                        },
+                    });
+                }
+                while ( !is_verified );
+            }
             if ( whoami.requires_email_confirmation ) {
                 let is_verified;
                 do {
                     is_verified = await UIWindowEmailConfirmationRequired({
+                        show_close_button: false,
+                        stay_on_top: true,
+                        has_head: false,
+                        window_options: {
+                            is_draggable: false,
+                        },
+                    });
+                }
+                while ( !is_verified );
+            }
+            // Card verification is the last gate: only show it once the email and
+            // phone (SMS) gates are cleared, since those show up first.
+            if ( whoami.requires_card_verification ) {
+                let is_verified;
+                do {
+                    is_verified = await UIWindowCardVerificationRequired({
                         show_close_button: false,
                         stay_on_top: true,
                         has_head: false,
@@ -830,11 +870,46 @@ window.initgui = async function (options) {
         }
         // update local user data
         if ( whoami ) {
+            // is phone verification required? (hard gate for low-rep signups)
+            if ( whoami.requires_phone_verification ) {
+                let is_verified;
+                do {
+                    is_verified = await UIWindowPhoneVerificationRequired({
+                        show_close_button: false,
+                        stay_on_top: true,
+                        has_head: false,
+                        logout_in_footer: true,
+                        window_options: {
+                            is_draggable: false,
+                            cover_page: window.is_embedded,
+                        },
+                    });
+                }
+                while ( !is_verified );
+            }
             // is email confirmation required?
             if ( whoami.requires_email_confirmation ) {
                 let is_verified;
                 do {
                     is_verified = await UIWindowEmailConfirmationRequired({
+                        show_close_button: false,
+                        stay_on_top: true,
+                        has_head: false,
+                        logout_in_footer: true,
+                        window_options: {
+                            is_draggable: false,
+                            cover_page: window.is_embedded,
+                        },
+                    });
+                }
+                while ( !is_verified );
+            }
+            // Card verification is the last gate: only show it once the email and
+            // phone (SMS) gates are cleared, since those show up first.
+            if ( whoami.requires_card_verification ) {
+                let is_verified;
+                do {
+                    is_verified = await UIWindowCardVerificationRequired({
                         show_close_button: false,
                         stay_on_top: true,
                         has_head: false,
@@ -859,8 +934,24 @@ window.initgui = async function (options) {
                         redirect_url: redirectURL,
                     });
                     if ( approved ) {
+                        // Hand the app a named, revocable full-API-access
+                        // token instead of the raw GUI/session token: it can
+                        // use the whole API but can't manage the account.
+                        let host = '';
+                        try { host = new URL(redirectURL).host; } catch ( e ) { /* ignore */ }
+                        let token;
+                        try {
+                            token = await create_access_token({
+                                label: host
+                                    ? `${i18n('token_label_external_app')} (${host})`
+                                    : i18n('token_label_external_app'),
+                            });
+                        } catch ( e ) {
+                            await UIAlert({ message: e?.message ?? String(e) });
+                            return;
+                        }
                         const url = new URL(redirectURL);
-                        url.searchParams.set('token', window.auth_token);
+                        url.searchParams.set('token', token);
                         window.location.href = url.href;
                         return;
                     }
@@ -1225,7 +1316,7 @@ window.initgui = async function (options) {
         }
 
         // Function to create temp user after captcha completion
-        const createTempUser = (turnstileToken) => {
+        const createTempUser = async (turnstileToken) => {
             // if this is a popup, show a spinner
             let spinner_init_ts = Date.now();
             const requestData = {
@@ -1236,6 +1327,16 @@ window.initgui = async function (options) {
             // Add Turnstile token if available
             if ( turnstileToken ) {
                 requestData['cf-turnstile-response'] = turnstileToken;
+            }
+
+            // Device signal for abuse prevention; omitted when unavailable
+            try {
+                const fingerprint = await window.getDeviceFingerprint?.();
+                if ( fingerprint ) {
+                    requestData.fingerprint = fingerprint;
+                }
+            } catch (e) {
+                // signup must never block or fail because of device signals
             }
 
             $.ajax({
@@ -1357,7 +1458,7 @@ window.initgui = async function (options) {
                             <div class="signup-blocked-content">
                                 <img src="${window.icons['logo.svg'] || window.icons['logo-white.svg'] || ''}" style="width:64px;margin-bottom:24px;" />
                                 <p>${html_encode(blockedMsg)}</p>
-                                <p>If you already have an account, try <a href="/action/login">logging in</a>. Otherwise, contact <a href="mailto:hi@puter.com">hi@puter.com</a> for assistance.</p>
+                                <p>If you already have an account, try <a href="/action/login">logging in</a>. Otherwise, contact <a href="mailto:support@puter.com">support@puter.com</a> for assistance.</p>
                             </div>
                         `;
                         document.body.appendChild(overlay);
@@ -1416,8 +1517,24 @@ window.initgui = async function (options) {
                     redirect_url: redirectURL,
                 });
                 if ( approved ) {
+                    // Hand the app a named, revocable full-API-access token
+                    // instead of the raw GUI/session token: it can use the
+                    // whole API but can't manage the account.
+                    let host = '';
+                    try { host = new URL(redirectURL).host; } catch ( e ) { /* ignore */ }
+                    let token;
+                    try {
+                        token = await create_access_token({
+                            label: host
+                                ? `${i18n('token_label_external_app')} (${host})`
+                                : i18n('token_label_external_app'),
+                        });
+                    } catch ( e ) {
+                        await UIAlert({ message: e?.message ?? String(e) });
+                        return;
+                    }
                     const url = new URL(redirectURL);
-                    url.searchParams.set('token', window.auth_token);
+                    url.searchParams.set('token', token);
                     window.location.href = url.href;
                     return;
                 }

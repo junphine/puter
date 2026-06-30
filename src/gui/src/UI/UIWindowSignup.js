@@ -20,6 +20,8 @@
 import check_password_strength from '../helpers/check_password_strength.js';
 import UIWindow from './UIWindow.js';
 import UIWindowEmailConfirmationRequired from './UIWindowEmailConfirmationRequired.js';
+import UIWindowPhoneVerificationRequired from './UIWindowPhoneVerificationRequired.js';
+import UIWindowCardVerificationRequired from './UIWindowCardVerificationRequired.js';
 import UIWindowLogin from './UIWindowLogin.js';
 
 function UIWindowSignup (options) {
@@ -138,7 +140,7 @@ function UIWindowSignup (options) {
             center: true,
             onAppend: function (el_window) {
                 if ( options.authError ) {
-                    $(el_window).find('.signup-error-msg').html(options.authError).fadeIn();
+                    $(el_window).find('.signup-error-msg').html(html_encode(options.authError)).fadeIn();
                 }
                 if ( ! window.disable_signup_autofocus )
                 {
@@ -269,7 +271,7 @@ function UIWindowSignup (options) {
             }
         });
 
-        $(el_window).find('.signup-btn').on('click', function (e) {
+        $(el_window).find('.signup-btn').on('click', async function (e) {
             // Clear previous error states
             $(el_window).find('.signup-error-msg').hide();
 
@@ -351,6 +353,14 @@ function UIWindowSignup (options) {
                 headers = window.custom_headers;
             }
 
+            // Device signal for abuse prevention; omitted when unavailable
+            let fingerprint = null;
+            try {
+                fingerprint = await window.getDeviceFingerprint?.();
+            } catch (_) {
+                // signup must never block or fail because of device signals
+            }
+
             // Include captcha in request only if required
             const requestData = {
                 username: username,
@@ -361,6 +371,9 @@ function UIWindowSignup (options) {
                 p102xyzname: p102xyzname,
                 'cf-turnstile-response': turnstileToken,
             };
+            if ( fingerprint ) {
+                requestData.fingerprint = fingerprint;
+            }
 
             $.ajax({
                 url: `${window.gui_origin }/signup`,
@@ -378,15 +391,46 @@ function UIWindowSignup (options) {
                         // either options.redirect_url or the current page
                         const redirectUrl = options.redirect_url || '/';
                         window.location.replace(redirectUrl);
-                    } else if ( options.send_confirmation_code || data.user?.requires_email_confirmation ) {
+                    } else if ( data.user?.requires_phone_verification || data.user?.requires_card_verification || options.send_confirmation_code || data.user?.requires_email_confirmation ) {
                         $(el_window).close();
-                        let is_verified = await UIWindowEmailConfirmationRequired({
-                            stay_on_top: true,
-                            has_head: true,
-                            reload_on_success: options.reload_on_success,
-                            window_options: options.window_options ?? {},
-                        });
-                        resolve(is_verified);
+                        // Low-reputation signups must clear every flagged gate.
+                        // Phone (SMS) and email come first; the card gate only
+                        // shows once those are cleared.
+                        if ( data.user?.requires_phone_verification ) {
+                            let phone_ok = false;
+                            do {
+                                phone_ok = await UIWindowPhoneVerificationRequired({
+                                    show_close_button: false,
+                                    stay_on_top: true,
+                                    has_head: true,
+                                    window_options: options.window_options ?? {},
+                                });
+                            }
+                            while ( !phone_ok );
+                        }
+                        let email_verified = true;
+                        if ( options.send_confirmation_code || data.user?.requires_email_confirmation ) {
+                            email_verified = await UIWindowEmailConfirmationRequired({
+                                stay_on_top: true,
+                                has_head: true,
+                                reload_on_success: options.reload_on_success,
+                                window_options: options.window_options ?? {},
+                            });
+                        }
+                        // Card verification is the last gate.
+                        if ( data.user?.requires_card_verification ) {
+                            let card_ok = false;
+                            do {
+                                card_ok = await UIWindowCardVerificationRequired({
+                                    show_close_button: false,
+                                    stay_on_top: true,
+                                    has_head: true,
+                                    window_options: options.window_options ?? {},
+                                });
+                            }
+                            while ( !card_ok );
+                        }
+                        resolve(email_verified);
                     } else {
                         resolve(true);
                     }
@@ -423,7 +467,7 @@ function UIWindowSignup (options) {
                                 <div class="signup-blocked-content">
                                     <img src="${window.icons['logo.svg'] || window.icons['logo-white.svg'] || ''}" style="width:64px;margin-bottom:24px;" />
                                     <p>${html_encode(blockedMsg)}</p>
-                                    <p>If you already have an account, try <a href="/action/login">logging in</a>. Otherwise, contact <a href="mailto:hi@puter.com">hi@puter.com</a> for assistance.</p>
+                                    <p>If you already have an account, try <a href="/action/login">logging in</a>. Otherwise, contact <a href="mailto:support@puter.com">support@puter.com</a> for assistance.</p>
                                 </div>
                             `;
                             document.body.appendChild(overlay);

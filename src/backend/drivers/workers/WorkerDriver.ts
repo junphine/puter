@@ -165,7 +165,8 @@ export class WorkerDriver extends PuterDriver {
                     { legacyCode: 'forbidden' },
                 );
             }
-            appOwnerId = actor.app?.id;
+            const ownerApp = await this.stores.app.getByUid(appId);
+            appOwnerId = ownerApp?.id ?? actor.app?.id;
             authorization = await this.services.auth.createWorkerAppToken(
                 actor,
                 appId,
@@ -245,6 +246,13 @@ export class WorkerDriver extends PuterDriver {
                 rootDirId: loaded.fsEntry?.sqlId,
                 appOwner: appOwnerId,
                 preambleVersion,
+            });
+        }
+
+        if (appId) {
+            await this.services.fs.mkdir(actor.user.id!, {
+                path: `/${actor.user.username}/AppData/${appId}`,
+                createMissingParents: true,
             });
         }
 

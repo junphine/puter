@@ -29,6 +29,21 @@ let sidebar = [
                 path: '/frameworks',
             },
             {
+                title: 'MCP Server',
+                source: '/mcp.md',
+                path: '/mcp',
+            },
+            {
+                title: 'CLI',
+                source: '/cli.md',
+                path: '/cli',
+            },
+            {
+                title: 'Deployments',
+                source: '/deployments.md',
+                path: '/deployments',
+            },
+            {
                 title: 'Examples',
                 source: '/examples.md',
                 path: '/examples',
@@ -1242,6 +1257,20 @@ let sidebar = [
                 icon: '/assets/img/object.svg',
                 source: '/Objects/subdomain.md',
                 path: '/Objects/subdomain',
+            },
+            {
+                title: '<code>TTSEngine</code>',
+                title_tag: 'TTSEngine',
+                icon: '/assets/img/object.svg',
+                source: '/Objects/ttsengine.md',
+                path: '/Objects/ttsengine',
+            },
+            {
+                title: '<code>TTSVoice</code>',
+                title_tag: 'TTSVoice',
+                icon: '/assets/img/object.svg',
+                source: '/Objects/ttsvoice.md',
+                path: '/Objects/ttsvoice',
             },
             {
                 title: '<code>ToolCall</code>',

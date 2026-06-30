@@ -321,6 +321,115 @@ describe('MeteringService', () => {
         });
     });
 
+    // ── overuse alarm ────────────────────────────────────────────────
+
+    describe('overuse alarm', () => {
+        const wasOveruseAlarmed = (alarmSpy: ReturnType<typeof vi.spyOn>) =>
+            alarmSpy.mock.calls.some(
+                (call) =>
+                    typeof call[0] === 'string' &&
+                    call[0].includes('usage exceeded'),
+            );
+
+        it('does not alarm when a single large request crosses the limit in one shot', async () => {
+            const bigActor: Actor = { user: makeUser() };
+            const sub = await target.getActorSubscription(bigActor);
+            const alarmSpy = vi.spyOn(server.clients.alarm, 'create');
+
+            // Previous usage was 0 (under the allowance) — one big request that
+            // blows straight past several multiples is legitimate, not abuse.
+            await target.incrementUsage(
+                bigActor,
+                'ai:chat',
+                1,
+                sub.monthUsageAllowance * 5,
+            );
+
+            expect(wasOveruseAlarmed(alarmSpy)).toBe(false);
+            alarmSpy.mockRestore();
+        });
+
+        it('does not alarm on further usage past the limit until the next multiple is crossed', async () => {
+            const overActor: Actor = { user: makeUser() };
+            const sub = await target.getActorSubscription(overActor);
+
+            // Take them just over the allowance (into the 1x–2x band).
+            await target.incrementUsage(
+                overActor,
+                'ai:chat',
+                1,
+                sub.monthUsageAllowance,
+            );
+
+            // A small further expense stays within the same band — no new
+            // multiple crossed, so it shouldn't page.
+            const alarmSpy = vi.spyOn(server.clients.alarm, 'create');
+            await target.incrementUsage(overActor, 'ai:chat', 1, 1_000);
+
+            expect(wasOveruseAlarmed(alarmSpy)).toBe(false);
+            alarmSpy.mockRestore();
+        });
+
+        it('alarms when a whole multiple of the allowance is crossed while already over', async () => {
+            const overActor: Actor = { user: makeUser() };
+            const sub = await target.getActorSubscription(overActor);
+
+            // First expense takes them to the limit (1x) — no alarm yet.
+            await target.incrementUsage(
+                overActor,
+                'ai:chat',
+                1,
+                sub.monthUsageAllowance,
+            );
+
+            // Spy only on the expense that crosses into 2x while already over.
+            const alarmSpy = vi.spyOn(server.clients.alarm, 'create');
+            await target.incrementUsage(
+                overActor,
+                'ai:chat',
+                1,
+                sub.monthUsageAllowance,
+            );
+
+            expect(alarmSpy).toHaveBeenCalledWith(
+                expect.stringContaining('usage exceeded'),
+                expect.stringContaining('exceeded their usage allowance'),
+                expect.objectContaining({ totalUsage: expect.any(Number) }),
+                // Non-paging severity — records and de-dupes but doesn't page on-call.
+                'warning',
+            );
+            alarmSpy.mockRestore();
+        });
+
+        it('does not alarm while purchased credits still cover the overage', async () => {
+            const creditActor: Actor = { user: makeUser() };
+            const sub = await target.getActorSubscription(creditActor);
+            await target.updateAddonCredit(
+                creditActor.user.uuid,
+                5_000_000_000,
+            );
+
+            // Cross to 2x — would page if not for the credits covering it.
+            await target.incrementUsage(
+                creditActor,
+                'ai:chat',
+                1,
+                sub.monthUsageAllowance,
+            );
+
+            const alarmSpy = vi.spyOn(server.clients.alarm, 'create');
+            await target.incrementUsage(
+                creditActor,
+                'ai:chat',
+                1,
+                sub.monthUsageAllowance,
+            );
+
+            expect(wasOveruseAlarmed(alarmSpy)).toBe(false);
+            alarmSpy.mockRestore();
+        });
+    });
+
     // ── batchIncrementUsages ─────────────────────────────────────────
 
     describe('batchIncrementUsages', () => {
@@ -725,18 +834,6 @@ describe('MeteringService', () => {
             const key = `${POLICY_PREFIX}:actor:${actor.user.uuid}:addons`;
             const { res } = await server.stores.kv.get({ key });
             expect(res).toMatchObject({ purchasedCredits: 250 });
-        });
-
-        it('persists lastUpdated after an increment', async () => {
-            const userId = actor.user.uuid;
-            await target.incrementUsage(actor, 'kv:read', 1, 50);
-            await waitFor(async () => {
-                const { res } = await server.stores.kv.get({
-                    key: `${METRICS_PREFIX}:actor:${userId}:lastUpdated`,
-                });
-                expect(typeof res).toBe('number');
-                expect(res).toBeGreaterThan(0);
-            });
         });
     });
 

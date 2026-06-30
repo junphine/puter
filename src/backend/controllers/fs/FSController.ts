@@ -37,6 +37,7 @@ import {
     runWithConcurrencyLimit,
     runWithConcurrencyLimitSettled,
 } from '../../util/concurrency.js';
+import { applyInlineContentSecurity } from '../../util/inlineContentSecurity.js';
 import { PuterController } from '../types.js';
 import { FS_COSTS } from './costs.js';
 import type {
@@ -118,6 +119,8 @@ export class FSController extends PuterController {
         requestBody.fileMetadata = await this.#resolveAssociatedAppMetadata(
             requestBody.fileMetadata,
             requestBody,
+            undefined,
+            userId,
         );
         await this.#assertWriteAccess(req, requestBody.fileMetadata, {
             pathAlreadyNormalized: true,
@@ -182,6 +185,7 @@ export class FSController extends PuterController {
                               normalizedRequestBody.fileMetadata,
                               normalizedRequestBody,
                               appUidLookupCache,
+                              userId,
                           );
                       return normalizedRequestBody;
                   }),
@@ -363,6 +367,8 @@ export class FSController extends PuterController {
         requestBody.fileMetadata = await this.#resolveAssociatedAppMetadata(
             requestBody.fileMetadata,
             requestBody,
+            undefined,
+            userId,
         );
         await this.#assertWriteAccess(req, requestBody.fileMetadata, {
             pathAlreadyNormalized: true,
@@ -496,6 +502,7 @@ export class FSController extends PuterController {
                                                 item.fileMetadata,
                                                 item,
                                                 appUidLookupCache,
+                                                userId,
                                             ),
                                     })),
                                 ),
@@ -717,6 +724,7 @@ export class FSController extends PuterController {
                               normalizedRequestBody.fileMetadata,
                               normalizedRequestBody,
                               appUidLookupCache,
+                              userId,
                           );
                       return normalizedRequestBody;
                   }),
@@ -964,8 +972,13 @@ export class FSController extends PuterController {
             range,
         });
 
-        if (download.contentType)
+        if (download.contentType) {
             res.setHeader('Content-Type', download.contentType);
+            // Stored type is uploader-controlled and served inline on the
+            // api origin — sandbox active-document types (HTML/SVG/XML) so
+            // embedded scripts can't run here. Inert types are untouched.
+            applyInlineContentSecurity(res, download.contentType);
+        }
         if (download.contentLength !== null)
             res.setHeader('Content-Length', String(download.contentLength));
         if (download.contentRange)
@@ -1039,13 +1052,15 @@ export class FSController extends PuterController {
                 legacyCode: 'bad_request',
             });
 
+        const dedupeName =
+            this.#toBoolean(body.dedupe_name ?? body.dedupeName) ?? false;
         await this.#assertCanCreate(actor, path);
+        if (dedupeName) await this.#assertCanDedupeCreate(actor, path);
 
         const entry = await this.services.fs.mkdir(userId, {
             path,
             overwrite: this.#toBoolean(body.overwrite) ?? false,
-            dedupeName:
-                this.#toBoolean(body.dedupe_name ?? body.dedupeName) ?? false,
+            dedupeName,
             createMissingParents:
                 this.#toBoolean(
                     body.create_missing_parents ??
@@ -1308,6 +1323,17 @@ export class FSController extends PuterController {
             return;
         }
         await this.#assertAccess(actor, parentForCheck, 'write');
+    }
+
+    async #assertCanDedupeCreate(actor: Actor, targetPath: string) {
+        const existing = await this.stores.fsEntry.getEntryByPath(targetPath);
+        if (!existing) return;
+        const parent = pathPosix.dirname(targetPath);
+        await this.#assertAccess(
+            actor,
+            parent === '/' ? targetPath : parent,
+            'write',
+        );
     }
 
     async #assertAccess(
@@ -1676,6 +1702,7 @@ export class FSController extends PuterController {
         fileMetadata: FSEntryWriteInput,
         fallbackSource?: unknown,
         appUidLookupCache?: Map<string, Promise<number | null>>,
+        actorUserId?: number,
     ): Promise<FSEntryWriteInput> {
         const metadataRecord = this.#toObjectRecord(fileMetadata);
         const fallbackRecord = this.#toObjectRecord(fallbackSource);
@@ -1689,10 +1716,11 @@ export class FSController extends PuterController {
             ),
         );
         if (associatedAppId !== undefined) {
-            return {
-                ...fileMetadata,
+            return this.#withAssociatedAppId(
+                fileMetadata,
                 associatedAppId,
-            };
+                actorUserId,
+            );
         }
 
         const appUid = this.#firstDefined(
@@ -1726,9 +1754,46 @@ export class FSController extends PuterController {
         if (resolvedAppId === null) {
             return fileMetadata;
         }
+        return this.#withAssociatedAppId(
+            fileMetadata,
+            resolvedAppId,
+            actorUserId,
+        );
+    }
+
+    /**
+     * Bind `associatedAppId` onto the write input only when the actor is
+     * entitled to reference that app. `associatedAppId` is client-supplied
+     * and never trusted for authz, but it's echoed back in legacy FS
+     * responses — so an attacker could plant another tenant's private app id
+     * to confirm the row exists (an enumeration oracle) and harvest its
+     * metadata. Allow binding to public apps (their existence isn't secret)
+     * or to apps the actor owns; drop the association otherwise so the file
+     * simply carries no associated app.
+     *
+     * `#resolveWriteFileMetadata` has already copied the raw client value onto
+     * `fileMetadata`, so a dropped association must be actively stripped — not
+     * merely left unset.
+     */
+    async #withAssociatedAppId(
+        fileMetadata: FSEntryWriteInput,
+        appId: number,
+        actorUserId?: number,
+    ): Promise<FSEntryWriteInput> {
+        const app = await this.stores.app.getById(appId);
+        const isPrivate =
+            !!app && (Boolean(app.is_private) || Boolean(app.protected));
+        const isOwner =
+            actorUserId !== undefined &&
+            this.#toNumber(app?.owner_user_id) === actorUserId;
+        if (!app || (isPrivate && !isOwner)) {
+            const { associatedAppId: _dropped, ...rest } =
+                fileMetadata as unknown as Record<string, unknown>;
+            return rest as unknown as FSEntryWriteInput;
+        }
         return {
             ...fileMetadata,
-            associatedAppId: resolvedAppId,
+            associatedAppId: appId,
         };
     }
 

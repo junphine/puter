@@ -18,6 +18,7 @@
  */
 
 import type { Request, Response } from 'express';
+import { actorUid } from '../../core/actor.js';
 import { Context } from '../../core/context.js';
 import { Controller } from '../../core/http/decorators.js';
 import { HttpError, isHttpError } from '../../core/http/HttpError.js';
@@ -34,6 +35,7 @@ import {
     resolveDriverMethodRateLimit,
 } from '../../drivers/meta.js';
 import type { PermissionService } from '../../services/permission/PermissionService.js';
+import { PermissionUtil } from '../../services/permission/permissionUtil.js';
 import type { WithLifecycle } from '../../types';
 import { PuterController } from '../types.js';
 
@@ -221,7 +223,16 @@ export class DriverController extends PuterController {
                 | PermissionService
                 | undefined;
             if (permService) {
-                const permKey = `service:${resolvedDriverName}:ii:${ifaceName}`;
+                // Build via PermissionUtil.join so any `:` in a driver or
+                // interface name is escaped — raw interpolation would let a
+                // crafted name shift permission-segment boundaries and match
+                // a broader/narrower parent than intended in the scan logic.
+                const permKey = PermissionUtil.join(
+                    'service',
+                    String(resolvedDriverName),
+                    'ii',
+                    ifaceName,
+                );
                 const hasPermission = await permService.check(
                     req.actor,
                     permKey,
@@ -324,14 +335,91 @@ export class DriverController extends PuterController {
         // a stale value from a prior call.
         Context.set('driverName', requestedDriver);
 
+        // Per-method lifecycle events, scoped to `driver.<iface>.<method>`.
+        // Subscribers can listen on `driver.*`, `driver.<iface>.*`, or the
+        // exact key. `before` is emitted via `emitAndWait` so a listener may
+        // veto the call by setting `allow = false` (emits `reject`, throws
+        // 403); otherwise `after`/`error` carry the result/error + duration.
+        const actor = req.actor ? actorUid(req.actor) : undefined;
+        const resolved = String(resolvedDriverName);
+        const beforeEvent = {
+            phase: 'before' as const,
+            iface: ifaceName,
+            method,
+            driver: resolved,
+            actor: req.actor,
+            actorUid: actor,
+            args,
+            allow: true as boolean,
+            rejectReason: undefined as string | undefined,
+        };
+        await this.clients.event?.emitAndWait(
+            `driver.${ifaceName}.${method}.before`,
+            beforeEvent,
+            {},
+        );
+        if (beforeEvent.allow === false) {
+            this.clients.event?.emit(
+                `driver.${ifaceName}.${method}.reject`,
+                {
+                    phase: 'reject',
+                    iface: ifaceName,
+                    method,
+                    driver: resolved,
+                    actor: req.actor,
+                    actorUid: actor,
+                    args,
+                    rejectReason: beforeEvent.rejectReason,
+                },
+                {},
+            );
+            throw new HttpError(
+                403,
+                beforeEvent.rejectReason ??
+                    `Blocked by policy: ${ifaceName}:${method}`,
+                { legacyCode: 'forbidden' },
+            );
+        }
+
         // Drivers read actor/context via the Context API — no drilled args.
+        const startedAt = Date.now();
         let result;
         try {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             result = await (fn as (...x: unknown[]) => any).call(driver, args);
         } catch (e) {
+            this.clients.event?.emit(
+                `driver.${ifaceName}.${method}.error`,
+                {
+                    phase: 'error',
+                    iface: ifaceName,
+                    method,
+                    driver: resolved,
+                    actor: req.actor,
+                    actorUid: actor,
+                    args,
+                    error: e,
+                    durationMs: Date.now() - startedAt,
+                },
+                {},
+            );
             throw translateProviderError(e);
         }
+        this.clients.event?.emit(
+            `driver.${ifaceName}.${method}.after`,
+            {
+                phase: 'after',
+                iface: ifaceName,
+                method,
+                driver: resolved,
+                actor: req.actor,
+                actorUid: actor,
+                args,
+                result,
+                durationMs: Date.now() - startedAt,
+            },
+            {},
+        );
 
         if (isDriverStreamResult(result)) {
             res.setHeader('Content-Type', result.content_type);

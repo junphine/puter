@@ -179,10 +179,33 @@ export class V1TokensDisabledError extends Error {
 
 // -- TokenService ----------------------------------------------------
 
+// The exact secret values shipped in config.default.json. Matched exactly
+// (not by substring) so the boot guard refuses only these known-insecure
+// defaults and never a legitimate operator secret that happens to contain
+// "change-me".
+const SHIPPED_PLACEHOLDER_SECRETS = new Set([
+    'dev-jwt-secret-change-me',
+    'dev-jwt-secret-v2-change-me',
+    'dev-url-signature-secret-change-me',
+]);
+
 export class TokenService extends PuterService {
-    #secretV2: string = '';
-    #secretLegacy: string = '';
-    #allowV1Tokens = true;
+    // Secrets are read straight from `this.config`, which is populated at
+    // construction (before any onServerStart runs). They are deliberately NOT
+    // copied into fields during onServerStart: the http socket starts
+    // accepting connections before onServerStart finishes, so a copied field
+    // would still be empty for any request that lands in the boot window —
+    // producing a cryptic `secretOrPrivateKey must have a value` 500 on login.
+    // Reading config directly closes that window entirely.
+    get #secretV2(): string {
+        return this.config.jwt_secret_v2 ?? '';
+    }
+    get #secretLegacy(): string {
+        return this.config.jwt_secret ?? '';
+    }
+    get #allowV1Tokens(): boolean {
+        return this.config.allow_v1_tokens !== false;
+    }
 
     override onServerStart(): void {
         const secretV2 = this.config.jwt_secret_v2;
@@ -191,12 +214,37 @@ export class TokenService extends PuterService {
                 'TokenService requires `jwt_secret_v2` in config — v2 signing cannot proceed without it',
             );
         }
-        this.#secretV2 = secretV2;
-        // Legacy secret is optional in fresh installs (no v1 tokens to verify),
-        // but every existing deployment carries one. Don't fail boot if it's
-        // missing — instead, refuse to verify v1 tokens later.
-        this.#secretLegacy = this.config.jwt_secret ?? '';
-        this.#allowV1Tokens = this.config.allow_v1_tokens !== false;
+        // The dev placeholders ship in config.default.json (a public repo) and
+        // survive a deep-merge when an override config omits them — anyone who
+        // knows the placeholder can forge with that secret. For the JWT secrets
+        // that means forging a session token for any user; for
+        // `url_signature_secret` it means forging file read/write capability
+        // URLs for any file uid. Refuse to boot a non-dev deployment on any
+        // placeholder secret. (`url_signature_secret` is guarded here, with the
+        // other shipped placeholder secrets, even though it's consumed
+        // elsewhere — this is the one hook guaranteed to run before any request.)
+        if (this.config.env !== 'dev') {
+            for (const [name, value] of [
+                ['jwt_secret_v2', secretV2],
+                ['jwt_secret', this.config.jwt_secret ?? ''],
+                [
+                    'url_signature_secret',
+                    this.config.url_signature_secret ?? '',
+                ],
+            ] as const) {
+                if (SHIPPED_PLACEHOLDER_SECRETS.has(value)) {
+                    throw new Error(
+                        `\`${name}\` is still the dev placeholder from config.default.json; ` +
+                            'set a real secret before running with env != "dev"',
+                    );
+                }
+            }
+        }
+        // Note: secrets are exposed via getters over `this.config` (see above),
+        // not copied into fields here. onServerStart only validates them at
+        // boot — fail fast on a missing v2 secret or a shipped placeholder.
+        // The legacy `jwt_secret` stays optional (fresh installs have no v1
+        // tokens to verify); a missing one is handled at verify time.
     }
 
     /**
@@ -241,6 +289,8 @@ export class TokenService extends PuterService {
         if (kid === 'v2') {
             const payload = jwt.verify(token, this.#secretV2, {
                 clockTolerance: CLOCK_TOLERANCE_SECONDS,
+                // Secrets are symmetric; never accept asymmetric algs here.
+                algorithms: ['HS256'],
             }) as Record<string, unknown>;
             return this.#decompressPayload(context, payload) as unknown as T;
         }
@@ -269,6 +319,7 @@ export class TokenService extends PuterService {
         }
         const payload = jwt.verify(token, this.#secretLegacy, {
             clockTolerance: CLOCK_TOLERANCE_SECONDS,
+            algorithms: ['HS256'],
         }) as Record<string, unknown>;
         const decompressed = this.#decompressPayload(
             context,

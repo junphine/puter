@@ -112,6 +112,43 @@ export interface IEmailConfig {
     [key: string]: unknown;
 }
 
+/** Prelude (https://prelude.so) Verify v2 — SMS phone verification provider. */
+export interface IPreludeConfig {
+    /** Prelude v2 API key (sent as `Authorization: Bearer <apiKey>`). */
+    apiKey?: string;
+    /** Default region for parsing local-format phone numbers (e.g. 'US'). */
+    defaultCountry?: string;
+    /**
+     * Per-SMS cost ceiling in EUR.
+     */
+    maxSmsCostEur?: number;
+    /**
+     * Verification template id (from the Prelude dashboard) that controls the
+     * SMS wording — e.g. a "Your Puter verification code is {{code}}" template.
+     * The message text itself is authored in Prelude, not here; this just
+     * selects it. Omit to use the dashboard default.
+     */
+    templateId?: string;
+    /**
+     * Alphanumeric Sender ID to brand who the SMS is "from" (e.g. "Puter").
+     * Must be pre-enabled by Prelude and isn't supported by all carriers/regions
+     * (notably US long/short codes). Omit to use Prelude's default sender.
+     */
+    senderId?: string;
+    /**
+     * Channel Prelude prioritizes for delivery. Defaults to 'rcs' (much cheaper
+     * than SMS); Prelude falls back to SMS when RCS isn't reachable. Requires an
+     * RCS agent provisioned in the Prelude account to actually use RCS.
+     */
+    preferredChannel?:
+        | 'sms'
+        | 'rcs'
+        | 'whatsapp'
+        | 'viber'
+        | 'zalo'
+        | 'telegram';
+}
+
 /**
  * S3-compatible bucket the thumbnails extension uses for storing generated
  * thumbnails. When unset, the extension falls back to the main `S3Client`
@@ -141,6 +178,8 @@ export interface IAIProviderConfig {
     apiToken?: string;
     /** Override the provider's HTTP base URL (OpenRouter, Cloudflare, ElevenLabs, Ollama). */
     apiBaseUrl?: string;
+    /** Azure AI Foundry deployment endpoint (azure-openai). Required alongside `apiKey`. */
+    apiURL?: string;
     /** Cloudflare account id. */
     accountId?: string;
     /** ElevenLabs default voice id. */
@@ -359,6 +398,13 @@ export interface IGuiParams {
     title?: string;
     short_description?: string;
     social_media_image?: string;
+    /**
+     * Public SDK key for Prelude's JS Signals SDK. When set, the phone-
+     * verification window collects a `dispatch_id` (browser signals) and
+     * forwards it to /send-confirm-phone, which passes it to Prelude's Verify
+     * API so its abuse model can weigh the device. Omit to disable collection.
+     */
+    preludeSdkKey?: string;
     [key: string]: unknown;
 }
 
@@ -506,11 +552,13 @@ interface IConfigOptional {
      */
     allow_v1_app_migration: boolean;
     /**
-     * Optional explicit allowlist of `Origin` header values that may
-     * call `POST /auth/migrate-token` cross-origin. The main `origin`
-     * is always allowed. Used to thread the SDK migration call through
-     * app subdomains (e.g. `*.puter.site`) without opening the
-     * endpoint to arbitrary attacker pages.
+     * Optional explicit allowlist of `Origin` header values that are
+     * trusted by `POST /auth/migrate-token` to receive the
+     * `puter_token_v2` companion cookie. The main `origin` is always
+     * trusted. The token exchange itself is open to any browser origin
+     * (the v1 bearer token is the credential); this list only gates
+     * cookie issuance, so attacker pages can't plant a session cookie
+     * on the GUI origin.
      */
     allow_migrate_token_origins?: string[];
     /** HMAC secret for signed file URLs (/file, /writeFile, /sign). */
@@ -523,6 +571,20 @@ interface IConfigOptional {
     allow_system_login: boolean;
     /** Reject auth-gated routes unless the user has confirmed their email. */
     strict_email_verification_required: boolean;
+    /**
+     * Force SMS phone verification on every new signup, regardless of abuse
+     * reputation. Off by default; mainly a test/QA switch so the phone gate can
+     * be exercised on demand (it otherwise only triggers for low-reputation
+     * signups). Requires `prelude.apiKey` to actually deliver codes.
+     */
+    always_require_phone_verification: boolean;
+    /**
+     * Force credit-card verification on every new signup, regardless of abuse
+     * reputation. Off by default; mainly a test/QA switch so the card gate can
+     * be exercised on demand (it otherwise only triggers for low-reputation
+     * signups). Requires a payments extension to actually run the $0 auth.
+     */
+    always_require_card_verification: boolean;
     /** Captcha configuration. */
     captcha: { enabled: boolean; difficulty?: 'easy' | 'medium' | 'hard' };
     /** OIDC / OAuth2 providers (google + custom). */
@@ -566,7 +628,10 @@ interface IConfigOptional {
     redis: IRedisConfig;
     pager: IPagerConfig;
     email: IEmailConfig;
-    clickhouse: IClickhouseConfig;
+    /** Optional — only set when SMS phone verification (Prelude) is wired in. */
+    prelude: IPreludeConfig;
+    /** Optional — only set when a ClickHouse analytics client is wired in. */
+    clickhouse?: IClickhouseConfig;
     cf_file_cache: ICfFileCacheConfig;
 
     // -- Rate limiting -----------------------------------------------

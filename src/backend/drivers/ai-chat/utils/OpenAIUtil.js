@@ -84,6 +84,39 @@ export const process_input_messages = async (messages) => {
 };
 
 export const process_input_messages_responses_api = async (messages) => {
+    // Pre-split round-tripped compaction blocks into standalone Responses
+    // compaction input items, preserving any sibling content (e.g. the
+    // assistant's reply text) as its own message. A compaction item represents
+    // prior history, so it precedes the message it was attached to. This avoids
+    // collapsing the whole message into a single compaction item and dropping
+    // the rest of its content.
+    const expanded = [];
+    for (const msg of messages) {
+        if (msg && Array.isArray(msg.content)) {
+            const compactionBlocks = msg.content.filter(
+                (c) => c && c.type === 'compaction',
+            );
+            if (compactionBlocks.length > 0) {
+                for (const block of compactionBlocks) {
+                    expanded.push({
+                        type: 'compaction',
+                        ...(block.id !== undefined ? { id: block.id } : {}),
+                        encrypted_content: block.encrypted_content,
+                    });
+                }
+                const rest = msg.content.filter(
+                    (c) => !(c && c.type === 'compaction'),
+                );
+                if (rest.length > 0) {
+                    expanded.push({ ...msg, content: rest });
+                }
+                continue;
+            }
+        }
+        expanded.push(msg);
+    }
+    messages = expanded;
+
     for (const msg of messages) {
         const content_as_string = (content) => {
             if (content === undefined || content === null) return '';
@@ -253,6 +286,7 @@ export const create_chat_stream_handler =
         const tool_call_blocks = [];
 
         let last_usage = null;
+        let last_extra_content = null;
         for await (let chunk of completion) {
             chunk = deviations.chunk_but_like_actually(chunk);
             const chunk_usage = deviations.index_usage_from_stream_chunk(chunk);
@@ -285,6 +319,14 @@ export const create_chat_stream_handler =
                 // Apps have to choose to handle extra_content themselves, it doesn't seem like theres a way we can do it in a backwards
                 // compatible fashion since most streaming apps will handle chat history by continuously updating content themselves
                 // This doesn't present us a chance to add in an extra object for gemini's chat continuing features
+                // Don't let a later extra_content chunk without grounding clobber an
+                // earlier one that carried grounding_metadata (used for metering).
+                if (
+                    choice.delta.extra_content.grounding_metadata ||
+                    !last_extra_content?.grounding_metadata
+                ) {
+                    last_extra_content = choice.delta.extra_content;
+                }
                 textblock.addExtraContent(choice.delta.extra_content);
             }
 
@@ -315,7 +357,10 @@ export const create_chat_stream_handler =
         }
 
         // TODO DS: this is a bit too abstracted... this is basically just doing the metering now
-        const usage = usage_calculator({ usage: last_usage });
+        const usage = usage_calculator({
+            usage: last_usage,
+            extra_content: last_extra_content,
+        });
 
         if (mode === 'text') textblock.end();
         if (mode === 'tool') toolblock.end();
@@ -353,6 +398,19 @@ export const create_chat_stream_handler_responses_api =
 
             if (chunk.type === 'response.completed') {
                 last_usage = chunk.response.usage;
+            }
+
+            if (
+                chunk.type === 'response.output_item.done' &&
+                chunk.item?.type === 'compaction'
+            ) {
+                // Inline compaction fired mid-response — normalize the artifact
+                // into the canonical internal compaction event.
+                chatStream.compaction({
+                    id: chunk.item.id,
+                    encrypted_content: chunk.item.encrypted_content,
+                });
+                continue;
             }
 
             if (
@@ -488,10 +546,14 @@ export const handle_completion_output_responses_api = async ({
             ...(item.id ? { canonical_id: item.id } : {}),
         }));
 
+    // Inline-compaction artifact, if the upstream compacted this turn.
+    const compactionItem = output.find((item) => item?.type === 'compaction');
+
     const is_empty = completion.output_text.trim() === '';
-    if (is_empty && responseToolCalls.length < 1) {
+    if (is_empty && responseToolCalls.length < 1 && !compactionItem) {
         // GPT refuses to generate an empty response if you ask it to,
         // so this will probably only happen on an error condition.
+        // A compaction-only output is legitimate, so don't reject it.
         throw new HttpError(400, 'an empty response was generated', {
             legacyCode: 'bad_response',
         });
@@ -522,6 +584,18 @@ export const handle_completion_output_responses_api = async ({
         },
     };
     ret.role = output.find((item) => item?.role)?.role ?? 'assistant';
+
+    if (compactionItem) {
+        // Include `type` so the artifact is a drop-in `messages` item for the
+        // stateless round-trip — symmetric with the streaming compaction chunk.
+        ret.compaction = {
+            type: 'compaction',
+            ...(compactionItem.id !== undefined
+                ? { id: compactionItem.id }
+                : {}),
+            encrypted_content: compactionItem.encrypted_content,
+        };
+    }
 
     delete ret.type;
 

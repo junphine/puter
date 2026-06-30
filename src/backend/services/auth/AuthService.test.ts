@@ -24,6 +24,7 @@ import type { Actor } from '../../core/actor.js';
 import { PuterServer } from '../../server.js';
 import { setupTestServer } from '../../testUtil.js';
 import { generateDefaultFsentries } from '../../util/userProvisioning.js';
+import { FULL_API_ACCESS } from '../permission/consts.js';
 import { AuthService } from './AuthService.js';
 
 function createAuthService(): AuthService {
@@ -75,6 +76,20 @@ describe('AuthService.createAccessToken', () => {
                 [['fs:abc:read']],
             ),
         ).rejects.toMatchObject({ statusCode: 403 });
+    });
+
+    it('rejects a full-access mint by an app-under-user actor', async () => {
+        // Apps may hold scoped grants but must not be able to escalate to a
+        // blanket account-wide token. This throws on actor shape, before any
+        // DB / permission interaction, so the mock service is sufficient.
+        const authService = createAuthService();
+        const appActor = {
+            user: { uuid: 'user-issuer', id: 1, username: 'issuer' },
+            app: { id: 0, uid: 'app-x' },
+        } as Actor;
+        await expect(
+            authService.createAccessToken(appActor, [[FULL_API_ACCESS]]),
+        ).rejects.toMatchObject({ statusCode: 403, legacyCode: 'forbidden' });
     });
 });
 
@@ -1182,6 +1197,24 @@ describe('AuthService (integration)', () => {
             ).rejects.toMatchObject({ statusCode: 400 });
         });
 
+        it('createWorkerAppToken refuses an app actor targeting a different app (403)', async () => {
+            const user = await makeUser();
+            const actor = {
+                user: { id: user.id, uuid: user.uuid, username: user.username },
+                app: { uid: `app-${uuidv4()}` },
+            } as Actor;
+            await expect(
+                authService.createWorkerAppToken(
+                    actor,
+                    `app-${uuidv4()}`,
+                    'wk-x',
+                ),
+            ).rejects.toMatchObject({
+                statusCode: 403,
+                legacyCode: 'forbidden',
+            });
+        });
+
         // ── Revocation flow ────────────────────────────────────────
 
         it('revokeSession on a worker session — authenticate returns reauth.session_revoked', async () => {
@@ -1299,6 +1332,99 @@ describe('AuthService (integration)', () => {
             expect(a).toBe(b);
             expect(a).toMatch(/^app-/);
         });
+
+        it.each([
+            'javascript:alert(document.domain)',
+            'data:text/html,<script>alert(1)</script>',
+            'file:///etc/passwd',
+            'vbscript:msgbox(1)',
+        ])('throws 400 for non-http(s) scheme %s', async (origin) => {
+            // These parse fine via `new URL()` but must never become a
+            // bootstrap app `index_url` — that would be a stored XSS /
+            // code-execution vector when launched as `iframe.src`.
+            await expect(
+                authService.appUidFromOrigin(origin),
+            ).rejects.toMatchObject({ statusCode: 400 });
+        });
+    });
+
+    describe('app origin blocklist enforcement', () => {
+        // The blocklist service caches with a TTL, so seed the row then
+        // invalidate the in-memory snapshot to force a reload for the test.
+        const blockOrigin = async (
+            domain: string,
+            includeSubdomains = false,
+        ) => {
+            await server.clients.db.write(
+                'INSERT INTO `blocked_app_origins` (`domain`, `include_subdomains`) VALUES (?, ?)',
+                [domain, includeSubdomains ? 1 : 0],
+            );
+            (
+                server.services.appOriginBlocklist as {
+                    invalidate: () => void;
+                }
+            ).invalidate();
+        };
+
+        it('appUidFromOrigin throws 403 app_blocked for a blocked exact host', async () => {
+            const host = `blocked-${uuidv4()}.example.com`;
+            await blockOrigin(host);
+            await expect(
+                authService.appUidFromOrigin(`https://${host}/`),
+            ).rejects.toMatchObject({
+                statusCode: 403,
+                legacyCode: 'app_blocked',
+            });
+        });
+
+        it('appUidFromOrigin throws for a subdomain of an include_subdomains entry', async () => {
+            const apex = `evil-${uuidv4()}.example.com`;
+            await blockOrigin(apex, true);
+            await expect(
+                authService.appUidFromOrigin(`https://app.${apex}/`),
+            ).rejects.toMatchObject({
+                statusCode: 403,
+                legacyCode: 'app_blocked',
+            });
+        });
+
+        it('appUidFromOrigin still resolves an unrelated origin', async () => {
+            const uid = await authService.appUidFromOrigin(
+                `https://fine-${uuidv4()}.example.com/`,
+            );
+            expect(uid).toMatch(/^app-/);
+        });
+
+        it('rejects an already-issued app token once its origin is blocked', async () => {
+            const user = await makeUser();
+            const host = `late-block-${uuidv4()}.example.com`;
+            const appUid = `app-${uuidv4()}`;
+            // App row carries the to-be-blocked host as its index_url.
+            await server.clients.db.write(
+                'INSERT INTO `apps` (`uid`, `name`, `title`, `index_url`, `owner_user_id`) VALUES (?, ?, ?, ?, ?)',
+                [appUid, `n-${appUid}`, `t-${appUid}`, `https://${host}/`, 1],
+            );
+            const appToken = await authService.getUserAppToken(
+                {
+                    user: {
+                        id: user.id,
+                        uuid: user.uuid,
+                        username: user.username,
+                    },
+                } as Actor,
+                appUid,
+            );
+
+            // Before blocking the token authenticates normally.
+            const ok = await authService.authenticate(appToken);
+            expect(ok.actor?.app?.uid).toBe(appUid);
+
+            // After blocking the same token is rejected with the blocked signal.
+            await blockOrigin(host);
+            const blocked = await authService.authenticate(appToken);
+            expect(blocked.actor).toBeUndefined();
+            expect(blocked.blocked).toBeTruthy();
+        });
     });
 
     describe('getUserAppToken', () => {
@@ -1347,6 +1473,67 @@ describe('AuthService (integration)', () => {
             // Idempotent per (user_id, app_uid) — both tokens reference the
             // same app session row.
             expect(decodedFirst.session_uid).toBe(decodedSecond.session_uid);
+        });
+
+        // Delegation scope: a scoped actor (app-under-user or access-token)
+        // may only mint a token for its own app; only a root user session
+        // may request a token for an arbitrary app.
+        it('lets an app actor mint a token for its own app', async () => {
+            const user = await makeUser();
+            const ownApp = `app-${uuidv4()}`;
+            const actor = {
+                user: { id: user.id, uuid: user.uuid, username: user.username },
+                app: { uid: ownApp },
+            } as Actor;
+            const token = await authService.getUserAppToken(actor, ownApp);
+            const decoded = server.services.token.verify('auth', token) as {
+                app_uid: string;
+            };
+            expect(decoded.app_uid).toBe(ownApp);
+        });
+
+        it('refuses an app actor minting a token for a different app (403)', async () => {
+            const user = await makeUser();
+            const actor = {
+                user: { id: user.id, uuid: user.uuid, username: user.username },
+                app: { uid: `app-${uuidv4()}` },
+            } as Actor;
+            await expect(
+                authService.getUserAppToken(actor, `app-${uuidv4()}`),
+            ).rejects.toMatchObject({
+                statusCode: 403,
+                legacyCode: 'forbidden',
+            });
+        });
+
+        it('refuses an access-token actor minting an app token (403)', async () => {
+            const user = await makeUser();
+            const issuer = {
+                user: { id: user.id, uuid: user.uuid, username: user.username },
+            } as Actor;
+            const actor = {
+                user: { id: user.id, uuid: user.uuid, username: user.username },
+                accessToken: { uid: `tok-${uuidv4()}`, issuer, authorized: null },
+            } as Actor;
+            await expect(
+                authService.getUserAppToken(actor, `app-${uuidv4()}`),
+            ).rejects.toMatchObject({
+                statusCode: 403,
+                legacyCode: 'forbidden',
+            });
+        });
+
+        it('lets a root user session mint a token for any app', async () => {
+            const user = await makeUser();
+            const actor = {
+                user: { id: user.id, uuid: user.uuid, username: user.username },
+            } as Actor;
+            const anyApp = `app-${uuidv4()}`;
+            const token = await authService.getUserAppToken(actor, anyApp);
+            const decoded = server.services.token.verify('auth', token) as {
+                app_uid: string;
+            };
+            expect(decoded.app_uid).toBe(anyApp);
         });
     });
 
@@ -1557,6 +1744,105 @@ describe('AuthService (integration)', () => {
                 statusCode: 403,
                 legacyCode: 'forbidden',
             });
+        });
+
+        // -- Full-API-access tokens --
+
+        it('mints a full-access token for a user actor and stores the label', async () => {
+            const user = await makeUser();
+            const actor = {
+                user: { id: user.id, uuid: user.uuid, username: user.username },
+            } as Actor;
+            const jwt = await authService.createAccessToken(
+                actor,
+                [[FULL_API_ACCESS]],
+                { label: 'My CLI' },
+            );
+            const decoded = server.services.token.verify('auth', jwt) as {
+                type: string;
+                token_uid: string;
+                session_uid: string;
+                full_access?: boolean;
+            };
+            expect(decoded.type).toBe('access-token');
+
+            // Full access is carried as a signed claim — NOT a stored grant.
+            expect(decoded.full_access).toBe(true);
+            const permRows = (await server.clients.db.read(
+                'SELECT `permission` FROM `access_token_permissions` WHERE `token_uid` = ?',
+                [decoded.token_uid],
+            )) as Array<{ permission: string }>;
+            expect(permRows).toHaveLength(0);
+
+            // The label lands on the access-token session row so it shows
+            // (and is revocable) in the manage-sessions UI.
+            const sessRows = (await server.clients.db.read(
+                'SELECT `label`, `kind` FROM `sessions` WHERE `uuid` = ?',
+                [decoded.session_uid],
+            )) as Array<{ label: string; kind: string }>;
+            expect(sessRows[0]?.kind).toBe('access_token');
+            expect(sessRows[0]?.label).toBe('My CLI');
+        });
+
+        it('full-access token resolves any permission the issuing user holds, but a scoped token does not', async () => {
+            const user = await makeUser();
+            await generateDefaultFsentries(
+                server.clients.db,
+                server.stores.user,
+                user,
+            );
+            const body = Buffer.from('secret');
+            await server.services.fs.write(user.id, {
+                fileMetadata: {
+                    path: `/${user.username}/Documents/secret.txt`,
+                    size: body.byteLength,
+                    contentType: 'text/plain',
+                },
+                fileContent: body,
+            } as never);
+            const fileEntry = await server.stores.fsEntry.getEntryByPath(
+                `/${user.username}/Documents/secret.txt`,
+            );
+            expect(fileEntry).not.toBeNull();
+
+            const userActor = {
+                user: { id: user.id, uuid: user.uuid, username: user.username },
+            } as Actor;
+
+            // Full-access token: the owner fs:read resolves *through the
+            // issuer*, even though the token holds no fs grant of its own.
+            const fullJwt = await authService.createAccessToken(userActor, [
+                [FULL_API_ACCESS],
+            ]);
+            const fullActor =
+                await authService.authenticateFromToken(fullJwt);
+            expect(fullActor).toBeTruthy();
+            // The signed claim is surfaced on the actor — this flag is what the
+            // resource gate and the permission scan both key off.
+            expect(fullActor!.accessToken?.fullAccess).toBe(true);
+            expect(
+                await server.services.permission.check(
+                    fullActor!,
+                    `fs:${fileEntry!.uuid}:read`,
+                ),
+            ).toBe(true);
+
+            // A scoped token (granted an unrelated permission) gets NO owner
+            // fs access — access-token actors are excluded from the owner
+            // implicator, so this stays the pre-existing behaviour.
+            const scopedJwt = await authService.createAccessToken(userActor, [
+                [`user:${user.uuid}:email:read`],
+            ]);
+            const scopedActor =
+                await authService.authenticateFromToken(scopedJwt);
+            expect(scopedActor).toBeTruthy();
+            expect(scopedActor!.accessToken?.fullAccess).toBeFalsy();
+            expect(
+                await server.services.permission.check(
+                    scopedActor!,
+                    `fs:${fileEntry!.uuid}:read`,
+                ),
+            ).toBe(false);
         });
     });
 

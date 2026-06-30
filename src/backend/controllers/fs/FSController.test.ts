@@ -18,6 +18,7 @@
  */
 
 import type { Request, Response } from 'express';
+import type { Readable } from 'node:stream';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { v4 as uuidv4 } from 'uuid';
 import type { Actor } from '../../core/actor.js';
@@ -123,6 +124,14 @@ const makeRes = () => {
 
 const withActor = async <T>(actor: Actor, fn: () => Promise<T>): Promise<T> =>
     runWithContext({ actor }, fn);
+
+const streamToString = async (stream: Readable): Promise<string> => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) {
+        chunks.push(Buffer.from(chunk as Buffer));
+    }
+    return Buffer.concat(chunks).toString('utf8');
+};
 
 // ── /startBatchWrite ────────────────────────────────────────────────
 
@@ -434,6 +443,65 @@ describe('FSController.completeBatchWrites', () => {
         expect(finalized?.wasOverwrite).toBe(true);
     });
 
+    // Regression: a signed (direct-to-S3) upload could declare a tiny size
+    // and PUT far more — the presigned URL doesn't bound the body. The
+    // completion path must reconcile the recorded size against the object's
+    // true size, or storage accounting is permanently understated and the
+    // quota is bypassable.
+    it('reconciles the recorded size to the real uploaded bytes (ignores under-declared size)', async () => {
+        const { actor, userId } = await makeUser();
+        const username = actor.user!.username!;
+        const target = `/${username}/Documents/under-declared.bin`;
+
+        // Declare 1 byte.
+        const start = makeRes();
+        await withActor(actor, () =>
+            controller.startBatchWrites(
+                makeReq<SignedWriteRequest[]>({
+                    body: [{ fileMetadata: { path: target, size: 1 } }],
+                    actor,
+                }),
+                start.res,
+            ),
+        );
+        const [started] = start.captured.body as SignedWriteResponse[];
+
+        // Actually upload 4096 bytes to the session's object key (simulating
+        // a client that PUTs more than it declared via the signed URL).
+        const realBytes = Buffer.alloc(4096, 0x41);
+        await server.stores.s3Object.uploadFromServer(
+            {
+                bucket: started!.bucket,
+                objectKey: started!.objectKey,
+                contentType: 'application/octet-stream',
+                body: realBytes,
+                contentLength: realBytes.byteLength,
+            },
+            started!.bucketRegion,
+        );
+
+        const complete = makeRes();
+        await withActor(actor, () =>
+            controller.completeBatchWrites(
+                makeReq<CompleteWriteRequest[]>({
+                    body: [{ uploadId: started!.sessionId }],
+                    actor,
+                }),
+                complete.res,
+            ),
+        );
+
+        const entry = await server.stores.fsEntry.getEntryByPath(target);
+        expect(entry).not.toBeNull();
+        // Recorded size is the true 4096 bytes, not the declared 1.
+        expect(entry?.size).toBe(4096);
+
+        // And the user's accounted usage reflects the real bytes.
+        const allowance =
+            await server.stores.fsEntry.getUserStorageAllowance(userId);
+        expect(allowance.curr).toBeGreaterThanOrEqual(4096);
+    });
+
     it('emits updated events with GUI metadata when overwriting via batch completion', async () => {
         const { actor, userId } = await makeUser();
         const username = actor.user!.username!;
@@ -490,9 +558,7 @@ describe('FSController.completeBatchWrites', () => {
             .body as SignedWriteResponse[];
 
         const emitSpy = vi.spyOn(server.clients.event, 'emit');
-        let updatedCall:
-            | (typeof emitSpy.mock.calls)[number]
-            | undefined;
+        let updatedCall: (typeof emitSpy.mock.calls)[number] | undefined;
         try {
             await withActor(actor, () =>
                 controller.completeBatchWrites(
@@ -667,9 +733,9 @@ describe('FSController.statEntry', () => {
             ...makeReq({ body: { path: '/x' }, actor }),
             actor: undefined,
         } as unknown as Request;
-        await expect(
-            controller.statEntry(req, res),
-        ).rejects.toMatchObject({ statusCode: 401 });
+        await expect(controller.statEntry(req, res)).rejects.toMatchObject({
+            statusCode: 401,
+        });
     });
 });
 
@@ -839,9 +905,7 @@ describe('FSController.searchEntries', () => {
             ).toBe(true);
         }
         expect(
-            results.some(
-                (r) => r.path === `/${username}/Documents/${needle}`,
-            ),
+            results.some((r) => r.path === `/${username}/Documents/${needle}`),
         ).toBe(false);
     });
 
@@ -951,6 +1015,82 @@ describe('FSController.mkdirEntry', () => {
         const body = captured.body as { path: string; isDir: boolean };
         expect(body.path).toBe(`/${username}/Documents/created`);
         expect(body.isDir).toBe(true);
+    });
+
+    it('dedupes an existing directory when dedupe_name is true', async () => {
+        const { actor } = await makeUser();
+        const username = actor.user!.username!;
+        const target = `/${username}/Documents/hello`;
+
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({
+                    body: { path: target },
+                    actor,
+                }),
+                makeRes().res,
+            ),
+        );
+
+        const { res, captured } = makeRes();
+        await withActor(actor, () =>
+            controller.mkdirEntry(
+                makeReq({
+                    body: { path: target, dedupe_name: true },
+                    actor,
+                }),
+                res,
+            ),
+        );
+
+        const body = captured.body as {
+            path: string;
+            name: string;
+            isDir: boolean;
+        };
+        expect(body.path).toBe(`/${username}/Documents/hello (1)`);
+        expect(body.name).toBe('hello (1)');
+        expect(body.isDir).toBe(true);
+        expect(
+            await server.stores.fsEntry.getEntryByPath(
+                `/${username}/Documents/hello (1)`,
+            ),
+        ).toMatchObject({ isDir: true });
+    });
+
+    it('requires parent write when deduping an existing directory', async () => {
+        const { actor: userActor } = await makeUser();
+        const username = userActor.user!.username!;
+        const appUid = `app-mkdir-${uuidv4()}`;
+        const appActor: Actor = { ...userActor, app: { uid: appUid } };
+        const target = `/${username}/AppData/${appUid}`;
+
+        await withActor(userActor, () =>
+            controller.mkdirEntry(
+                makeReq({
+                    body: { path: target },
+                    actor: userActor,
+                }),
+                makeRes().res,
+            ),
+        );
+
+        await expect(
+            withActor(appActor, () =>
+                controller.mkdirEntry(
+                    makeReq({
+                        body: { path: target, dedupe_name: true },
+                        actor: appActor,
+                    }),
+                    makeRes().res,
+                ),
+            ),
+        ).rejects.toMatchObject({ statusCode: 404 });
+        expect(
+            await server.stores.fsEntry.getEntryByPath(
+                `/${username}/AppData/${appUid} (1)`,
+            ),
+        ).toBeNull();
     });
 
     it('expands ~/ in the path to the user home', async () => {
@@ -1183,10 +1323,6 @@ describe('FSController.copyEntry', () => {
 // ── /read (readEntry, full read) ────────────────────────────────────
 
 describe('FSController.readEntry (file streaming)', () => {
-    // makeRes here adds a real Writable surface so that
-    // `pipeline(download.body, res)` inside the controller can pipe
-    // the in-memory S3 stream into the test's response and capture
-    // bytes for assertions.
     const makeStreamingRes = () => {
         const captured = {
             statusCode: 200,
@@ -1194,7 +1330,8 @@ describe('FSController.readEntry (file streaming)', () => {
             bodyChunks: [] as Buffer[],
         };
         // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const { Writable } = require('node:stream') as typeof import('node:stream');
+        const { Writable } =
+            require('node:stream') as typeof import('node:stream');
         const writable = new Writable({
             write(chunk: Buffer, _enc, cb) {
                 captured.bodyChunks.push(chunk);
@@ -1254,7 +1391,9 @@ describe('FSController.readEntry (file streaming)', () => {
         // Pipeline awaits the stream-end on success.
         expect(captured.statusCode).toBe(200);
         expect(captured.headers['Content-Type']).toMatch(/text\/plain/);
-        expect(captured.headers['Content-Length']).toBe(String(body.byteLength));
+        expect(captured.headers['Content-Length']).toBe(
+            String(body.byteLength),
+        );
         expect(captured.headers['Content-Disposition']).toMatch(
             /inline; filename=/,
         );
@@ -1696,5 +1835,268 @@ describe('FSController.mkshortcutEntry', () => {
         };
         expect(body.name).toBe('my-shortcut');
         expect(body.isShortcut).toBe(true);
+    });
+});
+
+describe('FSController metadata.objectKey injection', () => {
+    const writeFile = async (
+        actor: Actor,
+        path: string,
+        content: string,
+        metadata?: Record<string, unknown>,
+    ) => {
+        await withActor(actor, () =>
+            controller.write(
+                makeReq({
+                    body: {
+                        fileMetadata: {
+                            path,
+                            size: Buffer.byteLength(content),
+                            contentType: 'text/plain',
+                            overwrite: true,
+                            ...(metadata ? { metadata } : {}),
+                        },
+                        fileContent: content,
+                        encoding: 'utf8',
+                    },
+                    actor,
+                }) as unknown as Request<
+                    Record<string, never>,
+                    null,
+                    import('./requestTypes.js').WriteRequest
+                >,
+                makeRes().res,
+            ),
+        );
+        const entry = await server.stores.fsEntry.getEntryByPath(path, {
+            skipCache: true,
+        });
+        if (!entry) throw new Error(`entry not found after write: ${path}`);
+        return entry;
+    };
+
+    it("does not stream another user's file when a client injects metadata.objectKey on write", async () => {
+        const victim = await makeUser();
+        const attacker = await makeUser();
+        const victimSecret = 'VICTIM-TOP-SECRET-PAYLOAD';
+        const attackerDecoy = 'attacker-own-decoy-bytes';
+
+        const victimEntry = await writeFile(
+            victim.actor,
+            `/${victim.actor.user!.username}/Documents/secret.txt`,
+            victimSecret,
+        );
+
+        const victimRead = await server.services.fs.readContent(victimEntry);
+        expect(await streamToString(victimRead.body)).toBe(victimSecret);
+
+        const attackerEntry = await writeFile(
+            attacker.actor,
+            `/${attacker.actor.user!.username}/Documents/loot.txt`,
+            attackerDecoy,
+            { objectKey: victimEntry.uuid },
+        );
+
+        const persisted = attackerEntry.metadata
+            ? (JSON.parse(attackerEntry.metadata) as Record<string, unknown>)
+            : {};
+        expect(persisted.objectKey).toBeUndefined();
+
+        const attackerRead =
+            await server.services.fs.readContent(attackerEntry);
+        const got = await streamToString(attackerRead.body);
+        expect(got).toBe(attackerDecoy);
+        expect(got).not.toBe(victimSecret);
+    });
+
+    it('read path ignores a divergent metadata.objectKey on an already-poisoned row', async () => {
+        const victim = await makeUser();
+        const attacker = await makeUser();
+        const victimSecret = 'VICTIM-SECRET-FOR-POISON-TEST';
+        const attackerDecoy = 'attacker-decoy-for-poison-test';
+
+        const victimEntry = await writeFile(
+            victim.actor,
+            `/${victim.actor.user!.username}/Documents/secret2.txt`,
+            victimSecret,
+        );
+        const attackerEntry = await writeFile(
+            attacker.actor,
+            `/${attacker.actor.user!.username}/Documents/loot2.txt`,
+            attackerDecoy,
+        );
+
+        await server.stores.fsEntry.updateEntry(attackerEntry.uuid, {
+            metadata: JSON.stringify({ objectKey: victimEntry.uuid }),
+        });
+        const poisoned = await server.stores.fsEntry.getEntryByPath(
+            attackerEntry.path,
+            { skipCache: true },
+        );
+        if (!poisoned) throw new Error('poisoned entry not found');
+        expect(
+            (JSON.parse(poisoned.metadata!) as { objectKey: string }).objectKey,
+        ).toBe(victimEntry.uuid);
+
+        const read = await server.services.fs.readContent(poisoned);
+        expect(await streamToString(read.body)).toBe(attackerDecoy);
+    });
+
+    it('scrubs objectKey from move newMetadata while preserving legit trash metadata', async () => {
+        const victim = await makeUser();
+        const attacker = await makeUser();
+        const victimSecret = 'VICTIM-SECRET-FOR-MOVE-TEST';
+        const attackerDecoy = 'attacker-decoy-for-move-test';
+        const username = attacker.actor.user!.username!;
+
+        const victimEntry = await writeFile(
+            victim.actor,
+            `/${victim.actor.user!.username}/Documents/secret3.txt`,
+            victimSecret,
+        );
+        const attackerEntry = await writeFile(
+            attacker.actor,
+            `/${username}/Documents/loot3.txt`,
+            attackerDecoy,
+        );
+        const documents = await server.stores.fsEntry.getEntryByPath(
+            `/${username}/Documents`,
+            { skipCache: true },
+        );
+        if (!documents) throw new Error('Documents dir not found');
+
+        const moved = await withActor(attacker.actor, () =>
+            server.services.fs.move(attacker.userId, {
+                source: attackerEntry,
+                destinationParent: documents,
+                newName: 'loot3-moved.txt',
+                newMetadata: {
+                    original_path: `/${username}/Documents/loot3.txt`,
+                    trashed_ts: 1700000000,
+                    objectKey: victimEntry.uuid,
+                },
+            }),
+        );
+
+        const persisted = JSON.parse(moved.metadata!) as Record<
+            string,
+            unknown
+        >;
+        expect(persisted.objectKey).toBeUndefined();
+        expect(persisted.original_path).toBe(
+            `/${username}/Documents/loot3.txt`,
+        );
+        expect(persisted.trashed_ts).toBe(1700000000);
+
+        const read = await server.services.fs.readContent(moved);
+        expect(await streamToString(read.body)).toBe(attackerDecoy);
+    });
+});
+
+// ── associatedAppId entitlement gate ────────────────────────────────
+//
+// `associatedAppId` is client-supplied write metadata that's echoed back in
+// legacy FS responses. Binding a file to another tenant's private app would
+// turn `/stat` into an app-row enumeration oracle, so the write path drops
+// any association the actor isn't entitled to make.
+
+describe('FSController associatedAppId entitlement gate', () => {
+    // Seed an app row with a direct insert. `create` treats is_private as a
+    // read-only column, and going through the store would prime the cache —
+    // a raw insert leaves nothing cached so the gate's getById reads the DB.
+    const makeApp = async (
+        ownerUserId: number,
+        opts: { is_private?: boolean } = {},
+    ): Promise<{ id: number }> => {
+        const uid = `app-${uuidv4()}`;
+        await server.clients.db.write(
+            `INSERT INTO \`apps\` (\`uid\`, \`name\`, \`title\`, \`index_url\`, \`owner_user_id\`, \`is_private\`)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [
+                uid,
+                uid,
+                'Gate App',
+                'https://gate-app.puter.site/',
+                ownerUserId,
+                opts.is_private ? 1 : 0,
+            ],
+        );
+        const row = (
+            await server.clients.db.read(
+                'SELECT id FROM apps WHERE uid = ?',
+                [uid],
+            )
+        )[0] as { id: number };
+        return { id: row.id };
+    };
+
+    // Write a file via the signed-write flow with the given associatedAppId
+    // and return the committed entry's stored associatedAppId.
+    const writeWithAssociation = async (
+        actor: Actor,
+        path: string,
+        associatedAppId: number,
+    ): Promise<number | null> => {
+        const startRes = makeRes();
+        await withActor(actor, () =>
+            controller.startBatchWrites(
+                makeReq<SignedWriteRequest[]>({
+                    body: [{ fileMetadata: { path, size: 3, associatedAppId } }],
+                    actor,
+                }),
+                startRes.res,
+            ),
+        );
+        const [started] = startRes.captured.body as SignedWriteResponse[];
+        const completeRes = makeRes();
+        await withActor(actor, () =>
+            controller.completeBatchWrites(
+                makeReq<CompleteWriteRequest[]>({
+                    body: [{ uploadId: started.sessionId }],
+                    actor,
+                }),
+                completeRes.res,
+            ),
+        );
+        const entry = await server.stores.fsEntry.getEntryByPath(path);
+        return entry?.associatedAppId ?? null;
+    };
+
+    it("drops an association to another tenant's private app", async () => {
+        const victim = await makeUser();
+        const attacker = await makeUser();
+        const victimApp = await makeApp(victim.userId, { is_private: true });
+
+        const stored = await writeWithAssociation(
+            attacker.actor,
+            `/${attacker.actor.user!.username}/Documents/probe.txt`,
+            victimApp.id,
+        );
+        expect(stored).toBeNull();
+    });
+
+    it('keeps an association to a public app the actor does not own', async () => {
+        const owner = await makeUser();
+        const other = await makeUser();
+        const publicApp = await makeApp(owner.userId, { is_private: false });
+
+        const stored = await writeWithAssociation(
+            other.actor,
+            `/${other.actor.user!.username}/Documents/public-assoc.txt`,
+            publicApp.id,
+        );
+        expect(stored).toBe(publicApp.id);
+    });
+
+    it('keeps an association to the actor’s own private app', async () => {
+        const owner = await makeUser();
+        const ownApp = await makeApp(owner.userId, { is_private: true });
+
+        const stored = await writeWithAssociation(
+            owner.actor,
+            `/${owner.actor.user!.username}/Documents/own-assoc.txt`,
+            ownApp.id,
+        );
+        expect(stored).toBe(ownApp.id);
     });
 });

@@ -32,12 +32,14 @@
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { EventClient } from '../../clients/event/EventClient.js';
 import type { Actor } from '../../core/actor.js';
 import { runWithContext } from '../../core/context.js';
 import { HttpError } from '../../core/http/HttpError.js';
+import { requireUserActorGate } from '../../core/http/middleware/gates.js';
 import { PuterServer } from '../../server.js';
+import { FULL_API_ACCESS } from '../../services/permission/consts.js';
 import { setupTestServer } from '../../testUtil.js';
 
 // ── Test harness ────────────────────────────────────────────────────
@@ -72,6 +74,24 @@ type SignupValidateOverride = (data: {
 
 let signupValidateOverride: SignupValidateOverride | null = null;
 const heardSignupSuccess: Array<Record<string, unknown>> = [];
+const heardUserDelete: Array<Record<string, unknown>> = [];
+
+// Card verification is pure mechanism in core: a payments extension fills in the
+// event fields via emitAndWait. These overrides let a test stand in for that
+// extension, using the same shared-listener pattern as the signup validate
+// override above (EventClient has no off()). null override => no extension.
+type CardSetupOverride = (data: {
+    enabled: boolean | null;
+    client_secret: string | null;
+    publishable_key: string | null;
+}) => void;
+type CardConfirmOverride = (data: {
+    enabled: boolean | null;
+    verified: boolean;
+    reason: string | null;
+}) => void;
+let cardSetupOverride: CardSetupOverride | null = null;
+let cardConfirmOverride: CardConfirmOverride | null = null;
 
 const installSharedListeners = () => {
     eventClient.on('puter.signup.validate', (_k: unknown, data: unknown) => {
@@ -84,6 +104,25 @@ const installSharedListeners = () => {
     eventClient.on('puter.signup.success', (_k: unknown, data: unknown) => {
         heardSignupSuccess.push(data as Record<string, unknown>);
     });
+    eventClient.on('user.delete', (_k: unknown, data: unknown) => {
+        heardUserDelete.push(data as Record<string, unknown>);
+    });
+    eventClient.on(
+        'puter.card-verification.setup',
+        (_k: unknown, data: unknown) => {
+            if (cardSetupOverride) {
+                cardSetupOverride(data as Parameters<CardSetupOverride>[0]);
+            }
+        },
+    );
+    eventClient.on(
+        'puter.card-verification.confirm',
+        (_k: unknown, data: unknown) => {
+            if (cardConfirmOverride) {
+                cardConfirmOverride(data as Parameters<CardConfirmOverride>[0]);
+            }
+        },
+    );
 };
 
 const withSignupValidateOverride = async <T>(
@@ -95,6 +134,30 @@ const withSignupValidateOverride = async <T>(
         return await fn();
     } finally {
         signupValidateOverride = null;
+    }
+};
+
+const withCardSetupOverride = async <T>(
+    override: CardSetupOverride,
+    fn: () => Promise<T>,
+): Promise<T> => {
+    cardSetupOverride = override;
+    try {
+        return await fn();
+    } finally {
+        cardSetupOverride = null;
+    }
+};
+
+const withCardConfirmOverride = async <T>(
+    override: CardConfirmOverride,
+    fn: () => Promise<T>,
+): Promise<T> => {
+    cardConfirmOverride = override;
+    try {
+        return await fn();
+    } finally {
+        cardConfirmOverride = null;
     }
 };
 
@@ -322,6 +385,35 @@ describe('AuthController.handleSignup', () => {
         ).toBe(true);
     });
 
+    it('forces phone verification on every signup when always_require_phone_verification is set', async () => {
+        const cfg = (controller as { config: Record<string, unknown> }).config;
+        const prev = cfg.always_require_phone_verification;
+        cfg.always_require_phone_verification = true;
+        try {
+            const username = `s_${uniq()}`;
+            const req = makeReq({
+                username,
+                email: `${username}@test.local`,
+                password: 'correct-horse-battery',
+            });
+            const res = makeRes();
+
+            await controller.handleSignup(req, res);
+
+            // The login envelope flags the gate so the GUI shows the dialog …
+            const body = res.body as {
+                user: { requires_phone_verification?: number | boolean };
+            };
+            expect(body.user.requires_phone_verification).toBeTruthy();
+
+            // … and it's persisted so the gate survives re-login.
+            const persisted = await server.stores.user.getByUsername(username);
+            expect(persisted!.requires_phone_verification).toBe(true);
+        } finally {
+            cfg.always_require_phone_verification = prev;
+        }
+    });
+
     it('rejects a duplicate username with 400', async () => {
         const username = `s_${uniq()}`;
         // Seed first.
@@ -514,6 +606,209 @@ describe('AuthController.handleSignup', () => {
                 (evt) => (evt as { username?: string }).username === username,
             ),
         ).toBe(true);
+    });
+});
+
+// -- Signup device signal (fingerprint) --
+
+describe('AuthController.handleSignup device signals', () => {
+    const uniq = () => Math.random().toString(36).slice(2, 10);
+
+    const captureValidateEvents = async (
+        fn: () => Promise<void>,
+    ): Promise<Array<Record<string, unknown>>> => {
+        const seen: Array<Record<string, unknown>> = [];
+        await withSignupValidateOverride((event) => {
+            seen.push(event as unknown as Record<string, unknown>);
+        }, fn);
+        return seen;
+    };
+
+    const successEventsFor = (baseline: number, username: string) =>
+        heardSignupSuccess
+            .slice(baseline)
+            .filter(
+                (evt) => (evt as { username?: string }).username === username,
+            );
+
+    it('forwards fingerprint verbatim to validate and success events', async () => {
+        const username = `fp_${uniq()}`;
+        const baseline = heardSignupSuccess.length;
+        const fingerprint = 'Fp_abc.123-XYZ';
+
+        const seen = await captureValidateEvents(async () => {
+            const res = makeRes();
+            await controller.handleSignup(
+                makeReq({
+                    username,
+                    email: `${username}@test.local`,
+                    password: 'correct-horse-battery',
+                    fingerprint,
+                }),
+                res,
+            );
+            expect(isCompleteLoginResponse(res.body)).toBe(true);
+        });
+
+        expect(seen).toHaveLength(1);
+        expect(seen[0].fingerprint).toBe(fingerprint);
+
+        const successes = successEventsFor(baseline, username);
+        expect(successes).toHaveLength(1);
+        expect(successes[0].fingerprint).toBe(fingerprint);
+        expect(successes[0].is_temp).toBe(false);
+    });
+
+    it('accepts a boundary-length 128-char fingerprint', async () => {
+        const username = `fp_${uniq()}`;
+        const res = makeRes();
+        await controller.handleSignup(
+            makeReq({
+                username,
+                email: `${username}@test.local`,
+                password: 'correct-horse-battery',
+                fingerprint: 'f'.repeat(128),
+            }),
+            res,
+        );
+        expect(isCompleteLoginResponse(res.body)).toBe(true);
+    });
+
+    it('defaults the fingerprint to null on the validate event when absent', async () => {
+        const username = `fp_${uniq()}`;
+        const baseline = heardSignupSuccess.length;
+
+        const seen = await captureValidateEvents(async () => {
+            const res = makeRes();
+            await controller.handleSignup(
+                makeReq({
+                    username,
+                    email: `${username}@test.local`,
+                    password: 'correct-horse-battery',
+                }),
+                res,
+            );
+            // Signup completes exactly as before when the fields are absent.
+            expect(isCompleteLoginResponse(res.body)).toBe(true);
+            expect(res.cookies['puter_auth_token']).toBeDefined();
+        });
+
+        expect(seen).toHaveLength(1);
+        expect(seen[0].fingerprint).toBeNull();
+
+        const successes = successEventsFor(baseline, username);
+        expect(successes).toHaveLength(1);
+        expect(successes[0].fingerprint).toBeNull();
+        expect(successes[0].is_temp).toBe(false);
+    });
+
+    it('treats an empty-string fingerprint as absent', async () => {
+        const username = `fp_${uniq()}`;
+
+        const seen = await captureValidateEvents(async () => {
+            const res = makeRes();
+            await controller.handleSignup(
+                makeReq({
+                    username,
+                    email: `${username}@test.local`,
+                    password: 'correct-horse-battery',
+                    fingerprint: '',
+                }),
+                res,
+            );
+            // An empty signal is "not collected", never a 400.
+            expect(isCompleteLoginResponse(res.body)).toBe(true);
+        });
+
+        expect(seen).toHaveLength(1);
+        expect(seen[0].fingerprint).toBeNull();
+    });
+
+    it('rejects a non-string fingerprint with 400 and fires no success event', async () => {
+        const username = `fp_${uniq()}`;
+        const baseline = heardSignupSuccess.length;
+        await expect(
+            controller.handleSignup(
+                makeReq({
+                    username,
+                    email: `${username}@test.local`,
+                    password: 'correct-horse-battery',
+                    fingerprint: 12345,
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 400,
+            legacyCode: 'bad_request',
+        });
+        expect(heardSignupSuccess.length).toBe(baseline);
+        // No user row was created either.
+        expect(await server.stores.user.getByUsername(username)).toBeFalsy();
+    });
+
+    it('rejects a fingerprint longer than 128 characters with 400 and fires no success event', async () => {
+        const username = `fp_${uniq()}`;
+        const baseline = heardSignupSuccess.length;
+        await expect(
+            controller.handleSignup(
+                makeReq({
+                    username,
+                    email: `${username}@test.local`,
+                    password: 'correct-horse-battery',
+                    fingerprint: 'f'.repeat(129),
+                }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+        expect(heardSignupSuccess.length).toBe(baseline);
+    });
+
+    it('temp-user signup reports is_temp true and carries the fingerprint on the success event', async () => {
+        const baseline = heardSignupSuccess.length;
+        const res = makeRes();
+        await controller.handleSignup(
+            makeReq({ is_temp: true, fingerprint: 'temp-device-fp' }),
+            res,
+        );
+        expect(isCompleteLoginResponse(res.body)).toBe(true);
+        const username = (res.body as { user: { username: string } }).user
+            .username;
+        const successes = successEventsFor(baseline, username);
+        expect(successes).toHaveLength(1);
+        expect(successes[0].is_temp).toBe(true);
+        expect(successes[0].fingerprint).toBe('temp-device-fp');
+    });
+
+    it('pseudo-user claim reports is_temp false on the success event', async () => {
+        // Seed an unconfirmed placeholder row (email set, password null) —
+        // signing up with the same email claims it instead of inserting.
+        const placeholder = `ph_${uniq()}`;
+        const email = `${placeholder}@test.local`;
+        await server.stores.user.create({
+            username: placeholder,
+            uuid: uuidv4(),
+            password: null,
+            email,
+        });
+
+        const username = `fp_${uniq()}`;
+        const baseline = heardSignupSuccess.length;
+        const res = makeRes();
+        await controller.handleSignup(
+            makeReq({
+                username,
+                email,
+                password: 'correct-horse-battery',
+                fingerprint: 'claim-device-fp',
+            }),
+            res,
+        );
+        expect(isCompleteLoginResponse(res.body)).toBe(true);
+
+        const successes = successEventsFor(baseline, username);
+        expect(successes).toHaveLength(1);
+        expect(successes[0].is_temp).toBe(false);
+        expect(successes[0].fingerprint).toBe('claim-device-fp');
     });
 });
 
@@ -791,6 +1086,65 @@ describe('AuthController.handleLogout', () => {
         );
         expect(res.clearedCookies).toContain('puter_auth_token');
         expect(res.sent).toBe('logged out');
+    });
+});
+
+describe('AuthController account-lifecycle route gating', () => {
+    const routeOptions = (method: string, path: string) => {
+        const proto = Object.getPrototypeOf(controller) as {
+            __puterRoutes?: Array<{
+                method: string;
+                path: string;
+                options?: Record<string, unknown>;
+            }>;
+        };
+        const route = (proto.__puterRoutes ?? []).find(
+            (r) =>
+                r.method.toLowerCase() === method.toLowerCase() &&
+                r.path === path,
+        );
+        expect(route, `route ${method} ${path} not found`).toBeDefined();
+        return route!.options ?? {};
+    };
+
+    it('POST /logout requires a human user actor', () => {
+        const opts = routeOptions('post', '/logout');
+        expect(opts.requireUserActor).toBe(true);
+        expect(opts.antiCsrf).toBe(true);
+    });
+
+    it('GET /get-anticsrf-token requires a human user actor', () => {
+        const opts = routeOptions('get', '/get-anticsrf-token');
+        expect(opts.requireUserActor).toBe(true);
+    });
+
+    it('requireUserActorGate rejects app-under-user and access-token actors', () => {
+        const gate = requireUserActorGate();
+        const run = (actor: Partial<Actor>) =>
+            new Promise<unknown>((resolve) => {
+                gate(
+                    { actor } as never,
+                    {} as never,
+                    (err?: unknown) => resolve(err),
+                );
+            });
+
+        return (async () => {
+            const appActor = await run({
+                user: { uuid: 'u1' },
+                app: { uid: 'app-1' },
+            } as Partial<Actor>);
+            expect(appActor).toMatchObject({ statusCode: 403 });
+
+            const tokenActor = await run({
+                user: { uuid: 'u1' },
+                accessToken: { uid: 'tok-1' },
+            } as Partial<Actor>);
+            expect(tokenActor).toMatchObject({ statusCode: 403 });
+
+            const human = await run({ user: { uuid: 'u1' } } as Partial<Actor>);
+            expect(human).toBeUndefined();
+        })();
     });
 });
 
@@ -1223,6 +1577,78 @@ describe('AuthController.handleCreateAccessToken + handleRevokeAccessToken', () 
         expect(decoded.user_uid).toBe(actor.user.uuid);
     });
 
+    // -- Full-API-access + labels --
+
+    it('mints a full-access token and stores a trimmed label on the session row', async () => {
+        const res = makeRes();
+        await controller.handleCreateAccessToken(
+            makeReq(
+                { permissions: [FULL_API_ACCESS], label: '  My CLI  ' },
+                { actor },
+            ),
+            res,
+        );
+        const decoded = server.services.token.verify(
+            'auth',
+            (res.body as { token: string }).token,
+        ) as {
+            type: string;
+            token_uid: string;
+            session_uid: string;
+            full_access?: boolean;
+        };
+        expect(decoded.type).toBe('access-token');
+
+        // Full access is a signed claim, not a stored permission row.
+        expect(decoded.full_access).toBe(true);
+        const permRows = (await server.clients.db.read(
+            'SELECT `permission` FROM `access_token_permissions` WHERE `token_uid` = ?',
+            [decoded.token_uid],
+        )) as Array<{ permission: string }>;
+        expect(permRows).toHaveLength(0);
+
+        const sessRows = (await server.clients.db.read(
+            'SELECT `label` FROM `sessions` WHERE `uuid` = ?',
+            [decoded.session_uid],
+        )) as Array<{ label: string }>;
+        expect(sessRows[0]?.label).toBe('My CLI');
+    });
+
+    it('caps an over-long label at 64 characters', async () => {
+        const res = makeRes();
+        await controller.handleCreateAccessToken(
+            makeReq(
+                { permissions: [FULL_API_ACCESS], label: 'x'.repeat(120) },
+                { actor },
+            ),
+            res,
+        );
+        const decoded = server.services.token.verify(
+            'auth',
+            (res.body as { token: string }).token,
+        ) as { session_uid: string };
+        const sessRows = (await server.clients.db.read(
+            'SELECT `label` FROM `sessions` WHERE `uuid` = ?',
+            [decoded.session_uid],
+        )) as Array<{ label: string }>;
+        expect(sessRows[0]?.label.length).toBe(64);
+    });
+
+    it('rejects a non-string label with 400', async () => {
+        await expect(
+            controller.handleCreateAccessToken(
+                makeReq(
+                    {
+                        permissions: [FULL_API_ACCESS],
+                        label: 123 as unknown as string,
+                    },
+                    { actor },
+                ),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
     it('revoke-access-token: requires tokenOrUuid and returns ok:true on success', async () => {
         // Mint, then revoke.
         const created = makeRes();
@@ -1342,6 +1768,727 @@ describe('AuthController.handleSendConfirmEmail', () => {
         });
         expect(after!.email_confirm_code).not.toBe(before!.email_confirm_code);
         expect(String(after!.email_confirm_code).length).toBe(6);
+    });
+});
+
+// The per-account / per-number SMS send caps used to live here as a hardcoded
+// `MAX_PHONE_VERIFY_SENDS` in the backend. They now live entirely in the abuse
+// extension (no abuse thresholds in the OSS repo): the backend only asks via
+// `puter.phone-verification.check` and reports sends via
+// `puter.phone-verification.sent`. The cap behavior is covered by the
+// extension's phoneVerification / phoneSendLog tests; the backend side (it
+// forwards a veto, and emits `sent` only on success) is covered below.
+
+describe('AuthController.handleSendConfirmPhone validation', () => {
+    // Stub the Prelude client (a real external boundary) so we exercise the
+    // controller's validation branches, not the network. Override per case.
+    const stubPrelude = (over: Record<string, unknown> = {}) => ({
+        isConfigured: () => true,
+        isCountrySupported: () => true,
+        defaultCountry: 'US',
+        createVerification: vi.fn(async () => ({ status: 'success' })),
+        ...over,
+    });
+    const withPrelude = async (
+        prelude: unknown,
+        fn: () => Promise<void>,
+    ): Promise<void> => {
+        const ctrl = controller as { clients: { prelude: unknown } };
+        const real = ctrl.clients.prelude;
+        ctrl.clients.prelude = prelude;
+        try {
+            await fn();
+        } finally {
+            ctrl.clients.prelude = real;
+        }
+    };
+
+    it('throws 400 for an unparseable phone number', async () => {
+        const { actor } = await makeUserAndActor();
+        await withPrelude(stubPrelude(), async () => {
+            await expect(
+                controller.handleSendConfirmPhone(
+                    makeReq({ phone: 'not a phone' }, { actor }),
+                    makeRes(),
+                ),
+            ).rejects.toMatchObject({ statusCode: 400 });
+        });
+    });
+
+    it('throws 400 (and sends nothing) when the country is over the cost cap', async () => {
+        const { actor } = await makeUserAndActor();
+        const createVerification = vi.fn(async () => ({ status: 'success' }));
+        await withPrelude(
+            stubPrelude({ isCountrySupported: () => false, createVerification }),
+            async () => {
+                await expect(
+                    controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({ statusCode: 400 });
+                expect(createVerification).not.toHaveBeenCalled();
+            },
+        );
+    });
+
+    it('throws 503 when Prelude is not configured', async () => {
+        const { actor } = await makeUserAndActor();
+        await withPrelude(
+            stubPrelude({ isConfigured: () => false }),
+            async () => {
+                await expect(
+                    controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({ statusCode: 503 });
+            },
+        );
+    });
+
+    it('surfaces a Prelude block as 429', async () => {
+        const { actor } = await makeUserAndActor();
+        await withPrelude(
+            stubPrelude({
+                createVerification: vi.fn(async () => ({ status: 'blocked' })),
+            }),
+            async () => {
+                await expect(
+                    controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({ statusCode: 429 });
+            },
+        );
+    });
+
+    it('forwards ip, device fingerprint, and user-agent to Prelude as signals', async () => {
+        const { actor } = await makeUserAndActor();
+        const createVerification = vi.fn(async () => ({ status: 'success' }));
+        await withPrelude(stubPrelude({ createVerification }), async () => {
+            const req = makeReq(
+                { phone: '+14155550123' },
+                {
+                    actor,
+                    ip: '203.0.113.7',
+                    headers: { 'user-agent': 'Mozilla/5.0' },
+                },
+            );
+            // Stamped by the global fingerprint middleware in production.
+            (req as { deviceFingerprint?: string }).deviceFingerprint =
+                'thumb_abc123';
+            await controller.handleSendConfirmPhone(req, makeRes());
+        });
+        expect(createVerification).toHaveBeenCalledWith('+14155550123', {
+            ip: '203.0.113.7',
+            device_id: 'thumb_abc123',
+            user_agent: 'Mozilla/5.0',
+        });
+    });
+
+    it('omits absent device fingerprint and user-agent from the Prelude signals', async () => {
+        const { actor } = await makeUserAndActor();
+        const createVerification = vi.fn(async () => ({ status: 'success' }));
+        await withPrelude(stubPrelude({ createVerification }), async () => {
+            await controller.handleSendConfirmPhone(
+                makeReq({ phone: '+14155550123' }, { actor, ip: '203.0.113.7' }),
+                makeRes(),
+            );
+        });
+        expect(createVerification).toHaveBeenCalledWith('+14155550123', {
+            ip: '203.0.113.7',
+            device_id: undefined,
+            user_agent: undefined,
+        });
+    });
+});
+
+describe('AuthController phone verification — staging & reuse', () => {
+    const stubPrelude = (over: Record<string, unknown> = {}) => ({
+        isConfigured: () => true,
+        isCountrySupported: () => true,
+        defaultCountry: 'US',
+        createVerification: vi.fn(async () => ({ status: 'success' })),
+        checkVerification: vi.fn(async () => ({ status: 'success' })),
+        ...over,
+    });
+    const withClients = async (
+        over: { prelude?: unknown; event?: unknown },
+        fn: () => Promise<void>,
+    ): Promise<void> => {
+        const ctrl = controller as {
+            clients: { prelude: unknown; event: unknown };
+        };
+        const realPrelude = ctrl.clients.prelude;
+        const realEvent = ctrl.clients.event;
+        if ('prelude' in over) ctrl.clients.prelude = over.prelude;
+        if ('event' in over) ctrl.clients.event = over.event;
+        try {
+            await fn();
+        } finally {
+            ctrl.clients.prelude = realPrelude;
+            ctrl.clients.event = realEvent;
+        }
+    };
+
+    it('stages the number in KV and does NOT write it to the user row before verification', async () => {
+        const { user, actor } = await makeUserAndActor();
+        await withClients({ prelude: stubPrelude() }, async () => {
+            await controller.handleSendConfirmPhone(
+                makeReq({ phone: '+14155550123' }, { actor }),
+                makeRes(),
+            );
+        });
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        // The unverified number is not persisted to the indexed column …
+        expect(after!.phone ?? null).toBeNull();
+        // … it's staged in KV instead, for /confirm-phone to read back.
+        const { res: staged } = await server.stores.kv.get({
+            key: `phone-verify-pending:${user.id}`,
+        });
+        expect(staged).toBe('+14155550123');
+    });
+
+    it('forwards an abuse-extension veto as 429 with the opaque reason, and sends nothing', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const emitAndWait = vi.fn(
+            async (
+                name: string,
+                ev: { allowed: boolean; reason: string | null },
+            ) => {
+                if (name === 'puter.phone-verification.check') {
+                    ev.allowed = false;
+                    ev.reason = 'phone_already_used';
+                }
+            },
+        );
+        const createVerification = vi.fn(async () => ({ status: 'success' }));
+        await withClients(
+            {
+                prelude: stubPrelude({ createVerification }),
+                event: { emitAndWait, emit: vi.fn() },
+            },
+            async () => {
+                // 429 (not 403), and the extension's reason is forwarded
+                // verbatim for the client to message on — the backend never
+                // interprets it.
+                await expect(
+                    controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({
+                    statusCode: 429,
+                    fields: { reason: 'phone_already_used' },
+                });
+            },
+        );
+        // Vetoed before the send — no SMS dispatched, nothing staged.
+        expect(createVerification).not.toHaveBeenCalled();
+        const { res: staged } = await server.stores.kv.get({
+            key: `phone-verify-pending:${user.id}`,
+        });
+        expect(staged ?? null).toBeNull();
+    });
+
+    it('emits puter.phone-verification.sent after a successful send', async () => {
+        const { actor } = await makeUserAndActor();
+        const emit = vi.fn();
+        const emitAndWait = vi.fn(async () => {}); // no veto
+        await withClients(
+            { prelude: stubPrelude(), event: { emit, emitAndWait } },
+            async () => {
+                await controller.handleSendConfirmPhone(
+                    makeReq({ phone: '+14155550123' }, { actor }),
+                    makeRes(),
+                );
+            },
+        );
+        expect(emit).toHaveBeenCalledWith(
+            'puter.phone-verification.sent',
+            expect.objectContaining({ phone: '+14155550123' }),
+            expect.anything(),
+        );
+    });
+
+    it('does NOT emit the sent signal when the send fails upstream', async () => {
+        const { actor } = await makeUserAndActor();
+        const emit = vi.fn();
+        const emitAndWait = vi.fn(async () => {});
+        await withClients(
+            {
+                prelude: stubPrelude({
+                    createVerification: vi.fn(async () => {
+                        throw new Error('prelude down');
+                    }),
+                }),
+                event: { emit, emitAndWait },
+            },
+            async () => {
+                await expect(
+                    controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({ statusCode: 502 });
+            },
+        );
+        const sentCalls = emit.mock.calls.filter(
+            (c) => c[0] === 'puter.phone-verification.sent',
+        );
+        expect(sentCalls).toHaveLength(0);
+    });
+
+    it('confirms against the staged number and persists it to the row only on success', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+        });
+        // No phone on the row; the number lives only in the KV staging slot.
+        await server.stores.kv.set({
+            key: `phone-verify-pending:${user.id}`,
+            value: '+14155550123',
+        });
+        const checkVerification = vi.fn(async () => ({ status: 'success' }));
+        await withClients(
+            { prelude: stubPrelude({ checkVerification }) },
+            async () => {
+                const res = makeRes();
+                await controller.handleConfirmPhone(
+                    makeReq({ code: '123456' }, { actor }),
+                    res,
+                );
+                expect(res.body).toMatchObject({ phone_verified: true });
+            },
+        );
+        expect(checkVerification).toHaveBeenCalledWith('+14155550123', '123456');
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.requires_phone_verification).toBe(false);
+        // Persisted to the row only now, on success.
+        expect(after!.phone).toBe('+14155550123');
+    });
+});
+
+describe('AuthController.handleConfirmPhone', () => {
+    const stubPrelude = (over: Record<string, unknown> = {}) => ({
+        isConfigured: () => true,
+        checkVerification: vi.fn(async () => ({ status: 'success' })),
+        ...over,
+    });
+    const withPrelude = async (
+        prelude: unknown,
+        fn: () => Promise<void>,
+    ): Promise<void> => {
+        const ctrl = controller as { clients: { prelude: unknown } };
+        const real = ctrl.clients.prelude;
+        ctrl.clients.prelude = prelude;
+        try {
+            await fn();
+        } finally {
+            ctrl.clients.prelude = real;
+        }
+    };
+
+    it('throws 400 when code is missing', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        await expect(
+            controller.handleConfirmPhone(makeReq({}, { actor }), makeRes()),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('short-circuits to verified when the gate is not set (no Prelude call)', async () => {
+        const { actor } = await makeUserAndActor();
+        const checkVerification = vi.fn();
+        await withPrelude(stubPrelude({ checkVerification }), async () => {
+            const res = makeRes();
+            await controller.handleConfirmPhone(
+                makeReq({ code: '123456' }, { actor }),
+                res,
+            );
+            expect(res.body).toMatchObject({ phone_verified: true });
+            expect(checkVerification).not.toHaveBeenCalled();
+        });
+    });
+
+    it('throws 400 when the gate is set but no phone is on file', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+        });
+        await expect(
+            controller.handleConfirmPhone(
+                makeReq({ code: '123456' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 400 });
+    });
+
+    it('throws 503 when the gate is set but Prelude is not configured', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        await withPrelude(
+            stubPrelude({ isConfigured: () => false }),
+            async () => {
+                await expect(
+                    controller.handleConfirmPhone(
+                        makeReq({ code: '123456' }, { actor }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({ statusCode: 503 });
+            },
+        );
+    });
+
+    it('returns phone_verified:false on a wrong code without clearing the gate', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        await withPrelude(
+            stubPrelude({
+                checkVerification: vi.fn(async () => ({ status: 'failure' })),
+            }),
+            async () => {
+                const res = makeRes();
+                await controller.handleConfirmPhone(
+                    makeReq({ code: '000000' }, { actor }),
+                    res,
+                );
+                expect(res.body).toMatchObject({ phone_verified: false });
+                const after = await server.stores.user.getById(user.id, {
+                    force: true,
+                });
+                expect(after!.requires_phone_verification).toBe(true);
+            },
+        );
+    });
+
+    it('clears the gate on a correct code and echoes the socket id', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        await withPrelude(
+            stubPrelude({
+                checkVerification: vi.fn(async () => ({ status: 'success' })),
+            }),
+            async () => {
+                const res = makeRes();
+                await controller.handleConfirmPhone(
+                    makeReq(
+                        { code: '123456', original_client_socket_id: 'sock_1' },
+                        { actor },
+                    ),
+                    res,
+                );
+                expect(res.body).toMatchObject({
+                    phone_verified: true,
+                    original_client_socket_id: 'sock_1',
+                });
+                const after = await server.stores.user.getById(user.id, {
+                    force: true,
+                });
+                expect(after!.requires_phone_verification).toBe(false);
+            },
+        );
+    });
+
+    it('awaits the user.phone-verified listeners (emitAndWait, not fire-and-forget)', async () => {
+        // The carrier-based card-verification waiver (abuse extension) listens
+        // on user.phone-verified and must clear the card gate BEFORE confirm
+        // responds — so the event has to be awaited, not fire-and-forget.
+        const { actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        const emit = vi.fn();
+        const emitAndWait = vi.fn(async () => {});
+        const ctrl = controller as { clients: { event: unknown } };
+        const realEvent = ctrl.clients.event;
+        ctrl.clients.event = { emit, emitAndWait };
+        try {
+            await withPrelude(
+                stubPrelude({
+                    checkVerification: vi.fn(async () => ({
+                        status: 'success',
+                    })),
+                }),
+                async () => {
+                    await controller.handleConfirmPhone(
+                        makeReq({ code: '123456' }, { actor }),
+                        makeRes(),
+                    );
+                },
+            );
+        } finally {
+            ctrl.clients.event = realEvent;
+        }
+        expect(emitAndWait).toHaveBeenCalledWith(
+            'user.phone-verified',
+            expect.objectContaining({ phone: '+14155550123' }),
+            expect.anything(),
+        );
+        const fireAndForget = emit.mock.calls.filter(
+            (c) => c[0] === 'user.phone-verified',
+        );
+        expect(fireAndForget).toHaveLength(0);
+    });
+
+    it('throws 502 when the upstream check fails', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        await withPrelude(
+            stubPrelude({
+                checkVerification: vi.fn(async () => {
+                    throw new Error('prelude down');
+                }),
+            }),
+            async () => {
+                await expect(
+                    controller.handleConfirmPhone(
+                        makeReq({ code: '123456' }, { actor }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({ statusCode: 502 });
+            },
+        );
+    });
+});
+
+describe('AuthController.handleCardVerificationSetup', () => {
+    it('short-circuits to verified when the gate is not set', async () => {
+        const { actor } = await makeUserAndActor();
+        const res = makeRes();
+        await controller.handleCardVerificationSetup(
+            makeReq({}, { actor }),
+            res,
+        );
+        expect(res.body).toMatchObject({ card_verified: true });
+    });
+
+    it('throws 403 when the account is suspended', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+            suspended: 1,
+        });
+        await expect(
+            controller.handleCardVerificationSetup(
+                makeReq({}, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 403 });
+    });
+
+    it('throws 409 when phone verification must be completed first', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        await expect(
+            controller.handleCardVerificationSetup(
+                makeReq({}, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 409 });
+    });
+
+    it('throws 503 when no payments extension is listening', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+        });
+        await expect(
+            controller.handleCardVerificationSetup(
+                makeReq({}, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 503 });
+    });
+
+    it('clears the gate when the extension reports the feature disabled', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+        });
+        const res = makeRes();
+        await withCardSetupOverride(
+            (data) => {
+                data.enabled = false;
+            },
+            () =>
+                controller.handleCardVerificationSetup(
+                    makeReq({}, { actor }),
+                    res,
+                ),
+        );
+        expect(res.body).toMatchObject({ card_verified: true, disabled: true });
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.requires_card_verification).toBe(false);
+    });
+
+    it('returns the provider credentials on success', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+        });
+        const res = makeRes();
+        await withCardSetupOverride(
+            (data) => {
+                data.enabled = true;
+                data.client_secret = 'seti_secret';
+                data.publishable_key = 'pk_test';
+            },
+            () =>
+                controller.handleCardVerificationSetup(
+                    makeReq({}, { actor }),
+                    res,
+                ),
+        );
+        expect(res.body).toEqual({
+            client_secret: 'seti_secret',
+            publishable_key: 'pk_test',
+        });
+    });
+});
+
+describe('AuthController.handleCardVerificationConfirm', () => {
+    it('throws 400 for a missing or invalid setup_intent_id', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+        });
+        for (const bad of [undefined, '', 123, 'x'.repeat(256)]) {
+            await expect(
+                controller.handleCardVerificationConfirm(
+                    makeReq({ setup_intent_id: bad }, { actor }),
+                    makeRes(),
+                ),
+            ).rejects.toMatchObject({ statusCode: 400 });
+        }
+    });
+
+    it('short-circuits to verified when the gate is not set', async () => {
+        const { actor } = await makeUserAndActor();
+        const res = makeRes();
+        await controller.handleCardVerificationConfirm(
+            makeReq({ setup_intent_id: 'seti_1' }, { actor }),
+            res,
+        );
+        expect(res.body).toMatchObject({ card_verified: true });
+    });
+
+    it('throws 409 when phone verification must be completed first', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        await expect(
+            controller.handleCardVerificationConfirm(
+                makeReq({ setup_intent_id: 'seti_1' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 409 });
+    });
+
+    it('throws 503 when no payments extension is listening', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+        });
+        await expect(
+            controller.handleCardVerificationConfirm(
+                makeReq({ setup_intent_id: 'seti_1' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 503 });
+    });
+
+    it('clears the gate when the extension reports the feature disabled', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+        });
+        const res = makeRes();
+        await withCardConfirmOverride(
+            (data) => {
+                data.enabled = false;
+            },
+            () =>
+                controller.handleCardVerificationConfirm(
+                    makeReq({ setup_intent_id: 'seti_1' }, { actor }),
+                    res,
+                ),
+        );
+        expect(res.body).toMatchObject({ card_verified: true, disabled: true });
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.requires_card_verification).toBe(false);
+    });
+
+    it('returns card_verified:false with a reason when not verified', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+        });
+        const res = makeRes();
+        await withCardConfirmOverride(
+            (data) => {
+                data.enabled = true;
+                data.verified = false;
+                data.reason = 'prepaid_not_allowed';
+            },
+            () =>
+                controller.handleCardVerificationConfirm(
+                    makeReq({ setup_intent_id: 'seti_1' }, { actor }),
+                    res,
+                ),
+        );
+        expect(res.body).toMatchObject({
+            card_verified: false,
+            reason: 'prepaid_not_allowed',
+        });
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.requires_card_verification).toBe(true);
+    });
+
+    it('clears the gate when the extension verifies the card', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+        });
+        const res = makeRes();
+        await withCardConfirmOverride(
+            (data) => {
+                data.enabled = true;
+                data.verified = true;
+            },
+            () =>
+                controller.handleCardVerificationConfirm(
+                    makeReq(
+                        {
+                            setup_intent_id: 'seti_1',
+                            original_client_socket_id: 'sock_1',
+                        },
+                        { actor },
+                    ),
+                    res,
+                ),
+        );
+        expect(res.body).toMatchObject({ card_verified: true });
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.requires_card_verification).toBe(false);
     });
 });
 
@@ -1548,6 +2695,43 @@ describe('AuthController password recovery', () => {
             ),
         ).rejects.toMatchObject({ statusCode: 400 });
     });
+
+    it('set-pass-using-token: revokes all of the user’s interactive sessions', async () => {
+        // A password reset is the "someone may have my account" flow, so
+        // existing sessions must not survive it.
+        const { user } = await makeUserAndActor();
+        const recoveryToken = uuidv4();
+        await server.stores.user.update(user.id, {
+            pass_recovery_token: recoveryToken,
+        });
+        const jwt = server.services.token.sign(
+            'otp',
+            {
+                token: recoveryToken,
+                user_uid: user.uuid,
+                email: user.email,
+                purpose: 'pass-recovery',
+            },
+            { expiresIn: '1h' },
+        );
+
+        const s1 = await server.services.auth.createSessionToken(user, {});
+        const s2 = await server.services.auth.createSessionToken(user, {});
+        const uuid1 = (s1.session as { uuid: string }).uuid;
+        const uuid2 = (s2.session as { uuid: string }).uuid;
+        // Both are live before the reset.
+        expect(await server.stores.session.getByUuid(uuid1)).not.toBeNull();
+        expect(await server.stores.session.getByUuid(uuid2)).not.toBeNull();
+
+        await controller.handleSetPassUsingToken(
+            makeReq({ token: jwt, password: 'a-brand-new-password' }),
+            makeRes(),
+        );
+
+        // Every interactive session is revoked (getByUuid gates on revoked_at).
+        expect(await server.stores.session.getByUuid(uuid1)).toBeNull();
+        expect(await server.stores.session.getByUuid(uuid2)).toBeNull();
+    });
 });
 
 // ── User-protected change-* (skipping middleware-driven setup) ─────
@@ -1592,6 +2776,34 @@ describe('AuthController user-protected mutations (validation paths)', () => {
         expect(
             await bcrypt.compare('correct-horse-battery-2', after!.password!),
         ).toBe(true);
+    });
+
+    it('change-password: revokes the user’s other web sessions but keeps the current one', async () => {
+        const { user, actor } = await makeUserAndActor();
+        // Two web sessions for this user; one is the session performing the
+        // change (the "current" one, identified via actor.session.uid).
+        const current = await server.services.auth.createSessionToken(user, {});
+        const other = await server.services.auth.createSessionToken(user, {});
+        const currentUuid = (current.session as { uuid: string }).uuid;
+        const otherUuid = (other.session as { uuid: string }).uuid;
+
+        const req = makeReq(
+            { new_pass: 'a-fresh-password-123' },
+            {
+                actor: {
+                    ...actor,
+                    session: { uid: currentUuid },
+                } as typeof actor,
+            },
+        );
+        (req as unknown as { userProtected: unknown }).userProtected = { user };
+        await controller.handleChangePassword(req, makeRes());
+
+        // The other session is revoked; the one that made the change survives.
+        expect(await server.stores.session.getByUuid(otherUuid)).toBeNull();
+        expect(
+            await server.stores.session.getByUuid(currentUuid),
+        ).not.toBeNull();
     });
 
     it('change-username: 400 on missing/invalid/reserved/already-taken usernames', async () => {
@@ -2556,6 +3768,35 @@ describe('AuthController.handleDeleteOwnUser', () => {
         });
         expect(after).toBeFalsy();
     });
+
+    it('emits user.delete with the uuid + stripe customer id for downstream teardown', async () => {
+        // `stripe_customer_id` ships in the MySQL/Postgres migrations but not
+        // the sqlite ones the test harness runs — add it so the delete path
+        // captures it (it's how the marketplace extension cancels the sub).
+        try {
+            await server.clients.db.write(
+                'ALTER TABLE user ADD COLUMN stripe_customer_id TEXT',
+                [],
+            );
+        } catch {
+            /* already exists */
+        }
+        const { user, actor } = await makeUserAndActor();
+        await server.clients.db.write(
+            'UPDATE user SET stripe_customer_id = ? WHERE id = ?',
+            ['cus_delete_test', user.id],
+        );
+
+        heardUserDelete.length = 0;
+        await controller.handleDeleteOwnUser(makeReq({}, { actor }), makeRes());
+
+        const evt = heardUserDelete.find((e) => e.user_id === user.id);
+        expect(evt).toMatchObject({
+            user_id: user.id,
+            user_uuid: user.uuid,
+            stripe_customer_id: 'cus_delete_test',
+        });
+    });
 });
 
 // ── Additional branch coverage ─────────────────────────────────────
@@ -2886,6 +4127,77 @@ describe('AuthController.handleSignup additional branches', () => {
         });
         expect(claimed!.username).toBe(newUsername);
         expect(claimed!.password).not.toBeNull();
+    });
+
+    it('claim clears stale phone/card gates on the placeholder when the decision no longer requires them', async () => {
+        // Placeholder seeded with both gates already set. A benign claim
+        // (no validate override → no requirements) must reset them rather
+        // than silently inheriting the stale requirement.
+        const targetEmail = `pseudo_${uniq()}@test.local`;
+        const placeholder = await server.stores.user.create({
+            username: `placeholder_${uniq()}`,
+            uuid: uuidv4(),
+            password: null,
+            email: targetEmail,
+            clean_email: targetEmail,
+            email_confirmed: 0,
+            requires_phone_verification: 1,
+            requires_card_verification: 1,
+        } as never);
+
+        const res = makeRes();
+        await controller.handleSignup(
+            makeReq({
+                username: `claim_${uniq()}`,
+                email: targetEmail,
+                password: 'correct-horse-battery',
+            }),
+            res,
+        );
+        expect(isCompleteLoginResponse(res.body)).toBe(true);
+
+        const claimed = await server.stores.user.getById(placeholder.id, {
+            force: true,
+        });
+        expect(claimed!.requires_phone_verification).toBe(false);
+        expect(claimed!.requires_card_verification).toBe(false);
+    });
+
+    it('claim carries the phone/card gates when the decision requires them', async () => {
+        const targetEmail = `pseudo_${uniq()}@test.local`;
+        const placeholder = await server.stores.user.create({
+            username: `placeholder_${uniq()}`,
+            uuid: uuidv4(),
+            password: null,
+            email: targetEmail,
+            clean_email: targetEmail,
+            email_confirmed: 0,
+        } as never);
+
+        await withSignupValidateOverride(
+            (event) => {
+                event.requires_phone_verification = true;
+                event.requires_card_verification = true;
+            },
+            async () => {
+                const res = makeRes();
+                await controller.handleSignup(
+                    makeReq({
+                        username: `claim_${uniq()}`,
+                        email: targetEmail,
+                        password: 'correct-horse-battery',
+                    }),
+                    res,
+                );
+                expect(isCompleteLoginResponse(res.body)).toBe(true);
+            },
+        );
+
+        const claimed = await server.stores.user.getById(placeholder.id, {
+            force: true,
+        });
+        expect(claimed!.requires_phone_verification).toBe(true);
+        expect(claimed!.requires_card_verification).toBe(true);
     });
 
     it('extension hook can require email confirmation via requires_email_confirmation=true', async () => {
@@ -3597,27 +4909,60 @@ describe('AuthController.handleMigrateToken', () => {
         ).rejects.toMatchObject({ statusCode: 403 });
     });
 
-    it('rejects when the Origin header is not in config.origin or the allowlist', async () => {
+    it('allows the exchange from an unlisted origin (apps live on arbitrary domains)', async () => {
+        // puter.js apps run on any third-party domain; the v1 bearer
+        // token is the credential, so the exchange itself is not
+        // origin-gated — only cookie issuance is (next test).
         const { user } = await makeUserAndActor();
         const v1 = mintV1Token({
             type: 'access-token',
             token_uid: uuidv4(),
             user_uid: user.uuid,
         });
-        await expect(
-            controller.handleMigrateToken(
-                makeReq(
-                    {},
-                    {
-                        headers: {
-                            origin: 'https://not-allowed.example',
-                            authorization: `Bearer ${v1}`,
-                        },
+        const res = makeRes();
+        await controller.handleMigrateToken(
+            makeReq(
+                {},
+                {
+                    headers: {
+                        origin: 'https://some-app.example',
+                        authorization: `Bearer ${v1}`,
                     },
-                ),
-                makeRes(),
+                },
             ),
-        ).rejects.toMatchObject({ statusCode: 403 });
+            res,
+        );
+        expect((res.body as { kind: string }).kind).toBe('access_token');
+        expect((res.body as { token: string }).token).toBeTruthy();
+    });
+
+    it('does NOT set the puter_token_v2 cookie for an app token from an untrusted origin', async () => {
+        // Cookie planting on the GUI origin is what the allowlist
+        // prevents: an attacker page may exchange a token it already
+        // holds, but must not be able to set a session cookie.
+        const { user } = await makeUserAndActor();
+        const appUid = `app-${uuidv4()}`;
+        const v1 = mintV1Token({
+            type: 'app-under-user',
+            user_uid: user.uuid,
+            app_uid: appUid,
+        });
+        const res = makeRes();
+        await controller.handleMigrateToken(
+            makeReq(
+                {},
+                {
+                    headers: {
+                        origin: 'https://some-app.example',
+                        authorization: `Bearer ${v1}`,
+                    },
+                },
+            ),
+            res,
+        );
+        expect((res.body as { kind: string }).kind).toBe('app');
+        expect((res.body as { token: string }).token).toBeTruthy();
+        expect(res.cookies.puter_token_v2).toBeUndefined();
     });
 
     it('normalizes trailing slash on the request Origin (B4)', async () => {

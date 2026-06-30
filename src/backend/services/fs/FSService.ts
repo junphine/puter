@@ -32,6 +32,7 @@ import {
     FSEntry,
     FSEntryCreateInput,
     FSEntryWriteInput,
+    hasNoBackingS3Object,
     PendingUploadCreateInput,
     PendingUploadSession,
 } from '../../stores/fs/FSEntry.js';
@@ -71,8 +72,8 @@ import { AclMode } from '../acl/ACLService.js';
 const DEFAULT_CONTENT_TYPE = 'application/octet-stream';
 const DEFAULT_SIGNED_UPLOAD_EXPIRY_SECONDS = 60 * 15;
 
-// AWS SDK v3 surfaces missing-key errors with both `name` and `Code` set to
-// "NoSuchKey". Check both — `Code` is the wire field, `name` is the JS class.
+const RESERVED_METADATA_KEYS: readonly string[] = ['objectKey'];
+
 const isNoSuchKeyError = (err: unknown): boolean => {
     if (!err || typeof err !== 'object') return false;
     const e = err as { name?: unknown; Code?: unknown };
@@ -400,7 +401,7 @@ export class FSService extends PuterService {
             size,
             contentType: metadata.contentType ?? DEFAULT_CONTENT_TYPE,
             checksumSha256: metadata.checksumSha256,
-            metadata: metadata.metadata,
+            metadata: this.#sanitizeClientMetadata(metadata.metadata),
             thumbnail: metadata.thumbnail,
             associatedAppId: metadata.associatedAppId,
             overwrite: Boolean(metadata.overwrite),
@@ -412,6 +413,50 @@ export class FSService extends PuterService {
             bucket: this.#resolveBucket(),
             bucketRegion: this.#resolveBucketRegion(),
         };
+    }
+
+    #sanitizeClientMetadata(
+        metadata: FSEntryWriteInput['metadata'],
+    ): FSEntryWriteInput['metadata'] {
+        if (metadata === null || metadata === undefined) {
+            return metadata;
+        }
+        if (typeof metadata === 'string') {
+            let parsed: unknown;
+            try {
+                parsed = JSON.parse(metadata);
+            } catch {
+                return metadata;
+            }
+            if (
+                !parsed ||
+                typeof parsed !== 'object' ||
+                Array.isArray(parsed)
+            ) {
+                return metadata;
+            }
+            return JSON.stringify(
+                this.#stripReservedMetadataKeys(
+                    parsed as Record<string, unknown>,
+                ),
+            );
+        }
+        if (typeof metadata === 'object' && !Array.isArray(metadata)) {
+            return this.#stripReservedMetadataKeys(
+                metadata as Record<string, unknown>,
+            );
+        }
+        return metadata;
+    }
+
+    #stripReservedMetadataKeys(
+        record: Record<string, unknown>,
+    ): Record<string, unknown> {
+        const cleaned: Record<string, unknown> = { ...record };
+        for (const key of RESERVED_METADATA_KEYS) {
+            delete cleaned[key];
+        }
+        return cleaned;
     }
 
     async #findDedupedPath(
@@ -1107,7 +1152,7 @@ export class FSService extends PuterService {
         return {
             sessionId: '',
             uploadMode: 'single',
-            objectKey: fsEntry.path.substring(1),
+            objectKey: fsEntry.uuid,
             bucket: fsEntry.bucket ?? '',
             bucketRegion: fsEntry.bucketRegion ?? '',
             contentType: 'inode/directory',
@@ -2158,6 +2203,46 @@ export class FSService extends PuterService {
                 );
             }
 
+            // The size recorded so far is the client-declared value from the
+            // start-write request. On a signed (direct-to-S3) upload the
+            // client could declare `1` and PUT gigabytes — the presigned URL
+            // doesn't bound the body — so reconcile against the object's true
+            // size before persisting. Without this, storage accounting is
+            // understated permanently (quota is SUM(size)) and the free-tier
+            // limit is bypassable. Mirrors the server-proxied /write path.
+            const reconcileBucket =
+                session.bucket ?? createInput.bucket ?? this.#resolveBucket();
+            const reconcileRegion =
+                session.bucketRegion ??
+                createInput.bucketRegion ??
+                this.#resolveBucketRegion();
+            let trueSize: number | null = null;
+            try {
+                trueSize = await this.stores.s3Object.headObjectSize(
+                    reconcileBucket,
+                    session.objectKey,
+                    reconcileRegion,
+                );
+            } catch {
+                // HEAD failed (e.g. object never uploaded) — leave the
+                // declared size; don't block completion on a metadata read.
+                trueSize = null;
+            }
+            if (typeof trueSize === 'number' && trueSize >= 0) {
+                // Record the true size only — do not re-assert the quota here.
+                // The bytes are already in S3, so a completion-time reject
+                // can't reclaim them; it only false-rejects (the start-check
+                // may have used a higher storageAllowanceMax override that
+                // isn't persisted in the session) and deletes within-quota
+                // uploads. Recording real bytes is what closes the bypass:
+                // the user's SUM(size) becomes accurate so their next signed
+                // -write start-check (#assertStorageAllowance via
+                // getUserStorageAllowance) blocks them. The residual is a
+                // single in-flight upload over quota — the same bounded
+                // check-then-act window the start-check already has.
+                createInput.size = trueSize;
+            }
+
             const fsEntry = await this.stores.fsEntry.completePendingEntry(
                 session.sessionId,
                 createInput,
@@ -2336,6 +2421,49 @@ export class FSService extends PuterService {
                 throw firstReason;
             }
             throw new Error('Failed to complete multipart upload');
+        }
+
+        // Reconcile client-declared sizes against the true uploaded object
+        // sizes before persisting — see completeUrlWrite for the rationale.
+        // Without this the batch endpoint is a parallel bypass of the same
+        // storage-quota check.
+        const reconcileBucketRegion = (
+            item: (typeof completionItems)[number],
+        ) => ({
+            bucket:
+                item.session.bucket ??
+                item.finalData.bucket ??
+                this.#resolveBucket(),
+            region:
+                item.session.bucketRegion ??
+                item.finalData.bucketRegion ??
+                this.#resolveBucketRegion(),
+        });
+        const headSizes = await Promise.all(
+            completionItems.map(async (item) => {
+                const { bucket, region } = reconcileBucketRegion(item);
+                try {
+                    return await this.stores.s3Object.headObjectSize(
+                        bucket,
+                        item.session.objectKey,
+                        region,
+                    );
+                } catch {
+                    return null;
+                }
+            }),
+        );
+        // Record the true sizes only — do not re-assert the quota here. See
+        // completeUrlWrite: the bytes are already in S3 so a completion-time
+        // reject can't reclaim them, and per-item deletes would destroy the
+        // bytes of correctly-declared, within-quota siblings in the batch.
+        // Recording real sizes keeps SUM(size) accurate so the next
+        // signed-write start-check blocks an over-quota user.
+        for (let index = 0; index < completionItems.length; index++) {
+            const item = completionItems[index];
+            const trueSize = headSizes[index];
+            if (typeof trueSize !== 'number' || trueSize < 0) continue;
+            item.finalData.size = trueSize;
         }
 
         const completedEntries =
@@ -2705,10 +2833,25 @@ export class FSService extends PuterService {
                 { legacyCode: 'shortcut_target_not_found' },
             );
         }
-        // Derive the S3 object key from entry metadata if present, else fall
-        // back to the uuid convention used elsewhere (objectKey defaults to
-        // uuid during write when no metadata override is set).
-        const objectKey = this.#deriveObjectKeyFromEntry(entry);
+        // Empty files (created via `touch`/`createNonFileEntry` with kind
+        // 'empty-file') have no backing S3 object — `bucket` is null. Reading
+        // one would throw NoSuchKey and, worse, trip #handleGhostFile, which
+        // deletes the entry as if it were an orphan. Return an empty stream
+        // instead. (A real file whose object is genuinely missing keeps a
+        // non-null bucket, so it still falls through to the ghost path below.)
+        if (hasNoBackingS3Object(entry)) {
+            return {
+                body: Readable.from([]),
+                contentLength: 0,
+                contentType: null,
+                contentRange: null,
+                etag: null,
+                lastModified: entry.modified
+                    ? new Date(entry.modified * 1000)
+                    : null,
+            };
+        }
+        const objectKey = entry.uuid;
         try {
             return await this.stores.s3Object.getObjectStream(
                 {
@@ -2756,27 +2899,6 @@ export class FSService extends PuterService {
                 cleanupErr,
             );
         }
-    }
-
-    // Objects written by fsv2 use the pending-session's objectKey, which is
-    // persisted in FSEntry.metadata JSON under `objectKey`. Falls back to the
-    // entry uuid for entries that didn't record it (older data).
-    #deriveObjectKeyFromEntry(entry: FSEntry): string {
-        if (entry.metadata) {
-            try {
-                const parsed = JSON.parse(entry.metadata);
-                if (
-                    parsed &&
-                    typeof parsed.objectKey === 'string' &&
-                    parsed.objectKey.length > 0
-                ) {
-                    return parsed.objectKey;
-                }
-            } catch {
-                // Not JSON — fall through.
-            }
-        }
-        return entry.uuid;
     }
 
     // -- Mutation: mkdir / touch / rename / mkshortcut ---------
@@ -2866,10 +2988,13 @@ export class FSService extends PuterService {
         const existing = await this.stores.fsEntry.getEntryByPath(targetPath);
         if (existing) {
             if (existing.isDir) {
-                // A directory already exists at path: idempotent success.
-                return existing;
-            }
-            if (input.overwrite) {
+                if (input.dedupeName) {
+                    name = await this.#findDedupedName(parent, name);
+                } else {
+                    // A directory already exists at path: idempotent success.
+                    return existing;
+                }
+            } else if (input.overwrite) {
                 // Remove the non-directory occupant then create the dir.
                 await this.remove(userId, {
                     entry: existing,
@@ -2996,7 +3121,7 @@ export class FSService extends PuterService {
                 legacyCode: 'conflict',
             });
         }
-        // todo@byron op in s3
+
         const updated = await this.stores.fsEntry.updateEntry(entry.uuid, {
             name: newName,
             path: newPath,
@@ -3126,7 +3251,7 @@ export class FSService extends PuterService {
             try {
                 await this.stores.s3Object.deleteObject(
                     entry.bucket,
-                    this.#deriveObjectKeyFromEntry(entry),
+                    entry.uuid,
                     entry.bucketRegion,
                 );
             } catch {
@@ -3220,7 +3345,7 @@ export class FSService extends PuterService {
                 region: child.bucketRegion,
                 keys: [],
             };
-            group.keys.push(this.#deriveObjectKeyFromEntry(child));
+            group.keys.push(child.uuid);
             grouped.set(groupKey, group);
             // Fire individual removal events so thumbnail extension can clean up.
             this.#emitRemoveEvent(child);
@@ -3360,14 +3485,13 @@ export class FSService extends PuterService {
                 ? `/${name}`
                 : `${destinationParent.path}/${name}`;
 
-        // `metadata` column is a TEXT field; serialize when the caller sends
-        // an object, pass-through a bare string, and `null` clears it.
-        // `undefined` leaves the column untouched.
         let metadataPatch: string | null | undefined;
         if (input.newMetadata === null) metadataPatch = null;
-        else if (typeof input.newMetadata === 'object')
-            metadataPatch = JSON.stringify(input.newMetadata);
-        // todo@byron move in s3
+        else if (input.newMetadata && typeof input.newMetadata === 'object')
+            metadataPatch = JSON.stringify(
+                this.#stripReservedMetadataKeys(input.newMetadata),
+            );
+
         const updated = await this.stores.fsEntry.updateEntry(source.uuid, {
             name,
             path: finalPath,
@@ -3567,38 +3691,67 @@ export class FSService extends PuterService {
             });
         }
 
-        // Regular file: duplicate the S3 object under a new key (the new
-        // entry's uuid), then insert the DB row pointing at it.        
-        // modify@byron
-        //- const newUuid = uuidv4();        
-        const newObjectKey = genObjectKey(_newPath); // = newUuid;
-        const sourceObjectKey = this.#deriveObjectKeyFromEntry(source);
+        // Empty files (created via `touch`/`createNonFileEntry` with kind
+        // 'empty-file') have no backing S3 object — `bucket` is null and there
+        // is nothing to CopyObject. Issuing one would throw NoSuchKey, so clone
+        // the source as another empty-file entry instead of touching S3.
+        if (hasNoBackingS3Object(source)) {
+            return this.stores.fsEntry.createNonFileEntry({
+                userId,
+                parent: destinationParent,
+                name: newName,
+                kind: 'empty-file',
+                metadata: source.metadata,
+                thumbnail: source.thumbnail,
+                associatedAppId: source.associatedAppId,
+                isPublic: source.isPublic,
+                immutable: source.immutable,
+            });
+        }
+
+        // - const newUuid = uuidv4();
+        const newUuid = genObjectKey(_newPath); // = newUuid;
+        const sourceObjectKey = source.uuid;
         const resolvedBucket = this.stores.s3Object.resolveBucket(
             source.bucket,
         );
-        await this.stores.s3Object.copyObject(
-            {
-                sourceBucket: resolvedBucket,
-                sourceKey: sourceObjectKey,
-                destinationBucket: resolvedBucket,
-                destinationKey: newObjectKey,
-            },
-            this.stores.s3Object.resolveRegion(source.bucketRegion),
-        );
+        // A ghost file — DB row present with a non-null bucket but its backing
+        // S3 object gone — would make CopyObject throw NoSuchKey and bubble up
+        // as a 500. Mirror `readContent`: clean up the orphan and surface a
+        // 404 instead. (`hasNoBackingS3Object` above only covers legitimately
+        // empty files, which keep a null bucket.)
+        try {
+            await this.stores.s3Object.copyObject(
+                {
+                    sourceBucket: resolvedBucket,
+                    sourceKey: sourceObjectKey,
+                    destinationBucket: resolvedBucket,
+                    destinationKey: newUuid,
+                },
+                this.stores.s3Object.resolveRegion(source.bucketRegion),
+            );
+        } catch (err) {
+            if (isNoSuchKeyError(err)) {
+                await this.#handleGhostFile(source, sourceObjectKey);
+                throw new HttpError(404, 'File contents are missing', {
+                    legacyCode: 'subject_does_not_exist',
+                    cause: err,
+                    fields: {
+                        path: source.path,
+                        uid: source.uuid,
+                    },
+                });
+            }
+            throw err;
+        }
 
-        // Re-serialize metadata, swapping in the new objectKey.
-        const nextMetadata = this.#metadataWithObjectKey(
-            source.metadata,
-            newObjectKey,
-        );
+        const nextMetadata = this.#sanitizeClientMetadata(source.metadata);
 
-        // Insert as a file row. We reuse the files INSERT path (batchCreateEntries)
-        // since it handles bucket/metadata correctly. A single-row call is fine.
         const [created] = await this.stores.fsEntry.batchCreateEntries(
             [
                 {
                     userId,
-                    uuid: newObjectKey,
+                    uuid: newUuid,
                     path:
                         destinationParent.path === '/'
                             ? `/${newName}`
@@ -3629,7 +3782,7 @@ export class FSService extends PuterService {
                     source,
                     copy: created,
                     sourceObjectKey,
-                    copyObjectKey: newObjectKey,
+                    copyObjectKey: newUuid,
                 },
                 {},
             );
@@ -3637,27 +3790,6 @@ export class FSService extends PuterService {
             // ignore — non-critical.
         }
         return created;
-    }
-
-    // Preserves existing metadata JSON fields, overriding only objectKey.
-    #metadataWithObjectKey(metadata: string | null, objectKey: string): string {
-        let parsed: Record<string, unknown> = {};
-        if (metadata) {
-            try {
-                const tentative = JSON.parse(metadata);
-                if (
-                    tentative &&
-                    typeof tentative === 'object' &&
-                    !Array.isArray(tentative)
-                ) {
-                    parsed = tentative as Record<string, unknown>;
-                }
-            } catch {
-                // Non-JSON legacy metadata — drop and replace.
-            }
-        }
-        parsed.objectKey = objectKey;
-        return JSON.stringify(parsed);
     }
 
     /**

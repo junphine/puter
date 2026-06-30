@@ -30,6 +30,7 @@ import type { LayerInstances } from '../../types';
 import { sessionCookieFlags } from '../../util/cookieFlags.js';
 import type { puterServices } from '../index';
 import { PuterService } from '../types';
+import { FULL_API_ACCESS } from '../permission/consts';
 import { V1TokensDisabledError } from './TokenService';
 import type {
     AccessTokenPayload,
@@ -49,6 +50,13 @@ export interface AuthResult {
     actor?: Actor;
     reauth?: { reason: ReauthReason; auth_id?: string };
     invalid?: true;
+    /**
+     * The token authenticated, but its app is on the origin blocklist. The
+     * auth probe surfaces this as `req.appBlocked`; gates translate it to a
+     * 403 `app_blocked`. Distinct from `invalid` so the client sees a clear
+     * "app blocked" error rather than a generic auth failure.
+     */
+    blocked?: { reason?: string };
 }
 
 /**
@@ -357,6 +365,7 @@ export class AuthService extends PuterService {
                 legacyCode: 'bad_request',
             });
         }
+        this.#assertAppDelegationAllowed(actor, appUid);
         const auth_id = this.#authIdFor(actor.user as UserRow);
         const session = await this.stores.session.getOrCreateWorker(
             actor.user.id,
@@ -382,6 +391,22 @@ export class AuthService extends PuterService {
 
     #authIdFor(user: UserRow): string {
         return user.uuid;
+    }
+
+    /**
+     * Scope app token delegation by actor kind. An app-under-user or
+     * access-token actor is bound to a single app and may only mint a token
+     * for that same app; only a root user session may request a token for an
+     * arbitrary app (the GUI's app-launch delegation).
+     */
+    #assertAppDelegationAllowed(actor: Actor, appUid: string): void {
+        if ((actor.app || actor.accessToken) && actor.app?.uid !== appUid) {
+            throw new HttpError(
+                403,
+                'Actor cannot mint a token for another app',
+                { legacyCode: 'forbidden' },
+            );
+        }
     }
 
     /**
@@ -588,6 +613,24 @@ export class AuthService extends PuterService {
         const rows = await this.stores.session.getByUserId(userId);
         for (const row of rows) {
             await this.stores.session.revokeCascade(row.uuid as string);
+        }
+    }
+
+    /**
+     * Password-reset cascade: revoke every interactive (web/app) session
+     * for the user, so a hijacked session doesn't outlive a password
+     * reset. No actor context — the recovery flow has no authenticated
+     * caller. Leaves workers and standalone access tokens alone: those
+     * are managed credentials rather than sign-ins, and a routine
+     * forgot-password reset shouldn't break deployments.
+     */
+    async revokeInteractiveSessionsForUserId(userId: number): Promise<void> {
+        if (!userId) return;
+        const rows = await this.stores.session.getByUserId(userId);
+        for (const row of rows) {
+            if (row.kind === 'web' || row.kind === 'app') {
+                await this.stores.session.revokeCascade(row.uuid as string);
+            }
         }
     }
 
@@ -855,6 +898,19 @@ export class AuthService extends PuterService {
         const event = { origin: aliased };
         await this.clients.event?.emitAndWait('app.from-origin', event, {});
 
+        // Blocked origins can't acquire an app token (or have one minted /
+        // checked / granted), so the app loses every path to Puter resources.
+        const block = await this.services.appOriginBlocklist.isOriginBlocked(
+            event.origin,
+        );
+        if (block.blocked) {
+            throw new HttpError(
+                403,
+                'This app is not allowed to access Puter resources',
+                { legacyCode: 'app_blocked' },
+            );
+        }
+
         const canonicalUid = await this.#findCanonicalAppUidForOrigin(
             event.origin,
         );
@@ -1057,6 +1113,7 @@ export class AuthService extends PuterService {
             throw new HttpError(403, 'Actor must be a user', {
                 legacyCode: 'forbidden',
             });
+        this.#assertAppDelegationAllowed(actor, appUid);
 
         // Request-context (IP / UA) isn't available on the Actor shape —
         // the app row's `last_ip` / `last_user_agent` start NULL and get
@@ -1423,7 +1480,7 @@ export class AuthService extends PuterService {
         // '30d'). `#hardExpiryFromExpiresIn` supports both, and existing
         // callers / tests pass the string form, so narrowing to `number`
         // here would force unsafe casts at every call site.
-        options: { expiresIn?: string | number } = {},
+        options: { expiresIn?: string | number; label?: string | null } = {},
     ): Promise<string> {
         if (!actor.user)
             throw new HttpError(403, 'Actor must be a user', {
@@ -1439,6 +1496,20 @@ export class AuthService extends PuterService {
             );
         }
 
+        // Full-API-access sentinel: a token that may do anything its issuing
+        // user can do via the API (resolved against the issuer at check time —
+        // see PermissionService.#scanAccessToken). Only a plain user actor may
+        // mint one; an app-under-user actor must not be able to escalate the
+        // scoped access it was granted into blanket account-wide access.
+        const wantsFullAccess = permissions.some(
+            ([p]) => p === FULL_API_ACCESS,
+        );
+        if (wantsFullAccess && actor.app) {
+            throw new HttpError(403, 'Apps may not mint full-access tokens', {
+                legacyCode: 'forbidden',
+            });
+        }
+
         // Permission-subset enforcement: an access token can only carry
         // permissions the issuer itself holds. Without this, an
         // app-under-user actor (third-party app authorized by the user)
@@ -1447,12 +1518,19 @@ export class AuthService extends PuterService {
         // returned verbatim at check-time, with no re-validation against
         // the authorizer. `checkMany` is one pipelined MGET against the
         // per-actor permission cache so the cost is small even for
-        // many-permission mints.
+        // many-permission mints. The full-access sentinel is excluded — it
+        // isn't a real permission the issuer "holds"; its gate is the
+        // user-actor check above.
         const requestedPerms = [
             ...new Set(
                 permissions
                     .map(([p]) => p)
-                    .filter((p): p is string => typeof p === 'string' && !!p),
+                    .filter(
+                        (p): p is string =>
+                            typeof p === 'string' &&
+                            !!p &&
+                            p !== FULL_API_ACCESS,
+                    ),
             ),
         ];
         if (requestedPerms.length > 0) {
@@ -1491,6 +1569,9 @@ export class AuthService extends PuterService {
             actor.user.id as number,
             {
                 kind: 'access_token',
+                // User-facing name shown (and editable) in the manage-sessions
+                // UI. Trimmed/clamped by the caller; null when unnamed.
+                label: options.label ?? null,
                 parent_session_id,
                 expires_at: expiresAt,
                 auth_id,
@@ -1512,6 +1593,14 @@ export class AuthService extends PuterService {
         if (actor.app) {
             jwtPayload.app_uid = actor.app.uid;
         }
+        // Full-access is carried as a signed claim (not a stored permission
+        // row): it's the single source of truth read at auth time into
+        // `actor.accessToken.fullAccess`, which both `requireNonAccessTokenGate`
+        // and the permission scan consult. The `actor.app` block above already
+        // rejected app-issued full-access mints.
+        if (wantsFullAccess) {
+            jwtPayload.full_access = true;
+        }
 
         // jsonwebtoken's SignOptions.expiresIn is typed as `number |
         // ${number}${unit}` (template literal), so a plain string can't
@@ -1521,7 +1610,11 @@ export class AuthService extends PuterService {
         const jwt = this.services.token.sign(
             'auth',
             jwtPayload,
-            options as { expiresIn?: number },
+            // Only `expiresIn` is a valid jsonwebtoken sign option; `label` is
+            // ours (stored on the session row above), so don't forward it.
+            options.expiresIn !== undefined
+                ? { expiresIn: options.expiresIn as number }
+                : {},
         );
 
         // Store each permission grant
@@ -1532,6 +1625,9 @@ export class AuthService extends PuterService {
         };
         for (const spec of permissions) {
             const [permission, extra] = spec;
+            // The full-access sentinel is not a real grant — it lives in the
+            // signed `full_access` claim, not `access_token_permissions`.
+            if (permission === FULL_API_ACCESS) continue;
             await (db.clients?.db ?? this.clients.db).write(
                 'INSERT INTO `access_token_permissions` (`token_uid`, `authorizer_user_id`, `authorizer_app_id`, `permission`, `extra`) VALUES (?, ?, ?, ?, ?)',
                 [
@@ -1633,6 +1729,16 @@ export class AuthService extends PuterService {
     #originFromUrl(url: string): string | null {
         try {
             const parsed = new URL(url);
+            // A real web origin is always http(s). `new URL()` happily parses
+            // `javascript:`, `data:`, `file:`, `vbscript:`, etc.; if one of
+            // those slips through it ends up persisted as an app `index_url`
+            // (see AppStore.createFromOrigin) and later loaded as `iframe.src`
+            // — an XSS/code-execution primitive. Reject anything that isn't
+            // http(s) so the bootstrap path matches AppDriver's validateUrl
+            // allow-list.
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+                return null;
+            }
             return `${parsed.protocol}//${parsed.hostname}${parsed.port ? `:${parsed.port}` : ''}`;
         } catch {
             return null;
@@ -1697,6 +1803,21 @@ export class AuthService extends PuterService {
 
         const app = await this.stores.app.getByUid(decoded.app_uid);
         if (!app) return { invalid: true };
+
+        // Reject already-issued app tokens whose app origin is now blocked, so
+        // a block takes effect immediately rather than waiting for token
+        // expiry. The app's `index_url` host is the same origin checked at
+        // token acquisition.
+        const indexUrl = (app as { index_url?: unknown }).index_url;
+        if (typeof indexUrl === 'string' && indexUrl) {
+            const block =
+                await this.services.appOriginBlocklist.isOriginBlocked(
+                    indexUrl,
+                );
+            if (block.blocked) {
+                return { blocked: { reason: block.reason } };
+            }
+        }
 
         let rawRow: SessionRow | null = null;
         if (decoded.session_uid) {
@@ -1808,6 +1929,12 @@ export class AuthService extends PuterService {
                     uid: decoded.token_uid,
                     issuer: authorizer,
                     authorized: null,
+                    // Honor the signed full-access claim only for user-issued
+                    // tokens. App-issued tokens (`app_uid` present) can never be
+                    // full-access — mirrors the mint-time block — so even a
+                    // claim on one is ignored here.
+                    fullAccess:
+                        !decoded.app_uid && decoded.full_access === true,
                 },
             },
         };
@@ -1827,6 +1954,11 @@ export class AuthService extends PuterService {
             email_confirmed: user.email_confirmed ?? false,
             requires_email_confirmation:
                 user.requires_email_confirmation ?? false,
+            phone: user.phone ?? null,
+            requires_phone_verification:
+                user.requires_phone_verification ?? false,
+            requires_card_verification:
+                user.requires_card_verification ?? false,
         };
     }
 

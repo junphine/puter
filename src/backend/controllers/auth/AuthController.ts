@@ -48,6 +48,7 @@ import {
 import { sessionCookieFlags } from '../../util/cookieFlags.js';
 import { cleanEmail, isBlockedEmail } from '../../util/email.js';
 import { generate_identifier } from '../../util/identifier.js';
+import { parsePhone } from '../../util/phone.js';
 import { getTaskbarItems } from '../../util/taskbarItems.js';
 import {
     generateDefaultFsentries,
@@ -57,6 +58,8 @@ import { PuterController } from '../types.js';
 
 const USERNAME_REGEX = /^\w{1,}$/;
 const USERNAME_MAX_LENGTH = 45;
+const FINGERPRINT_MAX_LENGTH = 128;
+const DISPATCH_ID_MAX_LENGTH = 128;
 const RESERVED_USERNAMES = new Set([
     'admin',
     'administrator',
@@ -99,7 +102,16 @@ export class AuthController extends PuterController {
 
     @Post('/login', {
         captcha: true,
-        rateLimit: { scope: 'login', limit: 10, window: 15 * 60_000 },
+        // Two limits: per-fingerprint keeps users behind a shared IP
+        // (offices, campuses) from throttling each other, while the
+        // coarser per-IP backstop stops an attacker from minting fresh
+        // fingerprint buckets by rotating client-controlled headers
+        // (User-Agent etc.). Same pattern on the other unauthenticated
+        // credential endpoints below.
+        rateLimit: [
+            { scope: 'login', limit: 10, window: 15 * 60_000 },
+            { scope: 'login-ip', limit: 50, window: 15 * 60_000, key: 'ip' },
+        ],
     })
     async handleLogin(req: Request, res: Response): Promise<void> {
         const { username, email, password } = req.body;
@@ -206,11 +218,15 @@ export class AuthController extends PuterController {
 
     @Post('/login/otp', {
         captcha: true,
-        rateLimit: {
-            scope: 'login-otp',
-            limit: 15,
-            window: 30 * 60_000,
-        },
+        rateLimit: [
+            { scope: 'login-otp', limit: 15, window: 30 * 60_000 },
+            {
+                scope: 'login-otp-ip',
+                limit: 60,
+                window: 30 * 60_000,
+                key: 'ip',
+            },
+        ],
     })
     async handleLoginOtp(req: Request, res: Response): Promise<void> {
         const { token, code } = req.body;
@@ -266,11 +282,15 @@ export class AuthController extends PuterController {
 
     @Post('/login/recovery-code', {
         captcha: true,
-        rateLimit: {
-            scope: 'login-recovery',
-            limit: 10,
-            window: 60 * 60_000,
-        },
+        rateLimit: [
+            { scope: 'login-recovery', limit: 10, window: 60 * 60_000 },
+            {
+                scope: 'login-recovery-ip',
+                limit: 40,
+                window: 60 * 60_000,
+                key: 'ip',
+            },
+        ],
     })
     async handleLoginRecoveryCode(req: Request, res: Response): Promise<void> {
         const { token, code } = req.body;
@@ -339,7 +359,10 @@ export class AuthController extends PuterController {
 
     @Post('/signup', {
         captcha: true,
-        rateLimit: { scope: 'signup', limit: 10, window: 15 * 60_000 },
+        rateLimit: [
+            { scope: 'signup', limit: 10, window: 15 * 60_000 },
+            { scope: 'signup-ip', limit: 50, window: 15 * 60_000, key: 'ip' },
+        ],
     })
     async handleSignup(req: Request, res: Response): Promise<void> {
         const body = req.body ?? {};
@@ -354,6 +377,26 @@ export class AuthController extends PuterController {
             res.json({});
             return;
         }
+
+        // Optional device signal (browser fingerprint hash). Core only enforces
+        // shape and forwards the value verbatim — signup-abuse policy built on it
+        // lives in extensions. Checked before the reauth short-circuit so a
+        // malformed value is rejected on every /signup path.
+        if (body.fingerprint !== undefined && body.fingerprint !== null) {
+            if (typeof body.fingerprint !== 'string')
+                throw new HttpError(400, 'fingerprint must be a string.', {
+                    legacyCode: 'bad_request',
+                });
+            if (body.fingerprint.length > FINGERPRINT_MAX_LENGTH)
+                throw new HttpError(
+                    400,
+                    `fingerprint cannot be longer than ${FINGERPRINT_MAX_LENGTH} characters.`,
+                    { legacyCode: 'bad_request' },
+                );
+        }
+        // Empty strings are treated as absent — a signal that wasn't
+        // collected, not a malformed request.
+        const fingerprint: string | null = body.fingerprint || null;
 
         // Temp-user reauth short-circuit: when an existing temp user is
         // forced through the reauth flow, the GUI re-submits /signup with
@@ -534,23 +577,44 @@ export class AuthController extends PuterController {
             allow: true,
             no_temp_user: false,
             requires_email_confirmation: false,
+            // Set by the abuse harness for low-reputation signups: the account is
+            // created + logged in but gated behind SMS phone verification (in
+            // addition to email confirmation) instead of being blocked.
+            requires_phone_verification: false,
+            // Same idea, one rung up the ladder: gate the account behind
+            // credit-card verification (a $0 auth handled by an extension).
+            requires_card_verification: false,
             message: null,
             code: null,
             user_agent: req?.headers?.['user-agent'] ?? null,
+            fingerprint,
+            // Populated by the abuse extension's v2 harness; persisted to the
+            // user row below so the signup-time reputation is referable later.
+            reputation: null as number | null,
+            // Stamped by the abuse harness for flagged signups — the id keying
+            // the `abuse:trail:<id>` decision trail (carrying both the live and
+            // shadow trails). Surfaced to a blocked user as the Request Code so
+            // the code they quote support leads straight to their trail.
+            trail_id: undefined as string | undefined,
         };
         try {
             await this.clients.event?.emitAndWait(
-                'puter.signup.validate' as never,
-                validateEvent as never,
+                'puter.signup.validate',
+                validateEvent,
                 {},
             );
         } catch (e) {
             console.warn('[signup] validate hook failed:', e);
         }
         if (!validateEvent.allow) {
+            // Pass the trail id back to a blocked user as the Request Code (when
+            // the harness stamped one), embedded in the message so the existing
+            // signup-block UI surfaces it without a GUI change.
+            const requestCode = validateEvent.trail_id;
             throw new HttpError(
                 403,
-                validateEvent.message ?? 'Signup blocked',
+                (validateEvent.message ?? 'Signup blocked') +
+                    (requestCode ? ` Request Code: ${requestCode}` : ''),
                 {
                     ...(validateEvent.code
                         ? { legacyCode: validateEvent.code as never }
@@ -572,6 +636,17 @@ export class AuthController extends PuterController {
         }
         const force_email_confirmation = Boolean(
             validateEvent.requires_email_confirmation,
+        );
+        const force_phone_verification =
+            Boolean(validateEvent.requires_phone_verification) ||
+            // Test/QA switch: force the SMS gate on every signup regardless of
+            // reputation (see config.always_require_phone_verification).
+            Boolean(this.config.always_require_phone_verification);
+        const force_card_verification = Boolean(
+            validateEvent.requires_card_verification ||
+            // Test/QA switch: force the card gate on every signup regardless of
+            // reputation (see config.always_require_card_verification).
+            this.config.always_require_card_verification,
         );
 
         // Prepare shared fields
@@ -597,11 +672,13 @@ export class AuthController extends PuterController {
                 email_confirm_code,
                 email_confirm_token,
                 email_confirmed: 0,
-                // Pseudo claims always require email confirmation — the
-                // validate hook can only tighten, not loosen, so `1`
-                // stays hardcoded here.
                 requires_email_confirmation: 1,
                 last_activity_ts: signupSqlTs,
+                ...(validateEvent.reputation != null
+                    ? { reputation: validateEvent.reputation }
+                    : {}),
+                requires_phone_verification: force_phone_verification ? 1 : 0,
+                requires_card_verification: force_card_verification ? 1 : 0,
             });
 
             // Move from temp group to regular user group
@@ -650,6 +727,7 @@ export class AuthController extends PuterController {
                     ip_fwd: proxyIpChain,
                     user_agent: req.headers?.['user-agent'],
                     origin: req.headers?.origin,
+                    fingerprint,
                 },
                 signup_ip: clientIp,
                 signup_ip_forwarded: proxyIpChain,
@@ -658,6 +736,11 @@ export class AuthController extends PuterController {
                 signup_server: (this.config as { serverId?: string }).serverId,
                 referrer: req.body.referrer ?? null,
                 last_activity_ts: signupSqlTs,
+                reputation: validateEvent.reputation,
+                // Phone collected later in the verification dialog (null now).
+                phone: null,
+                requires_phone_verification: force_phone_verification,
+                requires_card_verification: force_card_verification,
             } as never);
 
             // Add to default group
@@ -728,6 +811,11 @@ export class AuthController extends PuterController {
                     user_uuid: user!.uuid,
                     email: user!.email,
                     username: user!.username,
+                    fingerprint,
+                    // Reflects the row that was actually created/claimed —
+                    // a pseudo-user claim ends up with credentials, so it
+                    // reports false here. Same signal completeLogin uses.
+                    is_temp: user!.password === null && user!.email === null,
                     ip:
                         (req?.headers?.['x-forwarded-for'] as
                             | string
@@ -764,7 +852,7 @@ export class AuthController extends PuterController {
     // -- Logout ------------------------------------------------------
 
     @Post('/logout', {
-        requireAuth: true,
+        requireUserActor: true,
         allowUnconfirmed: true,
         antiCsrf: true,
     })
@@ -926,6 +1014,526 @@ export class AuthController extends PuterController {
         }
 
         res.json({ email_confirmed: true, original_client_socket_id });
+    }
+
+    // -- Phone verification (SMS via Prelude) ------------------------
+
+    @Post('/send-confirm-phone', {
+        subdomain: ['api', ''],
+        requireUserActor: true,
+        allowUnconfirmed: true,
+        rateLimit: {
+            scope: 'send-confirm-phone',
+            limit: 10,
+            window: 60 * 60_000,
+            key: 'user',
+        },
+    })
+    async handleSendConfirmPhone(req: Request, res: Response): Promise<void> {
+        const user = await this.stores.user.getById(req.actor!.user.id!, {
+            force: true,
+        });
+        if (!user)
+            throw new HttpError(404, 'User not found.', {
+                legacyCode: 'user_not_found' as never,
+            });
+        if (user.suspended)
+            throw new HttpError(403, 'Account suspended.', {
+                legacyCode: 'account_suspended',
+            });
+        if (!this.clients.prelude?.isConfigured())
+            throw new HttpError(503, 'Phone verification is unavailable.', {
+                legacyCode: 'service_unavailable' as never,
+            });
+
+        // Parse to E.164 (Prelude's required form + the stored form) and the
+        // country, so we can apply the per-country cost cap.
+        const parsed = parsePhone(
+            req.body?.phone,
+            this.clients.prelude.defaultCountry,
+        );
+        if (!parsed)
+            throw new HttpError(400, 'Invalid phone number.', {
+                legacyCode: 'bad_request',
+            });
+
+        // Optional Prelude dispatch id (browser signals gathered by the JS
+        // Signals SDK on the number-entry page). Shape-checked and forwarded
+        // verbatim to Prelude; an empty / oversized / non-string value is just
+        // dropped so a bad client signal never blocks a real verification.
+        const rawDispatchId = req.body?.dispatch_id;
+        const dispatchId =
+            typeof rawDispatchId === 'string' &&
+            rawDispatchId.length > 0 &&
+            rawDispatchId.length <= DISPATCH_ID_MAX_LENGTH
+                ? rawDispatchId
+                : undefined;
+
+        // Cost cap: skip countries with no SMS channel or rates above the cap
+        // (see PreludeClient / countries.ts). Avoids paying exorbitant per-SMS
+        // rates in low-revenue, high-fraud geographies.
+        if (!this.clients.prelude.isCountrySupported(parsed.country))
+            throw new HttpError(
+                400,
+                'Phone verification is not available for this country.',
+                { legacyCode: 'phone_country_not_supported' as never },
+            );
+
+        // Abuse caps live ENTIRELY in a listening abuse extension, consulted
+        // via `puter.phone-verification.check`. The backend ships no thresholds
+        // or detection of its own (so none of it is readable in the open-source
+        // repo): it forwards the user / number / ip, and the extension decides
+        // `allowed` plus an opaque `reason` (per-account + per-number send
+        // velocity, cross-account reuse, …). With no extension listening
+        // `allowed` stays true. Fail-open on a hook error — this is abuse/cost
+        // control, not a security boundary (the route rate limit and the country
+        // cost cap remain), so a flaky hook must not lock signups out.
+        const abuseCheck = {
+            user_id: user.id,
+            user_uid: user.uuid,
+            phone: parsed.e164,
+            device_fingerprint: req.deviceFingerprint ?? null,
+            allowed: true,
+            reason: null as string | null,
+        };
+        try {
+            await this.clients.event?.emitAndWait(
+                'puter.phone-verification.check',
+                abuseCheck,
+                {},
+            );
+        } catch (e) {
+            console.warn('[send-confirm-phone] abuse-check hook failed:', e);
+        }
+        // Forward the verdict verbatim: a generic 429 plus the opaque reason for
+        // the client to message on. The backend never interprets the reason —
+        // its meaning lives in the extension (which sets it) and the GUI (which
+        // displays it), so no abuse semantics leak into the OSS repo.
+        if (abuseCheck.allowed === false)
+            throw new HttpError(
+                429,
+                'Phone verification is unavailable for this number right now.',
+                {
+                    legacyCode: 'phone_verification_unavailable' as never,
+                    fields: abuseCheck.reason
+                        ? { reason: abuseCheck.reason }
+                        : {},
+                },
+            );
+
+        // Stage the parsed number as pending in KV (NOT on the user row) so a
+        // never-confirmed number is never written to the indexed `phone`
+        // column. /confirm-phone reads it back and persists it to the row only
+        // once Prelude confirms the code. ~1h TTL covers the code's lifetime.
+        // Stored before the send so we never dispatch an SMS we couldn't later
+        // confirm against.
+        const pendingPhoneKey = `phone-verify-pending:${user.id}`;
+        try {
+            await this.stores.kv.set({
+                key: pendingPhoneKey,
+                value: parsed.e164,
+                expireAt: Math.floor(Date.now() / 1000) + 60 * 60,
+            });
+        } catch (e) {
+            console.warn('[send-confirm-phone] pending-store failed:', e);
+            throw new HttpError(503, 'Could not start phone verification.', {
+                legacyCode: 'service_unavailable' as never,
+            });
+        }
+
+        const ip = req.ip || req.socket?.remoteAddress || undefined;
+        const userAgent =
+            typeof req.headers['user-agent'] === 'string'
+                ? req.headers['user-agent']
+                : undefined;
+        try {
+            const result = await this.clients.prelude.createVerification(
+                parsed.e164,
+                {
+                    ip,
+                    device_id: req.deviceFingerprint ?? undefined,
+                    user_agent: userAgent,
+                    dispatch_id: dispatchId,
+                },
+            );
+            // Prelude rejected the attempt as abusive — surface as rate-limit.
+            if (
+                result.status === 'blocked' ||
+                result.status === 'shadow_blocked'
+            ) {
+                throw new HttpError(
+                    429,
+                    'Phone verification is temporarily unavailable for this number.',
+                    { legacyCode: 'too_many_requests' as never },
+                );
+            }
+        } catch (e) {
+            if (e instanceof HttpError) throw e;
+            console.warn('[send-confirm-phone] createVerification failed:', e);
+            throw new HttpError(502, 'Could not send verification code.', {
+                legacyCode: 'upstream_error' as never,
+            });
+        }
+
+        // Tell the abuse extension a code was actually sent, so it can bump its
+        // send-velocity counters (per number + per account). Fire-and-forget;
+        // the backend keeps no send counts of its own. Only reached after a
+        // successful send, so an upstream error never burns quota.
+        try {
+            this.clients.event?.emit(
+                'puter.phone-verification.sent' as never,
+                {
+                    user_id: user.id,
+                    user_uid: user.uuid,
+                    phone: parsed.e164,
+                    device_fingerprint: req.deviceFingerprint ?? null,
+                } as never,
+                {},
+            );
+        } catch {
+            // ignore — best-effort velocity signal
+        }
+        res.json({});
+    }
+
+    @Post('/confirm-phone', {
+        subdomain: ['api', ''],
+        requireUserActor: true,
+        allowUnconfirmed: true,
+        rateLimit: {
+            scope: 'confirm-phone',
+            limit: 10,
+            window: 10 * 60_000,
+            key: 'user',
+        },
+    })
+    async handleConfirmPhone(req: Request, res: Response): Promise<void> {
+        const { code, original_client_socket_id } = req.body ?? {};
+        if (!code)
+            throw new HttpError(400, 'Missing `code`.', {
+                legacyCode: 'bad_request',
+            });
+
+        const user = await this.stores.user.getById(req.actor!.user.id!, {
+            force: true,
+        });
+        if (!user)
+            throw new HttpError(404, 'User not found.', {
+                legacyCode: 'not_found',
+            });
+        if (!user.requires_phone_verification) {
+            res.json({ phone_verified: true, original_client_socket_id });
+            return;
+        }
+        // The number being verified is the one staged at send time (KV
+        // pending), not the user row — we don't persist an unverified number.
+        // Fall back to a row value for accounts that already have one on file
+        // (legacy / a number persisted by a prior verified flow).
+        const pendingPhoneKey = `phone-verify-pending:${user.id}`;
+        let pendingPhone: string | null = null;
+        try {
+            const { res: staged } = await this.stores.kv.get({
+                key: pendingPhoneKey,
+            });
+            if (typeof staged === 'string' && staged) pendingPhone = staged;
+        } catch (e) {
+            console.warn('[confirm-phone] pending read failed:', e);
+        }
+        if (!pendingPhone) pendingPhone = user.phone ?? null;
+        if (!pendingPhone)
+            throw new HttpError(
+                400,
+                'No phone number on file. Request a code first.',
+                { legacyCode: 'bad_request' },
+            );
+        if (!this.clients.prelude?.isConfigured())
+            throw new HttpError(503, 'Phone verification is unavailable.', {
+                legacyCode: 'service_unavailable' as never,
+            });
+
+        let status;
+        try {
+            ({ status } = await this.clients.prelude.checkVerification(
+                pendingPhone,
+                String(code),
+            ));
+        } catch (e) {
+            console.warn('[confirm-phone] checkVerification failed:', e);
+            throw new HttpError(502, 'Could not verify code.', {
+                legacyCode: 'upstream_error' as never,
+            });
+        }
+
+        if (status !== 'success') {
+            res.json({ phone_verified: false, original_client_socket_id });
+            return;
+        }
+
+        // Verified — persist the number now (and only now) and clear the gate.
+        await this.stores.user.update(user.id, {
+            requires_phone_verification: 0,
+            phone: pendingPhone,
+        });
+
+        // Run the verified-event listeners synchronously (emitAndWait, not
+        // fire-and-forget emit) so a carrier-based card-verification waiver in
+        // the abuse extension lands BEFORE we broadcast "refresh" and respond —
+        // otherwise the client re-fetches and still sees the card gate. Load-
+        // bearing now; emitAndWait swallows listener errors, so this stays
+        // best-effort and never blocks confirm on a listener.
+        try {
+            await this.clients.event?.emitAndWait(
+                'user.phone-verified' as never,
+                {
+                    user_id: user.id,
+                    user_uid: user.uuid,
+                    phone: pendingPhone,
+                } as never,
+                {},
+            );
+        } catch {
+            // ignore — listeners are best-effort
+        }
+        // Notify other tabs/devices for this user so they refresh + drop the gate.
+        try {
+            await this.services.socket?.send(
+                { room: user.id },
+                'user.phone_verified',
+                { original_client_socket_id },
+            );
+        } catch {
+            // ignore — best-effort
+        }
+
+        res.json({ phone_verified: true, original_client_socket_id });
+    }
+
+    // -- Card verification ($0 auth via a payments extension) --------
+
+    /**
+     * Start card verification for the calling user. Pure mechanism: the
+     * endpoint emits `puter.card-verification.setup` and a payments
+     * extension fills in the client credentials — the OSS backend holds
+     * no provider knowledge or config. Phone verification (when required)
+     * must be completed first; the ordering is enforced here so a client
+     * can't skip the cheaper gate.
+     */
+    @Post('/card-verification/setup', {
+        subdomain: ['api', ''],
+        requireUserActor: true,
+        allowUnconfirmed: true,
+        rateLimit: {
+            scope: 'card-verification-setup',
+            limit: 5,
+            window: 60 * 60_000,
+            key: 'user',
+        },
+    })
+    async handleCardVerificationSetup(
+        req: Request,
+        res: Response,
+    ): Promise<void> {
+        const user = await this.stores.user.getById(req.actor!.user.id!, {
+            force: true,
+        });
+        if (!user)
+            throw new HttpError(404, 'User not found.', {
+                legacyCode: 'user_not_found' as never,
+            });
+        if (user.suspended)
+            throw new HttpError(403, 'Account suspended.', {
+                legacyCode: 'account_suspended',
+            });
+        if (!user.requires_card_verification) {
+            res.json({ card_verified: true });
+            return;
+        }
+        if (user.requires_phone_verification)
+            throw new HttpError(
+                409,
+                'Phone verification must be completed first.',
+                { legacyCode: 'conflict' },
+            );
+
+        // `enabled` stays null when no extension is listening; an installed
+        // extension always sets it (true/false) before doing any work.
+        const setupEvent = {
+            user_id: user.id,
+            user_uid: user.uuid,
+            ip: (req.ip || req.socket?.remoteAddress || null) as string | null,
+            device_fingerprint: req.deviceFingerprint ?? null,
+            enabled: null as boolean | null,
+            allowed: true,
+            reason: null as string | null,
+            client_secret: null as string | null,
+            publishable_key: null as string | null,
+        };
+        try {
+            await this.clients.event?.emitAndWait(
+                'puter.card-verification.setup',
+                setupEvent,
+                {},
+            );
+        } catch (e) {
+            console.warn('[card-verification/setup] setup hook failed:', e);
+        }
+
+        // Abuse veto (e.g. per-device setup-velocity cap): the extension refused
+        // before any Stripe work. Forward the opaque reason verbatim as a 429,
+        // same as the phone gate — the backend never interprets it.
+        if (setupEvent.allowed === false)
+            throw new HttpError(
+                429,
+                'Card verification is unavailable right now.',
+                {
+                    legacyCode: 'too_many_requests' as never,
+                    fields: setupEvent.reason
+                        ? { reason: setupEvent.reason }
+                        : {},
+                },
+            );
+
+        // Kill switch: the extension reports the feature disabled — unstick
+        // any user still carrying the flag instead of dead-ending them.
+        if (setupEvent.enabled === false) {
+            await this.stores.user.update(user.id, {
+                requires_card_verification: 0,
+            });
+            res.json({ card_verified: true, disabled: true });
+            return;
+        }
+        if (!setupEvent.client_secret || !setupEvent.publishable_key)
+            throw new HttpError(503, 'Card verification is not available.', {
+                legacyCode: 'service_unavailable' as never,
+            });
+
+        res.json({
+            client_secret: setupEvent.client_secret,
+            publishable_key: setupEvent.publishable_key,
+        });
+    }
+
+    /**
+     * Complete card verification. The client confirms the setup intent with
+     * the payment provider directly, then posts the resulting id here; the
+     * payments extension checks it (and applies its own abuse limits) via
+     * `puter.card-verification.confirm`. On success the gate clears exactly
+     * like `/confirm-phone` clears the phone gate.
+     */
+    @Post('/card-verification/confirm', {
+        subdomain: ['api', ''],
+        requireUserActor: true,
+        allowUnconfirmed: true,
+        rateLimit: {
+            scope: 'card-verification-confirm',
+            limit: 10,
+            window: 10 * 60_000,
+            key: 'user',
+        },
+    })
+    async handleCardVerificationConfirm(
+        req: Request,
+        res: Response,
+    ): Promise<void> {
+        const { setup_intent_id, original_client_socket_id } = req.body ?? {};
+        if (
+            typeof setup_intent_id !== 'string' ||
+            setup_intent_id.length === 0 ||
+            setup_intent_id.length > 255
+        )
+            throw new HttpError(400, 'Invalid `setup_intent_id`.', {
+                legacyCode: 'bad_request',
+            });
+
+        const user = await this.stores.user.getById(req.actor!.user.id!, {
+            force: true,
+        });
+        if (!user)
+            throw new HttpError(404, 'User not found.', {
+                legacyCode: 'not_found',
+            });
+        if (!user.requires_card_verification) {
+            res.json({ card_verified: true });
+            return;
+        }
+        if (user.requires_phone_verification)
+            throw new HttpError(
+                409,
+                'Phone verification must be completed first.',
+                { legacyCode: 'conflict' },
+            );
+
+        const confirmEvent = {
+            user_id: user.id,
+            user_uid: user.uuid,
+            setup_intent_id,
+            enabled: null as boolean | null,
+            verified: false,
+            reason: null as string | null,
+            fingerprint: null as string | null,
+            funding: null as string | null,
+            country: null as string | null,
+        };
+        try {
+            await this.clients.event?.emitAndWait(
+                'puter.card-verification.confirm',
+                confirmEvent,
+                {},
+            );
+        } catch (e) {
+            console.warn('[card-verification/confirm] confirm hook failed:', e);
+        }
+
+        // Kill switch — same semantics as /card-verification/setup.
+        if (confirmEvent.enabled === false) {
+            await this.stores.user.update(user.id, {
+                requires_card_verification: 0,
+            });
+            res.json({ card_verified: true, disabled: true });
+            return;
+        }
+        // No extension listening — nothing could have verified anything.
+        if (confirmEvent.enabled === null)
+            throw new HttpError(503, 'Card verification is not available.', {
+                legacyCode: 'service_unavailable' as never,
+            });
+
+        if (confirmEvent.verified !== true) {
+            res.json({ card_verified: false, reason: confirmEvent.reason });
+            return;
+        }
+
+        await this.stores.user.update(user.id, {
+            requires_card_verification: 0,
+        });
+
+        try {
+            this.clients.event?.emit(
+                'user.card-verified' as never,
+                {
+                    user_id: user.id,
+                    user_uid: user.uuid,
+                    fingerprint: confirmEvent.fingerprint,
+                    funding: confirmEvent.funding,
+                    country: confirmEvent.country,
+                } as never,
+                {},
+            );
+        } catch {
+            // ignore — event is a side-channel signal, not load-bearing
+        }
+        // Notify other tabs/devices for this user so they refresh + drop the gate.
+        try {
+            await this.services.socket?.send(
+                { room: user.id },
+                'user.card_verified',
+                { original_client_socket_id },
+            );
+        } catch {
+            // ignore — best-effort
+        }
+
+        res.json({ card_verified: true });
     }
 
     // -- Password recovery -------------------------------------------
@@ -1129,6 +1737,12 @@ export class AuthController extends PuterController {
         }
         await this.stores.user.invalidateById(user.id);
 
+        // A password reset is the "I think someone else has access" flow —
+        // evict every interactive session so a hijacked one doesn't survive.
+        await this.services.auth.revokeInteractiveSessionsForUserId(
+            user.id as number,
+        );
+
         res.send('Password successfully updated.');
     }
 
@@ -1164,6 +1778,10 @@ export class AuthController extends PuterController {
             pass_recovery_token: null,
             change_email_confirm_token: null,
         });
+
+        // Sign out every other web session (cascading to their derived
+        // rows); only the session that changed the password survives.
+        await this.services.auth.revokeAllSessions(req.actor!);
 
         if (this.clients.email && user.email) {
             try {
@@ -1414,6 +2032,8 @@ export class AuthController extends PuterController {
             requires_email_confirmation: 0,
         });
 
+        await this.stores.oidc.unlinkAllByUserId(user.id);
+
         try {
             this.clients.event?.emit(
                 'user.email-changed' as never,
@@ -1634,7 +2254,9 @@ export class AuthController extends PuterController {
     // -- Anti-CSRF token generation ----------------------------------
 
     @Get('/get-anticsrf-token', {
-        requireAuth: true,
+        // Anti-CSRF tokens are only consumed by `requireUserActor` routes,
+        // so issuance is scoped to the same actor kind for consistency.
+        requireUserActor: true,
         allowUnconfirmed: true,
     })
     async handleGetAntiCsrfToken(req: Request, res: Response): Promise<void> {
@@ -2138,12 +2760,15 @@ export class AuthController extends PuterController {
     // -- Access tokens -----------------------------------------------
 
     async handleMigrateToken(req: Request, res: Response): Promise<void> {
-        // 1. Origin lock. Reject anything that isn't same-origin to
-        // `config.origin` or in the explicit per-deployment allowlist.
-        // No Origin header → reject (this endpoint is browser-only by
-        // design; server-side callers should re-auth properly).
+        // 1. Browser-only gate. No Origin header → reject (server-side
+        // callers should re-auth properly). The exchange itself is open
+        // to any browser origin: puter.js apps live on arbitrary
+        // third-party domains, the v1 bearer token is the credential,
+        // and cookies are never read here — so a hostile page learns
+        // nothing it doesn't already hold. Origin *trust* only decides
+        // whether the `puter_token_v2` companion cookie is set below.
         const reqOrigin = req.headers.origin;
-        if (!reqOrigin || !this.#isMigrateTokenOriginAllowed(reqOrigin)) {
+        if (!reqOrigin) {
             throw new HttpError(403, 'Origin not allowed', {
                 legacyCode: 'forbidden',
             });
@@ -2173,12 +2798,19 @@ export class AuthController extends PuterController {
                     : undefined,
         });
         // `puter_token_v2` is the cookie companion to v2 app tokens —
-        // the app runs in-browser (we already gated on Origin above) so
-        // the GUI's cookie-only middleware can authenticate subsequent
-        // calls from the same iframe without the client having to
-        // forward Authorization headers. Access tokens are programmatic
-        // (no browser cookie surface) so we deliberately skip them here.
-        if (result.kind === 'app') {
+        // it lets the GUI's cookie-only middleware authenticate
+        // subsequent same-origin calls without the client forwarding
+        // Authorization headers. Issuing it is gated on the trusted
+        // origin allowlist: an arbitrary attacker page must not be able
+        // to plant a session cookie on the GUI origin (login CSRF).
+        // Untrusted origins still get the token in the JSON body — the
+        // cookie is only consumed same-origin (see authProbe) so they
+        // lose nothing. Access tokens are programmatic (no browser
+        // cookie surface) so we deliberately skip them here.
+        if (
+            result.kind === 'app' &&
+            this.#isMigrateTokenOriginAllowed(reqOrigin)
+        ) {
             res.cookie('puter_token_v2', result.token, {
                 ...sessionCookieFlags(this.config),
                 httpOnly: true,
@@ -2210,11 +2842,23 @@ export class AuthController extends PuterController {
         requireAuth: true,
     })
     async handleCreateAccessToken(req: Request, res: Response): Promise<void> {
-        const { permissions, expiresIn } = req.body;
+        const { permissions, expiresIn, label } = req.body;
         if (!Array.isArray(permissions) || permissions.length === 0) {
             throw new HttpError(400, 'Missing or empty `permissions` array', {
                 legacyCode: 'bad_request',
             });
+        }
+
+        // Optional user-facing name for the manage-sessions UI. Trim and clamp
+        // to the same 64-char limit the rename endpoint enforces.
+        let normalizedLabel: string | null = null;
+        if (label !== undefined && label !== null) {
+            if (typeof label !== 'string') {
+                throw new HttpError(400, '`label` must be a string', {
+                    legacyCode: 'bad_request',
+                });
+            }
+            normalizedLabel = label.trim().slice(0, 64) || null;
         }
 
         // Normalize specs: string → [string], [string] → [string, {}], [string, extra] → as-is
@@ -2231,7 +2875,10 @@ export class AuthController extends PuterController {
         const token = await this.services.auth.createAccessToken(
             req.actor!,
             normalized as never,
-            expiresIn ? { expiresIn } : {},
+            {
+                ...(expiresIn ? { expiresIn } : {}),
+                ...(normalizedLabel ? { label: normalizedLabel } : {}),
+            },
         );
         res.json({ token });
     }
@@ -2468,6 +3115,9 @@ export class AuthController extends PuterController {
             });
 
         await this.stores.group.addUsers(uid, users);
+        // New members inherit the group's permissions immediately, not
+        // after the permission-cache TTL.
+        await this.services.permission.bumpPermissionCacheForUsernames(users);
         res.json({});
     }
 
@@ -2497,6 +3147,9 @@ export class AuthController extends PuterController {
             });
 
         await this.stores.group.removeUsers(uid, users);
+        // Removed members must lose the group's permissions immediately,
+        // not after the permission-cache TTL.
+        await this.services.permission.bumpPermissionCacheForUsernames(users);
         res.json({});
     }
 
@@ -2789,7 +3442,6 @@ export class AuthController extends PuterController {
         router.post(
             '/auth/migrate-token',
             {
-                subdomain: 'api',
                 rateLimit: {
                     scope: 'migrate-token',
                     limit: 20,
@@ -2804,6 +3456,22 @@ export class AuthController extends PuterController {
     // -- Private helpers ----------------------------------------------
 
     async #cascadeDeleteUser(userId: number): Promise<void> {
+        // Capture the identifiers downstream teardown needs before the row is
+        // gone — the marketplace extension cancels the user's Stripe
+        // subscriptions off `user.delete`, keyed by uuid / customer id.
+        let userUuid: string | undefined;
+        let stripeCustomerId: string | null = null;
+        try {
+            const rows = (await this.clients.db.read(
+                'SELECT `uuid`, `stripe_customer_id` FROM `user` WHERE `id` = ?',
+                [userId],
+            )) as Array<{ uuid?: string; stripe_customer_id?: string | null }>;
+            userUuid = rows[0]?.uuid;
+            stripeCustomerId = rows[0]?.stripe_customer_id ?? null;
+        } catch (e) {
+            console.warn('[cascade-delete-user] identifier lookup failed:', e);
+        }
+
         try {
             await this.services.fs.removeAllForUser(userId);
         } catch (e) {
@@ -2821,6 +3489,24 @@ export class AuthController extends PuterController {
             userId,
         ]);
         await this.stores.user.invalidateById(userId);
+
+        // Fire-and-forget: let listeners purge external state tied to the
+        // account (Stripe subscriptions are cancelled immediately, without
+        // proration). Emitted after the row delete — listeners key off the
+        // payload, not the DB row.
+        try {
+            this.clients.event?.emit(
+                'user.delete',
+                {
+                    user_id: userId,
+                    user_uuid: userUuid,
+                    stripe_customer_id: stripeCustomerId,
+                },
+                {},
+            );
+        } catch {
+            // ignore — event emission shouldn't block deletion
+        }
     }
 
     async #generateRandomUsername(): Promise<string> {
@@ -2980,6 +3666,9 @@ export class AuthController extends PuterController {
             password?: string | null;
             email_confirmed?: number | boolean;
             requires_email_confirmation?: number | boolean;
+            phone?: string | null;
+            requires_phone_verification?: number | boolean;
+            requires_card_verification?: number | boolean;
         },
     ): Promise<void> {
         const meta = {
@@ -3028,6 +3717,9 @@ export class AuthController extends PuterController {
                 email: user.email,
                 email_confirmed: user.email_confirmed,
                 requires_email_confirmation: user.requires_email_confirmation,
+                phone: user.phone,
+                requires_phone_verification: user.requires_phone_verification,
+                requires_card_verification: user.requires_card_verification,
                 is_temp: user.password === null && user.email === null,
                 taskbar_items,
             },

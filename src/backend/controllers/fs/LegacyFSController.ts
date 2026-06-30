@@ -29,6 +29,7 @@ import type { PuterRouter } from '../../core/http/PuterRouter.js';
 import type { ACLService } from '../../services/acl/ACLService.js';
 import type { SignedFile } from '../../util/fileSigning.js';
 import { verifySignature } from '../../util/fileSigning.js';
+import { applyInlineContentSecurity } from '../../util/inlineContentSecurity.js';
 import { PuterController } from '../types.js';
 import { FS_COSTS } from './costs.js';
 import {
@@ -44,14 +45,6 @@ import {
     toLegacyEntry,
 } from './legacyFsHelpers.js';
 import { RouteOptions } from '../../core/http/index.js';
-
-/**
- * Legacy FS routes, implemented as thin shims over `FSService`.
- *
- * Each shim parses the request shape (FSNodeParam-style `{ path, uid, id }`
- * or `{ parent, name }`), invokes the service method, and returns the
- * snake_case response clients expect.
- */
 
 type RouterCache = Map<string, RequestHandler | null>;
 
@@ -146,6 +139,11 @@ export class LegacyFSController extends PuterController {
             {
                 subdomain: ['api', ''],
                 requireUserActor: true,
+                // The user's own credential may download their files; apps and
+                // scoped tokens stay blocked. antiCsrf still protects the
+                // cookie-authed GUI path — a bearer-token PAT is exempt below
+                // (CSRF can't forge a header-credentialed request).
+                allowFullAccessToken: true,
                 requireVerified: true,
                 antiCsrf: true,
             },
@@ -427,17 +425,33 @@ export class LegacyFSController extends PuterController {
         const normalizedTarget = targetPath.startsWith('/')
             ? targetPath
             : `/${targetPath}`;
+        const dedupeName =
+            getBoolean(body, 'dedupe_name', 'change_name') ?? false;
         await assertCanCreate(
             this.services.acl,
             this.services.fs,
             actor,
             normalizedTarget,
         );
+        if (dedupeName) {
+            const existing =
+                await this.stores.fsEntry.getEntryByPath(normalizedTarget);
+            if (existing) {
+                const parent = pathPosix.dirname(normalizedTarget);
+                await assertAccess(
+                    this.services.acl,
+                    this.services.fs,
+                    actor,
+                    parent === '/' ? normalizedTarget : parent,
+                    'write',
+                );
+            }
+        }
 
         const entry = await this.services.fs.mkdir(userId, {
             path: targetPath,
             overwrite: getBoolean(body, 'overwrite') ?? false,
-            dedupeName: getBoolean(body, 'dedupe_name', 'change_name') ?? false,
+            dedupeName,
             createMissingParents:
                 getBoolean(
                     body,
@@ -1336,8 +1350,15 @@ export class LegacyFSController extends PuterController {
             query.download === '1' ||
             query.download === true;
 
-        if (download.contentType)
+        if (download.contentType) {
             res.setHeader('Content-Type', download.contentType);
+            // Uploader-controlled type served inline on the file origin —
+            // sandbox active-document types so an uploaded HTML/SVG can't
+            // execute scripts here. Mirrors FSController /fs/read.
+            if (!wantsAttachment) {
+                applyInlineContentSecurity(res, download.contentType);
+            }
+        }
         if (download.contentLength !== null)
             res.setHeader('Content-Length', String(download.contentLength));
         if (download.contentRange)
@@ -1601,17 +1622,6 @@ export class LegacyFSController extends PuterController {
         });
         download.body.pipe(res);
     };
-
-    // Helpers for writeFile
-    // -- GUI event emission -------------------------------------------
-    //
-    // Fire-and-forget `outer.gui.item.*` events so SocketService,
-    // BroadcastService, WorkerDriver (hot-reload), and cache-invalidation
-    // listeners pick up mutations made through the legacy (bare-path) routes.
-    // FSController (v2-native /fs/* routes) emits these from its own handlers;
-    // LegacyFSController delegates to the same FSService but needs its
-    // own emissions because the service layer deliberately doesn't emit GUI
-    // events (that's a controller concern).
 
     async #emitGuiEvent(
         eventName:
@@ -2186,120 +2196,6 @@ export class LegacyFSController extends PuterController {
     }
 
     // -- Helpers ---------------------------------------------------------
-
-    #parsePositiveIntegerQuery(
-        query: Record<string, unknown>,
-        key: string,
-        message: string,
-    ): number | undefined {
-        const value = query[key];
-        if (value === undefined || value === null || value === '') {
-            return undefined;
-        }
-        const parsed = Number.parseInt(String(value), 10);
-        if (!Number.isInteger(parsed) || parsed < 1) {
-            throw new HttpError(400, message, { legacyCode: 'bad_request' });
-        }
-        return parsed;
-    }
-
-    #parseNonNegativeIntegerQuery(
-        query: Record<string, unknown>,
-        key: string,
-        message: string,
-    ): number | undefined {
-        const value = query[key];
-        if (value === undefined || value === null || value === '') {
-            return undefined;
-        }
-        const parsed = Number.parseInt(String(value), 10);
-        if (!Number.isInteger(parsed) || parsed < 0) {
-            throw new HttpError(400, message, { legacyCode: 'bad_request' });
-        }
-        return parsed;
-    }
-
-    #normalizeRangeHeader(rangeHeader: string): string | undefined {
-        const firstRange = rangeHeader.includes(',')
-            ? rangeHeader.split(',')[0]?.trim()
-            : rangeHeader.trim();
-        if (!firstRange) return undefined;
-
-        const matches = firstRange.match(/^bytes=(\d+)-(\d*)$/);
-        if (!matches) return undefined;
-
-        const [, start, end] = matches;
-        return end ? `bytes=${start}-${end}` : `bytes=${start}-`;
-    }
-
-    #pipeLimitedLines(
-        source: NodeJS.ReadableStream,
-        res: Response,
-        lineCount: number,
-    ): void {
-        let remainingLines = lineCount;
-        let isClosed = false;
-
-        const closeSource = () => {
-            if (isClosed) return;
-            isClosed = true;
-            if ('destroy' in source && typeof source.destroy === 'function') {
-                source.destroy();
-            }
-        };
-
-        source.on('error', (err) => {
-            if (!isClosed) {
-                isClosed = true;
-                res.destroy(err);
-            }
-        });
-
-        res.on('close', () => {
-            closeSource();
-        });
-
-        source.on('data', (chunk: Buffer | string) => {
-            if (isClosed) return;
-
-            const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-            let endIndex = buffer.length;
-
-            for (let index = 0; index < buffer.length; index++) {
-                if (buffer[index] !== 0x0a) continue;
-                remainingLines -= 1;
-                if (remainingLines === 0) {
-                    endIndex = index + 1;
-                    break;
-                }
-            }
-
-            if (endIndex > 0) {
-                const canContinue = res.write(buffer.subarray(0, endIndex));
-                if (!canContinue) {
-                    source.pause();
-                    res.once('drain', () => {
-                        if (!isClosed) {
-                            source.resume();
-                        }
-                    });
-                }
-            }
-
-            if (endIndex !== buffer.length) {
-                res.end();
-                closeSource();
-            }
-        });
-
-        source.on('end', () => {
-            if (!isClosed) {
-                isClosed = true;
-                res.end();
-            }
-        });
-    }
-
     #requireActor(req: Request) {
         const actor = req.actor;
         if (!actor) {
