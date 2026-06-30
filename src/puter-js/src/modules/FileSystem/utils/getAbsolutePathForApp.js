@@ -6,6 +6,11 @@ const getAbsolutePathForApp = (relativePath) => {
     {
         return relativePath;
     }
+    // add@byron new path style
+    if ( !relativePath && puter.whoami && relativePath.startsWith(puter.whoami.username+'/'))
+    {
+        return relativePath;
+    }
 
     const reLooksLikeUUID = /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
     const isUUID = reLooksLikeUUID.test(relativePath);

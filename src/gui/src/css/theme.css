@@ -1,10 +1,18 @@
 div[data-app="ai"] {
-    width: calc(100% - 52px) !important;
+    width: calc(100% - 52px) !important;   
     z-index:4 !important;
 }
 
 div[data-app="ai"] .window-body{
     background: transparent !important;
+}
+
+div[data-app="chat"] {
+    width: 1000px !important;
+    height: 600px !important;
+    right: 32px !important;
+    top: 32px !important;
+    z-index:4 !important;
 }
 
 .btn-show-ai {

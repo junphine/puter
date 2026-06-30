@@ -229,6 +229,7 @@ export class PuterServer {
         // Cloudflare/nginx hop). Never `true` in prod: that trusts every hop
         // and makes XFF forgeable.
         this.#app.set('trust proxy', this.#config.trust_proxy ?? false);
+        this.#app.set('subdomain offset',this.#config.domain?.split('.').length);
         this.#installGlobalMiddleware();
 
         // Instantiate drivers BEFORE controllers so controllers can receive

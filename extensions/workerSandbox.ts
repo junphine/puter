@@ -69,7 +69,7 @@ const page = `
             </article>
         </section>
     </main>
-    <script src="/sdk/puter.dev.js"></script>
+    <script src="http://puter.localhost:4100/sdk/puter.dev.js"></script>
     <script>
         (() => {
             const codeEl = document.getElementById('code');

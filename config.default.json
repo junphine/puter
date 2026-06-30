@@ -3,7 +3,7 @@
     "env": "dev",
     "port": 4100,
     "protocol": "http",
-    "domain": "puter.localhost",
+    "domain": "puter.srv.cn",
     "cookie_name": "puter_auth_token",
     "jwt_secret": "dev-jwt-secret-change-me",
     "jwt_secret_v2": "dev-jwt-secret-v2-change-me",
@@ -15,16 +15,17 @@
     "enable_public_folders": true,
     "is_storage_limited": false,
     "min_pass_length": 5,
-    "static_hosting_domain": "site.puter.localhost",
-    "static_hosting_domain_alt": "host.puter.localhost",
-    "private_app_hosting_domain": "app.puter.localhost",
-    "private_app_hosting_domain_alt": "dev.puter.localhost",
+    "static_hosting_domain": "site.puter.srv.cn",
+    "static_hosting_domain_alt": "host.puter.srv.cn",
+    "private_app_hosting_domain": "app.puter.srv.cn",
+    "private_app_hosting_domain_alt": "dev.puter.srv.cn",
     "captcha": { "enabled": false },
     "default_user_group": "78b1b1dd-c959-44d2-b02c-8735671f9997",
     "default_temp_group": "b7220104-7905-4985-b996-649fdcdb3c8f",
     "storage_capacity": 104857600,
     "strict_email_verification_required": false,
     "gui_assets_root": "./src/gui",
+    "gui_puterjs_bundle": "http://puter.srv.cn/sdk/puter.dev.js",
     "puterjs_root": "./src/puter-js/dist",
     "builtin_apps": {
         "dev-center": "./src/dev-center",
@@ -41,7 +42,7 @@
         "user": "root",
         "password": "123456",
         "database": "puter",
-        "migrationPaths": ["./src/backend/clients/database/migrations/mysql"]
+        "_migrationPaths": ["./src/backend/clients/database/migrations/mysql"]
     },
     "dynamo": {
         "endpoint": "http://localhost:7890",
@@ -190,7 +191,7 @@
         "XAUTHKEY": "cfk_ymkRsir14Uv9ynSY2Hg1R9wWavePniHtXPbuJdnLa150bc28",
         "ACCOUNTID": "5a23a5635b28de86f83dafd8f4e05e23",
         "namespace": "",
-        "internetExposedUrl": "https://api.puter.com",
+        "internetExposedUrl": "http://api.puter.srv.cn",
         "loggingUrl": ""
     }
 }
