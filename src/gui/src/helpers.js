@@ -1500,7 +1500,7 @@ window.delete_item = async function (el_item, descendants_only = false) {
     // hide all UIItems with matching uids
     $(`.item[data-uid='${$(el_item).attr('data-uid')}']`).fadeOut(150, function () {
         // close all windows with matching uids
-        // modify@@byron
+        // modify@byron
         $(`.window[data-uid='${$(el_item).attr('data-uid')}']`).close();
         // close all windows that belong to a descendant of this item
         // todo this has to be case-insensitive but the `i` selector doesn't work on ^=

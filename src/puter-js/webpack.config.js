@@ -11,6 +11,7 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export default {
+    mode: 'development',
     entry: './src/index.js',
     output: {
         filename: 'puter.js',
@@ -18,8 +19,8 @@ export default {
     },
     plugins: [
         new webpack.DefinePlugin({
-            'globalThis.PUTER_ORIGIN_ENV': JSON.stringify(process.env.PUTER_ORIGIN || 'https://puter.com'),
-            'globalThis.PUTER_API_ORIGIN_ENV': JSON.stringify(process.env.PUTER_API_ORIGIN || 'https://api.puter.com'),
+            'globalThis.PUTER_ORIGIN_ENV': JSON.stringify(process.env.PUTER_ORIGIN || 'http://puter.localhost:4100'),
+            'globalThis.PUTER_API_ORIGIN_ENV': JSON.stringify(process.env.PUTER_API_ORIGIN || 'http://api.puter.localhost:4100'),
         }),
     ],
 };

@@ -7,7 +7,7 @@
     "cookie_name": "puter_auth_token",
     "jwt_secret": "dev-jwt-secret-change-me",
     "jwt_secret_v2": "dev-jwt-secret-v2-change-me",
-    "allow_v1_tokens": true,
+    "allow_v1_tokens": false,
     "url_signature_secret": "dev-url-signature-secret-change-me",
     "allow_all_host_values": true,
     "allow_no_host_header": true,
@@ -25,7 +25,7 @@
     "storage_capacity": 104857600,
     "strict_email_verification_required": false,
     "gui_assets_root": "./src/gui",
-    "gui_puterjs_bundle": "http://puter.srv.cn/sdk/puter.dev.js",
+    "gui_puterjs_bundle": "http://puter.srv.cn:4100/sdk/puter.dev.js",
     "puterjs_root": "./src/puter-js/dist",
     "builtin_apps": {
         "dev-center": "./src/dev-center",
@@ -42,7 +42,7 @@
         "user": "root",
         "password": "123456",
         "database": "puter",
-        "_migrationPaths": ["./src/backend/clients/database/migrations/mysql"]
+        "migrationPaths": ["./src/backend/clients/database/migrations/mysql"]
     },
     "dynamo": {
         "endpoint": "http://localhost:7890",
@@ -74,7 +74,7 @@
     "thumbnailStore": {
         "name": "puter-thumb",
         "endpoint": "http://127.0.0.1:8787/s3",
-        "region": "auto",
+        "region": "igfs",
         "credentials": {
             "accessKeyId": "rustfsadmin",
             "secretAccessKey": "rustfsadmin"
@@ -82,12 +82,12 @@
         "forcePathStyle": true
     },
     "redis": {        
-        "useMock": true,
+        "useMock": false,
         "tls": false,
         "startupNodes": [
             {
                 "host": "127.0.0.1",
-                "port": 11212
+                "port": 6379
             }
         ]     
     },

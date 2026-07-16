@@ -7,7 +7,7 @@ const getAbsolutePathForApp = (relativePath) => {
         return relativePath;
     }
     // add@byron new path style
-    if ( !relativePath && puter.whoami && relativePath.startsWith(puter.whoami.username+'/'))
+    if ( puter.whoami && relativePath.startsWith(puter.whoami.username+'/'))
     {
         return relativePath;
     }

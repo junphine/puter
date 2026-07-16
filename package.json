@@ -50,7 +50,7 @@
     "start": "node --enable-source-maps -r ./dist/src/backend/telemetry.js ./dist/src/backend/index.js",
     "start-tsx": "npx tsx --inspect ./src/backend/index.ts",
     "start=dynalite": "npx dynalite --port 7890 --path ./volatile/runtime/puter-ddb",
-    "prestart": "npm run setupExtensions && npm run build:ts",
+    "_prestart": "npm run setupExtensions && npm run build:ts",
     "dev": "npm start",
     "build": "npm run setupExtensions && npm run build:ts && cd src/gui && node ./build.js && cd ../puter-js && npm run build",
     "build:workerLib": "cd src/puter-js && npm run build && cd ../worker && npm run build",
