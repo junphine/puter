@@ -1016,7 +1016,7 @@ async function UIWindow (options) {
 
                 // build item for context menu
                 items.push({
-                    html: `<span>${history_item === window.home_path ? i18n('home') : path.basename(history_item)}</span>`,
+                    html: `<span>${history_item === window.home_path ? i18n('home') : html_encode(path.basename(history_item))}</span>`,
                     val: index,
                     onClick: async function (e) {
                         let history_index = e.value;
@@ -1089,7 +1089,7 @@ async function UIWindow (options) {
 
                 // build item for context menu
                 items.push({
-                    html: `<span>${history_item === window.home_path ? 'Home' : path.basename(history_item)}</span>`,
+                    html: `<span>${history_item === window.home_path ? 'Home' : html_encode(path.basename(history_item))}</span>`,
                     val: index,
                     onClick: async function (e) {
                         let history_index = e.value;
@@ -3560,7 +3560,7 @@ $.fn.close = async function (options) {
                 // only reset the URL if this window was the one that owns it (mirrors the open-side check in focusWindow)
                 const update_window_url = $(this).attr('data-update_window_url');
                 if ( ! window.is_dashboard_mode && (update_window_url === 'true' || update_window_url === null) ) {
-                    window.history.replaceState(null, document.title, '/');
+                    window.history.replaceState(null, document.title, '/desktop');
                 }
                 // bring focus to the last window in the window-stack (only if not minimized)
                 let next_window_focused = false;
@@ -4014,7 +4014,7 @@ $.fn.hideWindow = async function (options) {
             // update title and window URL — only if this window was the one that owns the URL
             const update_window_url = $(this).attr('data-update_window_url');
             if ( ! window.is_dashboard_mode && (update_window_url === 'true' || update_window_url === null) ) {
-                window.history.replaceState(null, document.title, '/');
+                window.history.replaceState(null, document.title, '/desktop');
                 document.title = i18n('window_title_puter');
             }
         }

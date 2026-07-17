@@ -30,6 +30,7 @@ import truncate_filename from '../helpers/truncate_filename.js';
 import launch_app from '../helpers/launch_app.js';
 import open_item from '../helpers/open_item.js';
 import mime from '../lib/mime.js';
+import { isWeblinkName, weblinkChangeIconMenuItem } from '../helpers/weblink.js';
 
 const AI_APP_NAME = 'ai';
 
@@ -1143,6 +1144,8 @@ async function UIItem (options) {
         // -------------------------------------------------------
         else {
             const is_trash = $(el_item).attr('data-path') === window.trash_path || $(el_item).attr('data-shortcut_to_path') === window.trash_path;
+            const is_shortcut = !! $(el_item).attr('data-shortcut_to_path');
+            const is_weblink = isWeblinkName($(el_item).attr('data-name'));
             menu_items = [];
             // -------------------------------------------
             // Open
@@ -1187,7 +1190,7 @@ async function UIItem (options) {
                             continue;
                         }
                         items.push({
-                            html: suggested_app.title,
+                            html: html_encode(suggested_app.title),
                             icon: `<img src="${html_encode(suggested_app.icon ?? window.icons['app.svg'])}" style="width:16px; height: 16px; margin-bottom: -4px;">`,
                             onClick: async function () {
                                 var extension = path.extname($(el_item).attr('data-path')).toLowerCase();
@@ -1568,6 +1571,12 @@ async function UIItem (options) {
                         );
                     },
                 });
+            }
+            // -------------------------------------------
+            // Change Web Link Icon
+            // -------------------------------------------
+            if ( !is_trashed && !is_trash && !is_shortcut && is_weblink ) {
+                menu_items.push(weblinkChangeIconMenuItem(el_item));
             }
             // -------------------------------------------
             // Delete

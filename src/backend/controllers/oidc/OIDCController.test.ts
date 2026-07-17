@@ -52,6 +52,12 @@ const TEST_ORIGIN = 'http://test.local';
 let server: PuterServer;
 let router: PuterRouter;
 
+// Stand-in for the abuse extension's signup veto. EventClient has no off(),
+// so one shared listener is installed in beforeAll and tests swap the
+// override in and out (same pattern as AuthController.test.ts).
+type SignupValidateOverride = (data: Record<string, unknown>) => void;
+let signupValidateOverride: SignupValidateOverride | null = null;
+
 beforeAll(async () => {
     server = await setupTestServer({
         origin: TEST_ORIGIN,
@@ -75,6 +81,14 @@ beforeAll(async () => {
     } as never);
     router = new PuterRouter();
     server.controllers.oidc.registerRoutes(router);
+    server.clients.event.on(
+        'puter.signup.validate',
+        (_k: unknown, data: unknown) => {
+            if (signupValidateOverride) {
+                signupValidateOverride(data as Record<string, unknown>);
+            }
+        },
+    );
 });
 
 afterAll(async () => {
@@ -83,6 +97,7 @@ afterAll(async () => {
 
 afterEach(() => {
     vi.restoreAllMocks();
+    signupValidateOverride = null;
 });
 
 interface CapturedResponse {
@@ -92,6 +107,7 @@ interface CapturedResponse {
     redirectUrl?: string;
     headers: Record<string, string>;
     cookies: Array<{ name: string; value: string; opts?: unknown }>;
+    clearedCookies: Array<{ name: string; opts?: unknown }>;
     contentType?: string;
 }
 
@@ -100,6 +116,7 @@ const makeReq = (init: {
     query?: Record<string, unknown>;
     params?: Record<string, unknown>;
     headers?: Record<string, string>;
+    cookies?: Record<string, string>;
     method?: string;
 }): Request => {
     return {
@@ -107,6 +124,7 @@ const makeReq = (init: {
         query: init.query ?? {},
         params: init.params ?? {},
         headers: init.headers ?? {},
+        cookies: init.cookies ?? {},
         method: init.method ?? 'GET',
     } as unknown as Request;
 };
@@ -117,6 +135,7 @@ const makeRes = () => {
         body: undefined,
         headers: {},
         cookies: [],
+        clearedCookies: [],
     };
     const res = {
         json: vi.fn((value: unknown) => {
@@ -153,6 +172,10 @@ const makeRes = () => {
         }),
         cookie: vi.fn((name: string, value: string, opts?: unknown) => {
             captured.cookies.push({ name, value, opts });
+            return res;
+        }),
+        clearCookie: vi.fn((name: string, opts?: unknown) => {
+            captured.clearedCookies.push({ name, opts });
             return res;
         }),
         type: vi.fn(() => res),
@@ -593,6 +616,7 @@ describe('OIDCController login callback', () => {
         );
         expect(captured.redirectStatus).toBe(302);
         expect(captured.redirectUrl).toContain('auth_error=1');
+        expect(captured.redirectUrl).toContain('message=account_suspended');
         // No session cookie issued for suspended accounts.
         expect(captured.cookies).toHaveLength(0);
     });
@@ -674,9 +698,7 @@ describe('OIDCController login callback', () => {
         expect(captured.redirectUrl).toContain('embedded_in_popup=true');
         expect(captured.redirectUrl).toContain('msg_id=msg-99');
         expect(captured.redirectUrl).toContain('auth_error=1');
-        // 'This account is suspended.' is not in ALLOWED_ERRORS, so the
-        // builder falls back to 'unauthorized'.
-        expect(captured.redirectUrl).toContain('message=unauthorized');
+        expect(captured.redirectUrl).toContain('message=account_suspended');
         expect(captured.redirectUrl).toContain(
             `opener_origin=${encodeURIComponent('http://opener.test')}`,
         );
@@ -764,6 +786,291 @@ describe('OIDCController login callback', () => {
 
         expect(captured.redirectStatus).toBe(302);
         expect(captured.redirectUrl).toContain('auth_error=1');
+    });
+});
+
+// -- Browser binding / login-CSRF --------------------------------------
+
+describe('OIDCController signup veto (abuse harness)', () => {
+    const vetoWithTrail = (email: string, trailId: string) => {
+        signupValidateOverride = (data) => {
+            if (data.email !== email) return;
+            data.allow = false;
+            data.trail_id = trailId;
+        };
+    };
+
+    const stubIdp = (sub: string, email: string) => {
+        vi.spyOn(oidc(), 'exchangeCodeForTokens').mockResolvedValue({
+            access_token: 'access',
+            id_token: 'id',
+        } as never);
+        vi.spyOn(oidc(), 'getUserInfo').mockResolvedValue({
+            sub,
+            email,
+            email_verified: true,
+        } as never);
+    };
+
+    it('createUserFromOIDC returns signup_blocked and the trail id as requestCode', async () => {
+        const email = `veto-${Math.random().toString(36).slice(2, 8)}@test.local`;
+        vetoWithTrail(email, 'trail-svc-1');
+
+        const created = await runWithContext(
+            { req: makeReq({}) },
+            () =>
+                oidc().createUserFromOIDC('custom', {
+                    sub: `sub-${Math.random().toString(36).slice(2, 8)}`,
+                    email,
+                    email_verified: true,
+                }),
+        );
+        expect(created.success).toBe(false);
+        expect(created.code).toBe('signup_blocked');
+        expect(created.requestCode).toBe('trail-svc-1');
+    });
+
+    it('login callback redirects with signup_blocked + request_code when first sign-in is vetoed', async () => {
+        const email = `veto-${Math.random().toString(36).slice(2, 8)}@test.local`;
+        vetoWithTrail(email, 'trail-login-1');
+        stubIdp(`sub-${Math.random().toString(36).slice(2, 8)}`, email);
+
+        const state = oidc().signState({
+            provider: 'custom',
+            redirect_uri: TEST_ORIGIN + '/',
+        });
+        const { res, captured } = makeRes();
+        await callRoute(
+            'get',
+            '/auth/oidc/callback/login',
+            makeReq({ query: { code: 'c', state } }),
+            res,
+        );
+
+        expect(captured.redirectStatus).toBe(302);
+        expect(captured.redirectUrl).toContain('auth_error=1');
+        expect(captured.redirectUrl).toContain('action=login');
+        expect(captured.redirectUrl).toContain('message=signup_blocked');
+        expect(captured.redirectUrl).toContain('request_code=trail-login-1');
+        expect(captured.cookies).toHaveLength(0);
+    });
+
+    it('signup callback redirects with signup_blocked + request_code when vetoed', async () => {
+        const email = `veto-${Math.random().toString(36).slice(2, 8)}@test.local`;
+        vetoWithTrail(email, 'trail-signup-1');
+        stubIdp(`sub-${Math.random().toString(36).slice(2, 8)}`, email);
+
+        const state = oidc().signState({
+            provider: 'custom',
+            redirect_uri: TEST_ORIGIN + '/',
+        });
+        const { res, captured } = makeRes();
+        await callRoute(
+            'get',
+            '/auth/oidc/callback/signup',
+            makeReq({ query: { code: 'c', state } }),
+            res,
+        );
+
+        expect(captured.redirectStatus).toBe(302);
+        expect(captured.redirectUrl).toContain('auth_error=1');
+        expect(captured.redirectUrl).toContain('action=signup');
+        expect(captured.redirectUrl).toContain('message=signup_blocked');
+        expect(captured.redirectUrl).toContain('request_code=trail-signup-1');
+        expect(captured.cookies).toHaveLength(0);
+    });
+
+    it('a veto with no trail id still redirects with signup_blocked and no request_code', async () => {
+        const email = `veto-${Math.random().toString(36).slice(2, 8)}@test.local`;
+        signupValidateOverride = (data) => {
+            if (data.email !== email) return;
+            data.allow = false;
+        };
+        stubIdp(`sub-${Math.random().toString(36).slice(2, 8)}`, email);
+
+        const state = oidc().signState({
+            provider: 'custom',
+            redirect_uri: TEST_ORIGIN + '/',
+        });
+        const { res, captured } = makeRes();
+        await callRoute(
+            'get',
+            '/auth/oidc/callback/signup',
+            makeReq({ query: { code: 'c', state } }),
+            res,
+        );
+
+        expect(captured.redirectUrl).toContain('message=signup_blocked');
+        expect(captured.redirectUrl).not.toContain('request_code');
+    });
+});
+
+describe('OIDCController browser binding', () => {
+    const NONCE_COOKIE = 'puter_oidc_nonce';
+
+    const stubIdP = (sub: string, email: string) => {
+        vi.spyOn(oidc(), 'exchangeCodeForTokens').mockResolvedValue({
+            access_token: 'access',
+            id_token: 'id',
+        } as never);
+        vi.spyOn(oidc(), 'getUserInfo').mockResolvedValue({
+            sub,
+            email,
+            email_verified: true,
+        } as never);
+    };
+
+    it('/start sets an HttpOnly nonce cookie matching the nonce embedded in state', async () => {
+        const { res, captured } = makeRes();
+        await callRoute(
+            'get',
+            '/auth/oidc/:provider/start',
+            makeReq({ params: { provider: 'custom' } }),
+            res,
+        );
+
+        const nonceCookie = captured.cookies.find(
+            (c) => c.name === NONCE_COOKIE,
+        );
+        expect(nonceCookie).toBeTruthy();
+        expect(nonceCookie?.value).toBeTruthy();
+        expect((nonceCookie?.opts as { httpOnly?: boolean })?.httpOnly).toBe(
+            true,
+        );
+
+        // The cookie value must equal the nonce baked into the signed state.
+        const state = new URL(captured.redirectUrl ?? '').searchParams.get(
+            'state',
+        );
+        const decoded = oidc().verifyState(state!);
+        expect(decoded?.nonce).toBe(nonceCookie?.value);
+    });
+
+    it('completes login when the nonce cookie matches the state nonce', async () => {
+        const sub = `sub-${Math.random().toString(36).slice(2, 8)}`;
+        const email = `bind-${Math.random().toString(36).slice(2, 8)}@test.local`;
+        const nonce = 'browser-nonce-match';
+        const state = oidc().signState({
+            provider: 'custom',
+            redirect_uri: TEST_ORIGIN + '/',
+            nonce,
+        });
+        stubIdP(sub, email);
+
+        const { res, captured } = makeRes();
+        await callRoute(
+            'get',
+            '/auth/oidc/callback/login',
+            makeReq({
+                query: { code: 'c', state },
+                cookies: { [NONCE_COOKIE]: nonce },
+            }),
+            res,
+        );
+
+        // Session cookie issued; single-use nonce cookie cleared.
+        expect(captured.cookies).toHaveLength(1);
+        expect(captured.redirectUrl).toBe(TEST_ORIGIN + '/');
+        expect(
+            captured.clearedCookies.some((c) => c.name === NONCE_COOKIE),
+        ).toBe(true);
+    });
+
+    it('rejects login (no session cookie) when the nonce cookie is absent — the login-CSRF case', async () => {
+        const state = oidc().signState({
+            provider: 'custom',
+            redirect_uri: TEST_ORIGIN + '/',
+            nonce: 'attacker-flow-nonce',
+        });
+        // If enforcement were missing, this would resolve a user and set a
+        // session cookie for the victim's browser. It must not get that far.
+        const exchangeSpy = vi.spyOn(oidc(), 'exchangeCodeForTokens');
+
+        const { res, captured } = makeRes();
+        await callRoute(
+            'get',
+            '/auth/oidc/callback/login',
+            // Victim's browser has no nonce cookie for the attacker's flow.
+            makeReq({ query: { code: 'c', state }, cookies: {} }),
+            res,
+        );
+
+        expect(captured.redirectStatus).toBe(302);
+        expect(captured.redirectUrl).toContain('auth_error=1');
+        expect(captured.cookies).toHaveLength(0);
+        // We bail before ever exchanging the code.
+        expect(exchangeSpy).not.toHaveBeenCalled();
+    });
+
+    it('rejects login when the nonce cookie does not match the state nonce', async () => {
+        const state = oidc().signState({
+            provider: 'custom',
+            redirect_uri: TEST_ORIGIN + '/',
+            nonce: 'expected-nonce',
+        });
+        const exchangeSpy = vi.spyOn(oidc(), 'exchangeCodeForTokens');
+
+        const { res, captured } = makeRes();
+        await callRoute(
+            'get',
+            '/auth/oidc/callback/login',
+            makeReq({
+                query: { code: 'c', state },
+                cookies: { [NONCE_COOKIE]: 'a-different-nonce' },
+            }),
+            res,
+        );
+
+        expect(captured.redirectUrl).toContain('auth_error=1');
+        expect(captured.cookies).toHaveLength(0);
+        expect(exchangeSpy).not.toHaveBeenCalled();
+    });
+
+    it('rejects the revalidate callback (400) when the nonce cookie is missing', async () => {
+        const state = oidc().signState({
+            provider: 'custom',
+            flow: 'revalidate',
+            user_uuid: uuidv4(),
+            nonce: 'reval-nonce',
+        });
+        const exchangeSpy = vi.spyOn(oidc(), 'exchangeCodeForTokens');
+
+        const { res, captured } = makeRes();
+        await callRoute(
+            'get',
+            '/auth/oidc/callback/revalidate',
+            makeReq({ query: { code: 'c', state }, cookies: {} }),
+            res,
+        );
+
+        expect(captured.statusCode).toBe(400);
+        expect(exchangeSpy).not.toHaveBeenCalled();
+    });
+
+    it('lets legacy nonce-less state through (deploy grace) without touching the nonce cookie', async () => {
+        const sub = `sub-${Math.random().toString(36).slice(2, 8)}`;
+        const email = `legacy-${Math.random().toString(36).slice(2, 8)}@test.local`;
+        // No `nonce` field — mimics a state signed before this shipped.
+        const state = oidc().signState({
+            provider: 'custom',
+            redirect_uri: TEST_ORIGIN + '/',
+        });
+        stubIdP(sub, email);
+
+        const { res, captured } = makeRes();
+        await callRoute(
+            'get',
+            '/auth/oidc/callback/login',
+            makeReq({ query: { code: 'c', state }, cookies: {} }),
+            res,
+        );
+
+        // Proceeds as before; no nonce cookie is cleared for legacy states.
+        expect(captured.cookies).toHaveLength(1);
+        expect(captured.redirectUrl).toBe(TEST_ORIGIN + '/');
+        expect(
+            captured.clearedCookies.some((c) => c.name === NONCE_COOKIE),
+        ).toBe(false);
     });
 });
 

@@ -53,7 +53,7 @@ The `extension` global ([src/backend/extensions.ts](src/backend/extensions.ts)) 
 
 - **Modules:** We transpile and build as needed — write ES modules, not CommonJS.
 - **TypeScript preferred for new files.** Existing JS is fine; convert opportunistically when you're already touching a file.
-- **Reuse types before inventing them.** Search for an existing type first; extend it if close. Only define a new type when nothing fits.
+- **Reuse types and code before adding duplicates.** Before defining a type, search for an existing one; extend it if close. Before writing a helper or repeating logic, search for an existing utility, helper, or implementation and reuse or extend it. Only add a new type or helper when nothing suitable exists.
 - **Make new types findable.** Co-locate them with the layer/module that owns them, export from the obvious entry point, and use a descriptive `PascalCase` name. Don't hide types in random files where future readers won't grep them.
 - **Naming:** `camelCase` for variables/functions, `PascalCase` for classes and for files containing a class (`AuthService.ts`, `KVStoreDriver.ts`).
 
@@ -63,6 +63,8 @@ Keep comments light. Prefer self-documenting code — clear names, small functio
 
 - The _why_ is non-obvious (a hidden constraint, a workaround, a subtle invariant).
 - A non-trivial usage detail would otherwise trip the next reader.
+
+If comments need to be more than a line, its probably too long, and when it does need multiline comments, use multiline `/** ... */` JSDoc style for consistency. Use `//` for single-line comments.
 
 Don't restate what the code already says. Don't write comments that reference the current task or PR or version of something — those rot.
 

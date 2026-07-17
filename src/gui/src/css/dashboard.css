@@ -75,6 +75,11 @@
     --dashboard-bento-usage-surface: #eef2ff;
     --dashboard-bento-usage-header-bg: #e0e7ff;
     --dashboard-bento-usage-bar-fill: #ea580c;
+    /* Emerald (matches the green icon accent used elsewhere) */
+    --dashboard-bento-desktop-icon-bg: #059669;
+    --dashboard-bento-desktop-icon-shadow: rgba(5, 150, 105, 0.22);
+    --dashboard-bento-desktop-surface: #ecfdf5;
+    --dashboard-bento-desktop-header-bg: #d1fae5;
 
     --dashboard-shadow-subtle: rgba(0, 0, 0, 0.04);
     --dashboard-shadow-light: rgba(0, 0, 0, 0.06);
@@ -166,6 +171,10 @@ body {
         --dashboard-bento-usage-surface: #1c1d2e;
         --dashboard-bento-usage-header-bg: #252a42;
         --dashboard-bento-usage-bar-fill: #fb923c;
+        --dashboard-bento-desktop-icon-bg: #10b981;
+        --dashboard-bento-desktop-icon-shadow: rgba(16, 185, 129, 0.32);
+        --dashboard-bento-desktop-surface: #16241f;
+        --dashboard-bento-desktop-header-bg: #172e26;
 
         --dashboard-shadow-subtle: rgba(0, 0, 0, 0.2);
         --dashboard-shadow-light: rgba(0, 0, 0, 0.3);
@@ -621,40 +630,22 @@ body {
 
 /* My Apps tab */
 
-.myapps-tab {
-    max-width: 900px;
-    padding: 32px 40px;
-    width: 100%;
+/* The Apps tab fills the content area and paginates horizontally
+   (iOS-home-screen style) instead of scrolling vertically. */
+.dashboard-section-apps {
+    height: 100%;
+}
+
+.dashboard-tab-content.myapps-tab {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
 }
 
 .myapps-search-wrap {
-    position: sticky;
-    top: 0;
-    z-index: 10;
     padding-top: 30px;
     padding-bottom: 30px;
     margin-bottom: 20px;
-    margin-left: -40px;
-    margin-right: -40px;
-    padding-left: 40px;
-    padding-right: 40px;
-    background: var(--dashboard-background);
-}
-
-@supports (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)) {
-    .myapps-search-wrap {
-        background: rgba(255, 255, 255, 0.52);
-        backdrop-filter: blur(20px) saturate(1.5);
-        -webkit-backdrop-filter: blur(20px) saturate(1.5);
-    }
-}
-
-@media (prefers-color-scheme: dark) {
-    @supports (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)) {
-        .myapps-search-wrap {
-            background: rgba(30, 30, 30, 0.55);
-        }
-    }
 }
 
 .myapps-search-inner {
@@ -687,7 +678,15 @@ body {
 }
 
 input.myapps-search {
+    /* type="search" pulls in native search-field chrome (inset bevel on
+       webkit) and skips the global input[type=text] styling; strip the native
+       chrome and set padding/box-sizing here so the box looks the same as it
+       did as a text input. */
+    -webkit-appearance: none;
+    appearance: none;
+    box-sizing: border-box;
     width: 100%;
+    padding: 8px;
     padding-right: 33px !important;
     font-size: 13px;
     border: 1px solid var(--dashboard-border);
@@ -706,12 +705,28 @@ input.myapps-search::placeholder {
     color: var(--dashboard-text-muted);
 }
 
+/* Hide the native search clear button — a custom .myapps-icon-clear is used. */
+input.myapps-search::-webkit-search-cancel-button,
+input.myapps-search::-webkit-search-decoration {
+    -webkit-appearance: none;
+    appearance: none;
+}
+
 .myapps-container {
-    min-height: 200px;
-    padding-bottom: 50px;
+    /* Pager geometry; TabApps.js reads these to size pages. */
+    --myapps-tile-w: 100px;
+    --myapps-tile-h: 78px;
+    --myapps-gap-x: 32px;
+    --myapps-gap-y: 32px;
+    --myapps-dots-h: 28px;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
 }
 
 .myapps-empty {
+    flex: 1;
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -732,17 +747,149 @@ input.myapps-search::placeholder {
     margin: 0;
 }
 
-.myapps-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, 80px);
-    gap: 32px 32px;
-    justify-content: center;
+/* iOS-style pager: pages snap horizontally, dots below, hover arrows */
+
+.myapps-pager {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
     opacity: 1;
     transition: opacity 0.2s ease;
 }
 
-.myapps-grid-loading {
+.myapps-pager-loading {
     opacity: 0;
+}
+
+.myapps-pager-scroller {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    overflow-x: auto;
+    overflow-y: hidden;
+    /* overflow-x above forces vertical clipping too, which would shave the
+       top of first-row icons when they scale up on hover; bleed the clip
+       edge upward so the scaled icons stay visible. */
+    margin-top: -8px;
+    padding-top: 8px;
+    scroll-snap-type: x mandatory;
+    overscroll-behavior-x: contain;
+    touch-action: pan-x;
+    scrollbar-width: none;
+}
+
+.myapps-pager-scroller::-webkit-scrollbar {
+    display: none;
+}
+
+.myapps-page {
+    flex: 0 0 100%;
+    min-width: 0;
+    scroll-snap-align: start;
+    scroll-snap-stop: always;
+    display: grid;
+    grid-template-columns: repeat(var(--myapps-cols, 1), var(--myapps-tile-w));
+    grid-auto-rows: var(--myapps-tile-h);
+    column-gap: var(--myapps-gap-x);
+    row-gap: var(--myapps-gap-y);
+    justify-content: center;
+    align-content: start;
+}
+
+.myapps-pager-dots {
+    flex: none;
+    height: var(--myapps-dots-h);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+}
+
+.myapps-pager-dots-hidden {
+    visibility: hidden;
+}
+
+.myapps-pager-dot {
+    -webkit-appearance: none;
+    appearance: none;
+    flex: none;
+    width: 17px;
+    height: 17px;
+    padding: 5px;
+    margin: 0;
+    border: none;
+    border-radius: 50%;
+    background-color: var(--dashboard-text-primary);
+    background-clip: content-box;
+    opacity: 0.22;
+    cursor: pointer;
+    transition: opacity 0.2s ease;
+}
+
+.myapps-pager-dot.active {
+    opacity: 0.85;
+}
+
+@media (hover: hover) {
+    .myapps-pager-dot:not(.active):hover {
+        opacity: 0.5;
+    }
+}
+
+.myapps-pager-dot:focus-visible {
+    outline: 2px solid var(--select-color);
+    outline-offset: -1px;
+}
+
+.myapps-pager-arrow {
+    position: absolute;
+    top: calc(50% - var(--myapps-dots-h) / 2);
+    transform: translateY(-50%);
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--dashboard-border);
+    border-radius: 50%;
+    background: var(--dashboard-card-background);
+    color: var(--dashboard-text-secondary);
+    box-shadow: 0 2px 8px var(--dashboard-shadow-light);
+    cursor: pointer;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.15s ease, background 0.15s ease;
+    z-index: 2;
+}
+
+.myapps-pager-arrow svg {
+    width: 16px;
+    height: 16px;
+}
+
+.myapps-pager-arrow-prev {
+    left: 0;
+}
+
+.myapps-pager-arrow-next {
+    right: 0;
+}
+
+/* Arrows are a hover-only affordance for mouse users; touch swipes instead. */
+@media (hover: hover) and (pointer: fine) {
+    .myapps-pager:hover .myapps-pager-arrow:not(.myapps-pager-arrow-hidden),
+    .myapps-pager-arrow:focus-visible:not(.myapps-pager-arrow-hidden) {
+        opacity: 1;
+        pointer-events: auto;
+    }
+
+    .myapps-pager-arrow:hover {
+        background: var(--dashboard-hover);
+        color: var(--dashboard-text-primary);
+    }
 }
 
 .myapps-tile {
@@ -750,15 +897,15 @@ input.myapps-search::placeholder {
     flex-direction: column;
     align-items: center;
     cursor: pointer;
-    width: 80px;
+    width: 100px;
     -webkit-user-select: none;
     user-select: none;
     overflow: visible !important;
 }
 
 .myapps-tile-icon {
-    width: 52px;
-    height: 52px;
+    width: 56px;
+    height: 56px;
     overflow: hidden;
     background: var(--dashboard-card-background);
     transition: transform 0.15s ease, box-shadow 0.15s ease;
@@ -798,7 +945,7 @@ input.myapps-search::placeholder {
     color: var(--dashboard-text-heading);
     text-align: center;
     line-height: 1.3;
-    max-width: 80px;
+    max-width: 100px;
     overflow: hidden;
     text-overflow: ellipsis;
     display: -webkit-box;
@@ -898,6 +1045,1078 @@ input.myapps-search::placeholder {
     box-shadow: 0 8px 24px rgba(0,0,0,0.15);
     z-index: 1000;
     opacity: 0.9;
+}
+
+/* Dashboard files */
+
+.dashboard-content.files {
+    padding: 0 0 0 10px;
+    overflow: hidden;
+}
+
+.dashboard-tab-content.files-tab {
+    display: flex;
+    justify-content: flex-start;
+    align-items: flex-start;
+    max-width: unset;
+    padding: 0;
+    margin: 0;
+}
+
+.dashboard-tab-content.files-tab h2 {
+    margin: 0 0 6px 0;
+    font-size: 26px;
+    font-weight: 700;
+    color: var(--dashboard-text-primary);
+    letter-spacing: -0.02em;
+}
+
+.dashboard-section-files .directories {
+    position: sticky;
+    top: 0;
+    width: 160px;
+    padding: 16px 0;
+}
+
+.dashboard-section-files .directories ul {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.dashboard-section-files .directories li {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 3px;
+    margin-right: 10px;
+    padding: 3px 0px 3px 5px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--dashboard-text);
+    border: 2px dashed transparent;
+    transition: background-color 0.15s;
+}
+
+@media (hover: hover) {
+    .dashboard-section-files .directories li:hover {
+        background: var(--dashboard-hover);
+    }
+}
+
+.dashboard-section-files .directories li.context-menu-active {
+    background: var(--dashboard-hover);
+}
+
+.dashboard-section-files .directories li.active {
+    color: var(--select-color);
+    font-weight: 500;
+}
+
+.dashboard-section-files .directories li img {
+    width: 28px;
+    height: auto;
+}
+
+.dashboard-section-files .directories li[data-folder="Trash"] {
+    position: fixed;
+    bottom: 0;
+    margin-bottom: 20px;
+    width: 150px;
+    height: 38px;
+}
+
+.dashboard-section-files .directory-contents {
+    position: relative;
+    width: calc(100% - 160px);
+    min-height: 100vh;
+    border-left: 1px solid var(--dashboard-border);
+}
+
+.dashboard-section-files .directory-contents .header {
+    position: sticky;
+    top: 0;
+    padding-top: 12px;
+    background: var(--dashboard-background);
+}
+
+.dashboard-section-files .header .path {
+    font-size: 14px;
+    height: 47px;
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    padding: 10px 12px;
+    background: linear-gradient(0deg, var(--dashboard-sidebar-background), var(--dashboard-background));
+    border-bottom: 1px solid var(--dashboard-border);
+}
+
+.dashboard .path-nav-buttons {
+    padding: 4px 10px 4px 0px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 10px;
+    margin-right: 5px;
+    border-right: 1px dotted var(--dashboard-border);
+}
+
+.dashboard .path-btn {
+    opacity: 0.6;
+    width: 28px;
+    cursor: pointer;
+    border-radius: 5px;
+    padding: 4px;
+    background-color: transparent;
+}
+
+@media (hover: hover) {
+    .dashboard .path-btn:hover {
+        filter: invert(1) hue-rotate(180deg);
+        background-color: var(--select-color);
+        opacity: 1;
+    }
+}
+
+@media (prefers-color-scheme: dark) {
+    .path-btn {
+        filter: invert(1) hue-rotate(180deg);
+    }
+    @media (hover: hover) {
+        .path-btn:hover {
+            filter: invert(0) hue-rotate(0deg);
+            background-color: var(--select-color);
+            opacity: 1;
+        }
+    }
+}
+
+.dashboard-section-files .header .path-breadcrumbs {
+    display: flex;
+    align-items: center;
+    margin-left: 10px;
+}
+
+.dashboard-section-files .header .path-breadcrumbs:empty + .path-actions {
+    display: none;
+}
+
+.dashboard-section-files .header .path-actions {
+    display: flex;
+    gap: 10px;
+    margin-left: auto;
+}
+
+.dashboard-section-files .header .path-action-btn {
+    background-color: transparent;
+    border: none;
+    cursor: pointer;
+    padding: 4px;
+    border-radius: 4px;
+    color: var(--dashboard-icon);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+@media (hover: hover) {
+    .dashboard-section-files .header .path-action-btn:hover {
+        color: var(--dashboard-background);
+        background-color: var(--select-color);
+    }
+}
+
+.dashboard-section-files .header .path-btn-disabled {
+    opacity: 0.1;
+    pointer-events: none;
+}
+
+.dashboard-section-files .header .path-action-btn svg {
+    width: 24px;
+    height: 24px;
+}
+
+.dashboard-section-files .header .path .dirname {
+    height: auto;
+    font-weight: 400;
+    -webkit-font-smoothing: subpixel-antialiased;
+    color: var(--dashboard-text-secondary);
+    cursor: pointer;
+    background-color: transparent;
+    padding: 3px 6px;
+    font-size: 13px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+}
+
+@media (hover: hover) {
+    .dashboard-section-files .header .path .dirname:hover {
+        color: var(--dashboard-background);
+        background-color: var(--select-color);
+        border: 1px solid var(--select-color);
+    }
+}
+
+.dashboard-section-files .header .path .dirname.drop-target {
+    color: var(--dashboard-text);
+    background-color: rgba(59, 130, 246, 0.15);
+    border: 1px dashed var(--select-color);
+}
+
+.dashboard-section-files .header .path .dirname.context-menu-active {
+    color: var(--dashboard-background);
+    background-color: var(--select-color);
+    border: 1px solid var(--select-color);
+}
+
+.dashboard-section-files .header .columns {
+    display: grid;
+    height: 32px;
+    padding: 0 10px;
+    grid-template-columns: 24px auto 4px 100px 4px 120px 4px 20px;
+    align-items: center;
+    margin: 1px 2px;
+    color: var(--dashboard-text-secondary);
+    border-bottom: 1px solid var(--dashboard-border);
+    font-size: 12px;
+}
+
+.dashboard-section-files .files {
+    width: 100%;
+    height: calc(100vh - 124px);
+    display: flex;
+    flex-direction: column;
+    padding-bottom: 30px;
+    overflow-y: auto;
+    touch-action: pan-y;
+}
+
+.dashboard-section-files .row {
+    display: grid;
+    width: unset;
+    height: 32px;
+    padding: 0 10px;
+    grid-template-columns: 24px auto 4px 100px 4px 120px 4px 20px;
+    align-items: center;
+    font-size: 13px;
+    color: var(--dashboard-text);
+    touch-action: pan-y;
+    margin: 1px 2px;
+    pointer-events: auto;
+    float: unset;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+.dashboard-section-files .row.folder {
+    border: 1px solid transparent;
+}
+
+@media (hover: hover) {
+    .dashboard-section-files .row:hover {
+        background: var(--dashboard-hover);
+        border-radius: 3px;
+    }
+}
+
+.dashboard-section-files .row.selected {
+    color: var(--primary-color-sidebar-item);
+    background-color: var(--select-color);
+    border-radius: 3px;
+}
+
+@keyframes item-added-highlight {
+    from { background-color: var(--select-color); }
+    to { background-color: transparent; }
+}
+
+.dashboard-section-files .row.item-newly-added {
+    animation: item-added-highlight 2s ease-out;
+}
+
+.dashboard-section-files .row img {
+    width: 18px;
+    height: 18px;
+}
+
+.dashboard-section-files .row .item-icon,
+.dashboard-section-files .header .columns .item-icon {
+    padding: inherit;
+    height: 100%;
+    width: 100%;
+    filter: none;
+    margin: 0;
+}
+
+.dashboard-section-files .row .item-name-wrapper {
+    display: flex;
+    align-items: center;
+    overflow: hidden;
+    min-width: 0;
+}
+
+.dashboard-section-files .row .item-name,
+.dashboard-section-files .header .columns .item-name {
+    /* text-overflow: ellipsis; */
+    white-space: nowrap;
+    overflow: hidden;
+    max-width: unset;
+    color: currentColor !important;
+    text-shadow: none;
+    padding: 0 8px;
+    margin: 0;
+    font-size: inherit;
+    font-weight: 500;
+    word-break: inherit;
+    line-height: 32px;
+}
+
+/* On touch devices, item-name/icon/badges must not be direct event targets
+   so that pointerdown's isDragHandle check can't match them and accidentally
+   select items when the user is scrolling. Events pass through to the .row. */
+.files-tab.touch-device .row:not(.header) .item-name,
+.files-tab.touch-device .row:not(.header) .item-icon,
+.files-tab.touch-device .row:not(.header) .item-badges {
+    pointer-events: none;
+}
+
+.dashboard-section-files .row textarea {
+    align-items: center;
+    width: 100%;
+    height: 20px;
+    margin: 0;
+    padding: 3px 8px 0 8px;
+    text-align: left;
+    font-weight: inherit;
+    display: none;
+    white-space: nowrap;
+}
+
+.dashboard-section-files .row .item-size {
+    white-space: nowrap;
+    overflow: hidden;
+    line-height: 32px;
+    text-align: left;
+}
+
+.dashboard-section-files .row .item-modified {
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    overflow: hidden;
+    line-height: 32px;
+    text-align: left;
+}
+
+.dashboard-section-files .row .item-more {
+    color: var(--dashboard-border);
+    cursor: pointer;
+}
+
+.dashboard-section-files .row .item-more svg {
+    pointer-events: none;
+}
+
+@media (hover: hover) {
+    .dashboard-section-files .row:hover .item-more {
+        color: var(--dashboard-text);
+    }
+}
+
+.dashboard-section-files.ui-draggable-dragging {
+    background-color: transparent !important;
+    opacity: 1 !important;
+}
+
+/* --- List view drag ghost --- */
+
+.dashboard-section-files.ui-draggable-dragging .files-list-view .row,
+.dashboard-section-files.item-selected-clone .files-list-view .row {
+    background-color: var(--select-color) !important;
+    color: var(--dashboard-background) !important;
+    border-radius: 3px;
+    cursor: move;
+    width: auto !important;
+    display: grid !important;
+    grid-template-columns: 24px auto !important;
+    align-items: center;
+    height: 32px;
+}
+
+.dashboard-section-files.item-selected-clone .files-list-view .row {
+    opacity: 0.6;
+    pointer-events: none;
+}
+
+.dashboard-section-files.ui-draggable-dragging .files-list-view .row .item-name-wrapper,
+.dashboard-section-files.item-selected-clone .files-list-view .row .item-name-wrapper {
+    display: flex;
+    align-items: center;
+    overflow: hidden;
+    min-width: 0;
+}
+
+.dashboard-section-files.ui-draggable-dragging .files-list-view .row .item-icon,
+.dashboard-section-files.item-selected-clone .files-list-view .row .item-icon {
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    background: white;
+    border-radius: 2px;
+}
+
+.dashboard-section-files.ui-draggable-dragging .files-list-view .row .item-icon img,
+.dashboard-section-files.item-selected-clone .files-list-view .row .item-icon img {
+    width: 18px;
+    height: 18px;
+    object-fit: cover;
+}
+
+.dashboard-section-files.ui-draggable-dragging .files-list-view .row .item-name,
+.dashboard-section-files.item-selected-clone .files-list-view .row .item-name {
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    overflow: hidden;
+    max-width: unset;
+    color: currentColor;
+    text-shadow: none;
+    padding: 0 8px;
+    margin: 0;
+    font-size: 12px;
+    font-weight: 500;
+    word-break: inherit;
+    line-height: 32px;
+}
+
+.dashboard-section-files.ui-draggable-dragging .files-list-view .row .item-metadata,
+.dashboard-section-files.ui-draggable-dragging .files-list-view .row .col-spacer,
+.dashboard-section-files.ui-draggable-dragging .files-list-view .row .item-more,
+.dashboard-section-files.ui-draggable-dragging .files-list-view .row .item-name-editor,
+.dashboard-section-files.item-selected-clone .files-list-view .row .item-metadata,
+.dashboard-section-files.item-selected-clone .files-list-view .row .col-spacer,
+.dashboard-section-files.item-selected-clone .files-list-view .row .item-more,
+.dashboard-section-files.item-selected-clone .files-list-view .row .item-name-editor {
+    display: none !important;
+}
+
+/* --- Grid view drag ghost --- */
+
+.dashboard-section-files.ui-draggable-dragging .files-grid-view .row,
+.dashboard-section-files.item-selected-clone .files-grid-view .row {
+    background-color: var(--select-color) !important;
+    color: var(--dashboard-background) !important;
+    cursor: move;
+}
+
+.dashboard-section-files.item-selected-clone .files-grid-view .row {
+    opacity: 0.6;
+    pointer-events: none;
+}
+
+.dashboard-section-files.ui-draggable-dragging .files-grid-view .row .item-name-wrapper,
+.dashboard-section-files.item-selected-clone .files-grid-view .row .item-name-wrapper {
+    /* display: none !important; */
+}
+
+.dashboard-section-files.ui-draggable-dragging .files-grid-view .row .item-metadata,
+.dashboard-section-files.ui-draggable-dragging .files-grid-view .row .col-spacer,
+.dashboard-section-files.ui-draggable-dragging .files-grid-view .row .item-more,
+.dashboard-section-files.ui-draggable-dragging .files-grid-view .row .item-name-editor,
+.dashboard-section-files.item-selected-clone .files-grid-view .row .item-metadata,
+.dashboard-section-files.item-selected-clone .files-grid-view .row .col-spacer,
+.dashboard-section-files.item-selected-clone .files-grid-view .row .item-more,
+.dashboard-section-files.item-selected-clone .files-grid-view .row .item-name-editor {
+    display: none !important;
+}
+
+.dashboard-section-files .row.folder.ui-droppable-hover,
+.dashboard-section-files .row.folder.selected.ui-droppable-over {
+    color: var(--dashboard-text);
+    background-color: rgba(59, 130, 246, 0.1);
+    border: 2px dashed var(--select-color);
+    border-radius: 3px;
+}
+
+/* Spring-loaded folder dwell animation */
+.dashboard-section-files .row.folder.dwell-opening,
+.dashboard-section-files .directories li.dwell-opening {
+    background: linear-gradient(90deg, rgba(59, 130, 246, 0.15) 100%, transparent 100%);
+    background-size: 0% 100%;
+    background-repeat: no-repeat;
+    border: 2px dashed var(--select-color);
+    border-radius: 3px;
+    animation: dwell-fill 700ms linear forwards;
+}
+
+@keyframes dwell-fill {
+    from { background-size: 0% 100%; }
+    to { background-size: 100% 100%; }
+}
+
+.dashboard-section-files .draggable-count-badge {
+    position: fixed;
+    background: var(--select-color);
+    color: var(--dashboard-background);
+    border-radius: 50%;
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: bold;
+    pointer-events: none;
+    z-index: 10001;
+}
+
+/* Drag cancel zone — shown after spring-loaded folder navigation */
+.drag-cancel-zone {
+    position: absolute;
+    bottom: 32px;
+    right: 32px;
+    background: #ef4444;
+    color: white;
+    padding: 16px 32px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+    z-index: 10001;
+    user-select: none;
+    cursor: default;
+    transition: background 0.15s, transform 0.15s;
+}
+
+.drag-cancel-zone.drag-cancel-hover {
+    background: #dc2626;
+    transform: scale(1.05);
+}
+
+.dashboard-section-files .directories li.ui-droppable-hover.active {
+    background-color: rgba(59, 130, 246, 0.1);
+    border: 2px dashed var(--select-color);
+    border-radius: 4px;
+}
+
+/* Native file drop visual feedback for Dashboard */
+.dashboard-section-files .files.native-drop-active {
+    background-color: rgba(0, 120, 212, 0.08);
+    outline: 2px dashed #0078d4;
+    outline-offset: -2px;
+    border-radius: 4px;
+}
+
+.dashboard-section-files .directories li.native-drop-target {
+    background-color: rgba(0, 120, 212, 0.15);
+    border-radius: 4px;
+}
+
+.dashboard-section-files .files .row.folder.native-drop-target {
+    background-color: rgba(0, 120, 212, 0.15);
+}
+
+/* Dark mode support for native file drop */
+.window[data-color-scheme="dark"] .dashboard-section-files .files.native-drop-active {
+    background-color: rgba(100, 180, 255, 0.12);
+    outline-color: #4da3ff;
+}
+
+.window[data-color-scheme="dark"] .dashboard-section-files .directories li.native-drop-target,
+.window[data-color-scheme="dark"] .dashboard-section-files .files .row.folder.native-drop-target {
+    background-color: rgba(100, 180, 255, 0.2);
+}
+
+.dashboard-section-files .files-footer {
+    position: absolute;
+    bottom: 0;
+    right: 0;
+    left: 0;
+    background: linear-gradient(180deg, var(--dashboard-sidebar-background), var(--dashboard-background));
+    border-top: 1px solid var(--dashboard-border);
+    height: 30px;
+    font-size: 13px;
+    line-height: 28px;
+    padding: 0 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    color: #666;
+    z-index: 10;
+}
+
+.dashboard-section-files .files-footer-separator,
+.dashboard-section-files .files-footer-selected-items {
+    display: none;
+}
+
+.dashboard-section-files .files-footer-separator {
+    color: #CCC;
+}
+
+/* Floating Selection Actions Bar */
+.dashboard-section-files .files-selection-actions {
+    position: absolute;
+    bottom: 40px;
+    left: 50%;
+    transform: translateX(-50%) translateY(100px);
+    background: var(--dashboard-card-background);
+    border: 1px solid var(--dashboard-border);
+    border-radius: 12px;
+    padding: 8px 12px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    box-shadow: 0 4px 20px var(--dashboard-shadow-medium),
+                0 2px 8px var(--dashboard-shadow-light);
+    z-index: 15;
+    opacity: 0;
+    visibility: hidden;
+    transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+                opacity 0.25s ease,
+                visibility 0.25s ease;
+}
+
+.dashboard-section-files .files-selection-actions.visible {
+    transform: translateX(-50%) translateY(0);
+    opacity: 1;
+    visibility: visible;
+    z-index: 99999999999999999;
+}
+
+.dashboard-section-files .files-selection-actions.rubberband-active {
+    pointer-events: none;
+}
+
+.dashboard-section-files .selection-action-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 14px;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--dashboard-text);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+@media (hover: hover) {
+    .dashboard-section-files .selection-action-btn:hover {
+        background: var(--dashboard-hover);
+    }
+}
+
+.dashboard-section-files .selection-action-btn:active {
+    transform: scale(0.97);
+}
+
+.dashboard-section-files .selection-action-btn svg {
+    width: 24px;
+    height: 24px;
+    flex-shrink: 0;
+}
+
+.dashboard-section-files .selection-action-btn.restore-btn {
+    color: #43a047;
+}
+
+@media (hover: hover) {
+    .dashboard-section-files .selection-action-btn.restore-btn:hover {
+        background: rgba(67, 160, 71, 0.1);
+    }
+}
+
+.dashboard-section-files .selection-action-btn.delete-btn {
+    color: #e53935;
+}
+
+@media (hover: hover) {
+    .dashboard-section-files .selection-action-btn.delete-btn:hover {
+        background: rgba(229, 57, 53, 0.1);
+    }
+}
+
+/* Select mode button - hidden on desktop by default */
+.dashboard-section-files .header .path-action-btn.select-mode-btn {
+    display: none;
+}
+
+/* Done button in floating action bar - hidden by default, shown in select mode on mobile */
+.dashboard-section-files .files-selection-actions .done-btn {
+    display: none;
+}
+
+/* Checkbox in item rows - hidden by default */
+.dashboard-section-files .files-tab .files .row .item-checkbox {
+    display: none;
+    width: 24px;
+    height: 24px;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+
+.dashboard-section-files .files-tab .files .row .item-checkbox .checkbox-icon {
+    width: 20px;
+    height: 20px;
+    border: 2px solid var(--dashboard-border);
+    border-radius: 4px;
+    background: var(--dashboard-card-background);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s ease;
+}
+
+.dashboard-section-files .files-tab .files .row.selected .item-checkbox .checkbox-icon {
+    background: var(--primary-color, #3b82f6);
+    border-color: var(--primary-color, #3b82f6);
+}
+
+.dashboard-section-files .files-tab .files .row.selected .item-checkbox .checkbox-icon::after {
+    content: '';
+    width: 6px;
+    height: 10px;
+    border: solid white;
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+    margin-bottom: 2px;
+}
+
+.dashboard-section-files .files-tab .files.files-list-view .row {
+    display: grid;
+    grid-template-columns: 24px auto 4px 100px 4px 120px 4px 20px;
+    height: 32px;
+    padding: 0 10px;
+    align-items: center;
+}
+
+.dashboard-section-files .files-tab .files.files-list-view .row .item-icon {
+    position: relative;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    background: var(--dashboard-background);
+    border-radius: 2px;
+}
+
+.dashboard-section-files .files-tab .files.files-list-view .row .item-icon img {
+    width: 18px;
+    height: 18px;
+    object-fit: cover;
+}
+
+.dashboard-section-files .files-tab .files.files-list-view .row .item-size,
+.dashboard-section-files .files-tab .files.files-list-view .row .item-modified,
+.dashboard-section-files .files-tab .files.files-list-view .row .item-more {
+    display: block;
+    padding: 0 10px;
+}
+
+.dashboard-section-files .files-tab .files.files-grid-view {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+    gap: 10px;
+    padding: 16px;
+    align-content: start;
+    margin-bottom: 30px;
+}
+
+.dashboard-section-files .files-tab .files.files-list-view .row .item-badges {
+    width: 36px;
+    height: 36px;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    justify-content: flex-end;
+    align-items: flex-start;
+}
+
+.dashboard-section-files .files-tab .files.files-list-view .row img.item-badge {
+    width: 12px !important;
+    height: 12px !important;
+    margin: 0 -2px;
+}
+
+.dashboard-section-files .files-tab .files.files-grid-view .row .item-badges {
+    width: 100%;
+    height: 100%;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    justify-content: flex-end;
+    align-items: flex-start;
+}
+
+.dashboard-section-files .files-tab .files.files-grid-view .row img.item-badge {
+    width: 20px !important;
+    height: 20px !important;
+    margin: 5px;
+    border-radius: 50%;
+}
+
+.dashboard-section-files .files-tab .files.files-grid-view .row {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    position: relative;
+    padding: 12px;
+    height: auto;
+    gap: 8px;
+    border: 1px solid var(--dashboard-border);
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    box-shadow: 0px 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+@media (hover: hover) {
+    .dashboard-section-files .files-tab .files.files-grid-view .row:hover {
+        background: var(--dashboard-sidebar-background);
+        border-color: var(--dashboard-border);
+    }
+}
+
+.dashboard-section-files .files-tab .files.files-grid-view .row.selected {
+    background-color: var(--select-color);
+    color: var(--dashboard-background);
+    border-color: var(--select-color);
+}
+
+.dashboard-section-files .files-tab .files.files-grid-view .row .item-icon {
+    width: 150px;
+    height: 150px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    /* background: #fafafa; */
+    border-radius: 8px;
+    overflow: hidden;
+    background: white;
+    border-radius: 2px;
+}
+
+.dashboard-section-files .files-tab .files.files-grid-view .row .item-icon img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    max-width: fit-content;
+    max-height: fit-content;
+}
+
+.dashboard-section-files .files-tab .files.files-grid-view .row .item-icon svg {
+    width: 64px;
+    height: 64px;
+    opacity: 0.5;
+}
+
+.dashboard-section-files .files-tab .files.files-grid-view .row .item-name {
+    text-align: center;
+    width: 100%;
+    padding: 0;
+    font-size: 13px;
+    line-height: 1.4;
+    max-height: 2.8em;
+    overflow: hidden;
+    word-break: break-word;
+}
+
+.dashboard-section-files .files-tab .files.files-grid-view .row .item-size,
+.dashboard-section-files .files-tab .files.files-grid-view .row .item-modified,
+.dashboard-section-files .files-tab .files.files-grid-view .row .item-more,
+.dashboard-section-files .files-tab .files.files-grid-view .row .col-spacer {
+    display: none;
+}
+
+.dashboard-section-files .files-tab .files.files-grid-view .row .item-name-wrapper {
+    width: 100%;
+    display: block;
+}
+
+@media (hover: hover) {
+    .dashboard-section-files .files-tab .files.files-grid-view .row:hover .item-more {
+        position: absolute;
+        top: 1px;
+        right: 1px;
+        color: #666;
+        background: var(--dashboard-sidebar-background);
+        width: 24px;
+        height: 24px;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        border-radius: 7px;
+    }
+}
+
+/* Hide .item-more on desktop (non-touch devices) - use right-click context menu instead */
+.dashboard-section-files .files-tab:not(.touch-device) .files.files-list-view .row .item-more,
+.dashboard-section-files .files-tab:not(.touch-device) .files.files-grid-view .row .item-more,
+@media (hover: hover) {
+    .dashboard-section-files .files-tab:not(.touch-device) .files.files-grid-view .row:hover .item-more,
+    .dashboard-section-files .files-tab:not(.touch-device) .header .columns .item-more {
+        display: none !important;
+    }
+}
+
+.dashboard-section-files .files-tab .files.files-grid-view .row .item-name-editor {
+    text-align: center;
+}
+
+.dashboard-section-files .files-tab.files-grid-mode .header .columns {
+    display: none;
+}
+
+/* Sortable column headers */
+.dashboard-section-files .header .columns .sortable {
+    cursor: pointer;
+    user-select: none;
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0 10px;
+    justify-content: space-between;
+}
+
+@media (hover: hover) {
+    .dashboard-section-files .header .columns .sortable:hover {
+        color: var(--dashboard-text-heading);
+    }
+}
+
+.dashboard-section-files .header .columns .sortable::after {
+    content: '';
+    display: inline-block;
+    width: 0;
+    height: 0;
+    margin-left: 4px;
+    opacity: 0.3;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-bottom: 5px solid currentColor;
+}
+
+.dashboard-section-files .header .columns .sortable.sort-asc::after {
+    opacity: 1;
+    border-bottom: 5px solid currentColor;
+    border-top: none;
+}
+
+.dashboard-section-files .header .columns .sortable.sort-desc::after {
+    opacity: 1;
+    border-top: 5px solid currentColor;
+    border-bottom: none;
+}
+
+/* Column resize handles */
+.dashboard-section-files .header .columns .col-resize-handle {
+    width: 4px;
+    height: 100%;
+    cursor: col-resize;
+    background: transparent;
+    position: relative;
+    background: var(--dashboard-sidebar-background);
+}
+
+@media (hover: hover) {
+    .dashboard-section-files .header .columns .col-resize-handle:hover {
+        background: var(--dashboard-border);
+    }
+}
+
+.dashboard-section-files .header .columns .col-resize-handle:active {
+    background: var(--select-color);
+}
+
+.dashboard-section-files .more-btn {
+    background: none;
+    border: none;
+    padding: 6px;
+    cursor: pointer;
+    color: var(--text-muted);
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transition: all 0.15s ease;
+    position: relative;
+}
+
+.dashboard-section-files .more-menu {
+    position: absolute;
+    min-width: 180px;
+    background: var(--dashboard-background);
+    border: 1px solid var(--dashboard-border);
+    border-radius: 8px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+    z-index: 1000;
+    padding: 4px;
+}
+
+.dashboard-section-files .more-menu .menu-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 10px 12px;
+    background: none;
+    border: none;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    color: var(--dashboard-text);
+    cursor: pointer;
+    transition: background 0.15s ease;
+    text-align: left;
+}
+
+@media (hover: hover) {
+    .dashboard-section-files .more-menu .menu-item:hover {
+        background: var(--dashboard-hover);
+    }
+}
+
+.dashboard-section-files .more-menu .menu-item svg {
+    width: 16px;
+    height: 16px;
+    color: var(--dashboard-border);
+    flex-shrink: 0;
+}
+
+.dashboard-section-files .more-menu .menu-item.has-submenu {
+    position: relative;
+}
+
+.dashboard-section-files .more-menu .menu-item.has-submenu svg:last-child {
+    margin-left: auto;
+    width: 0.85rem;
+    height: 0.85rem;
+}
+
+.dashboard-section-files .more-menu .menu-item.danger {
+    color: #ea4335;
+}
+
+.dashboard-section-files .more-menu .menu-item.danger svg {
+    color: #ea4335;
+}
+
+@media (hover: hover) {
+    .dashboard-section-files .more-menu .menu-item.danger:hover {
+        background: rgba(234, 67, 53, 0.1);
+    }
+}
+
+.dashboard-section-files .more-menu .menu-divider {
+    height: 1px;
+    background: var(--dashboard-border);
+    margin: 4px 0;
 }
 
 /* Mobile sidebar toggle */
@@ -1001,19 +2220,22 @@ input.myapps-search::placeholder {
         height: 40px;
     }
 
+    .dashboard-tab-content.myapps-tab {
+        padding-bottom: max(6px, env(safe-area-inset-bottom));
+    }
+
     .myapps-container {
-        padding: 20px 10px;
+        --myapps-tile-w: 72px;
+        --myapps-tile-h: 74px;
+        --myapps-gap-x: 12px;
+        --myapps-gap-y: 30px;
     }
 
-    .myapps-tab h2 {
-        font-size: 22px;
-        margin-bottom: 16px;
-    }
-
-    .myapps-grid {
-        grid-template-columns: repeat(4, 72px);
-        column-gap: max(0px, calc((100% - 4 * 72px) / 3));
-        row-gap: 30px;
+    /* Spread the fixed column count across the page width, iOS-style;
+       --myapps-gap-x stays the minimum gap the column count is computed for. */
+    .myapps-page {
+        justify-content: space-between;
+        column-gap: 0;
     }
 
     .myapps-tile {
@@ -1025,14 +2247,269 @@ input.myapps-search::placeholder {
         height: 52px;
         border-radius: 12px;
     }
+}
 
-    /* Too narrow for 4×72px in one row: wrap like before */
-    @media (max-width: 400px) {
-        .myapps-grid {
-            grid-template-columns: repeat(auto-fill, 72px);
-            column-gap: 12px;
-            row-gap: 20px;
+/* Desktop: Make metadata wrapper transparent */
+.dashboard-section-files .files-tab .files.files-list-view .row .item-metadata {
+    display: contents;
+}
+
+/* Image preview popover */
+.image-preview-popover {
+    position: fixed;
+    z-index: 9999;
+    background: var(--dashboard-background);
+    border: 1px solid var(--dashboard-border);
+    border-radius: 8px;
+    padding: 16px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+}
+
+.image-preview-popover img {
+    max-width: 100%;
+    max-height: 70vh;
+    object-fit: contain;
+    border-radius: 4px;
+}
+
+.image-preview-name {
+    font-size: 14px;
+    color: var(--dashboard-text);
+    text-align: center;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Mobile phone optimizations */
+@media (max-width: 480px) {
+    .dashboard-content.files {
+        padding: 0;
+    }
+
+    /* Hide directories sidebar */
+    .dashboard-section-files .directories {
+        display: none;
+    }
+
+    /* Full width for directory contents */
+    .dashboard-section-files .directory-contents {
+        width: 100%;
+        border-left: none;
+    }
+
+    .dashboard-section-files .directory-contents .header {
+        margin-bottom: 12px;
+    }
+
+    /* Hide column headers */
+    .dashboard-section-files .header .columns {
+        display: none;
+    }
+
+    /* Two-row header layout */
+    .dashboard-section-files .header .path {
+        flex-wrap: wrap;
+        height: auto;
+        padding: 8px 12px;
+    }
+
+    .dashboard-section-files .header .path-breadcrumbs {
+        order: 1;
+        width: 100%;
+        margin: 0 0 8px 0;
+        padding-bottom: 8px;
+        margin-left: 50px;
+        flex-wrap: nowrap;
+        white-space: nowrap;
+        overflow-x: auto;
+        border-bottom: 1px solid var(--dashboard-border);
+    }
+
+    .dashboard-section-files .header .path-nav-buttons {
+        order: 2;
+        border-right: none;
+        margin-right: 0;
+    }
+
+    .dashboard-section-files .header .path-actions {
+        order: 3;
+        margin-left: auto;
+    }
+
+    /* Two-row item layout */
+    .dashboard-section-files .files-tab .files.files-list-view .row {
+        display: grid;
+        grid-template-columns: 48px 1fr !important;
+        grid-template-rows: auto auto;
+        height: auto;
+        padding: 6px 10px;
+        gap: 2px 8px;
+    }
+
+    /* Thumbnail spans both rows */
+    .dashboard-section-files .files-tab .files.files-list-view .row .item-icon {
+        grid-row: 1 / 3;
+        width: 48px;
+        height: 48px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .dashboard-section-files .files-tab .files.files-list-view .row .item-icon img {
+        width: 40px;
+        height: 40px;
+    }
+
+    /* File name on first row */
+    .dashboard-section-files .files-tab .files.files-list-view .row .item-name-wrapper {
+        grid-column: 2;
+        grid-row: 1;
+        padding-right: 40px;
+    }
+
+    .dashboard-section-files .files-tab .files.files-list-view .row .item-name {
+        padding: 0;
+        line-height: 24px;
+    }
+
+    /* Metadata wrapper for second row */
+    .dashboard-section-files .files-tab .files.files-list-view .row .item-metadata {
+        grid-column: 2;
+        grid-row: 2;
+        display: flex;
+        align-items: center;
+        font-size: 11px;
+    }
+
+    .dashboard-section-files .files-tab .files.files-list-view .row .item-metadata .col-spacer {
+        display: none;
+    }
+
+    .dashboard-section-files .files-tab .files.files-list-view .row .item-modified,
+    .dashboard-section-files .files-tab .files.files-list-view .row .item-size {
+        font-size: 11px;
+        padding: 0;
+        line-height: 24px;
+        color: var(--dashboard-text-muted);        
+    }
+
+    @media (hover: hover) {
+        .dashboard-section-files .files-tab .files.files-list-view .row:hover .item-modified,
+        .dashboard-section-files .files-tab .files.files-list-view .row:hover .item-size,
+        .dashboard-section-files .files-tab .files.files-list-view .row.selected .item-modified,
+        .dashboard-section-files .files-tab .files.files-list-view .row.selected .item-size {
+            /* color: var(--primary-color-sidebar-item);         */
         }
+    }
+
+    /* Bullet separator between size and modified */
+    .dashboard-section-files .files-tab .files.files-list-view .row .item-size:not(:empty)::after {
+        content: '•';
+        margin: 0 6px;
+    }
+
+    /* Hide outer spacers */
+    .dashboard-section-files .files-tab .files.files-list-view .row > .col-spacer {
+        display: none;
+    }
+
+    /* Hide more button (use long-press for context menu on touch) */
+    .dashboard-section-files .files-tab .files.files-list-view .row .item-more {
+        position: absolute;
+        right: 10px;
+    }
+
+    /* Adjust footer position - full width since sidebar is hidden */
+    .dashboard-section-files .files-footer {
+        left: 0;
+        padding: 0;
+    }
+
+    /* Mobile: Floating selection actions - icon-only, full width */
+    .dashboard-section-files .files-selection-actions {
+        left: 0;
+        right: 0;
+        bottom: 38px;
+        transform: translateX(0) translateY(100px);
+        border-radius: 0;
+        justify-content: center;
+        padding: 10px 8px;
+    }
+
+    .dashboard-section-files .files-selection-actions.visible {
+        transform: translateX(0) translateY(0);
+    }
+
+    .dashboard-section-files .selection-action-btn span {
+        display: none;
+    }
+
+    .dashboard-section-files .selection-action-btn {
+        padding: 9px 8px;
+        border-radius: 50%;
+    }
+
+    /* Mobile: Show select mode button */
+    .dashboard-section-files .header .path-action-btn.select-mode-btn {
+        display: flex;
+    }
+
+    .dashboard-section-files .header .path-action-btn.select-mode-btn.active {
+        background: var(--primary-color, #3b82f6);
+        color: white;
+        border-radius: 6px;
+    }
+
+    /* Mobile: Show checkboxes in select mode */
+    .dashboard-section-files .files-tab.select-mode-active .files .row .item-checkbox {
+        display: flex;
+        grid-row: 1 / 3;
+    }
+
+    /* Mobile: Adjust grid for checkbox in list view */
+    .dashboard-section-files .files-tab.select-mode-active .files.files-list-view .row {
+        grid-template-columns: 32px 48px 1fr !important;
+    }
+
+    /* Adjust grid-column for content when checkbox is visible */
+    .dashboard-section-files .files-tab.select-mode-active .files.files-list-view .row .item-icon {
+        grid-column: 2;
+    }
+
+    .dashboard-section-files .files-tab.select-mode-active .files.files-list-view .row .item-name-wrapper {
+        grid-column: 3;
+    }
+
+    .dashboard-section-files .files-tab.select-mode-active .files.files-list-view .row .item-metadata {
+        grid-column: 3;
+    }
+
+    /* Mobile: Show Done button in floating action bar during select mode */
+    .dashboard-section-files .files-tab.select-mode-active .files-selection-actions .done-btn {
+        display: flex;
+        background: var(--primary-color, #3b82f6);
+        color: white;
+        padding: 5px;
+        margin-left: 8px;
+    }
+
+    /* Mobile: Grid view checkbox positioning */
+    .dashboard-section-files .files-tab.select-mode-active .files.files-grid-view .row {
+        position: relative;
+    }
+
+    .dashboard-section-files .files-tab.select-mode-active .files.files-grid-view .row .item-checkbox {
+        position: absolute;
+        top: 8px;
+        left: 8px;
+        z-index: 2;
     }
 }
 
@@ -1074,9 +2551,6 @@ input.myapps-search::placeholder {
     border-radius: 20px;
     overflow: hidden;
     border: 1px solid var(--dashboard-shadow-light);
-    box-shadow:
-        0 1px 2px var(--dashboard-shadow-subtle),
-        0 4px 16px var(--dashboard-shadow-light);
 }
 
 /* Welcome Card — uses same surface as .bento-card (no separate welcome tint) */
@@ -1246,6 +2720,11 @@ input.myapps-search::placeholder {
     color: #fff;
 }
 
+.dashboard .bento-card-fancy-icon-desktop {
+    background-color: var(--dashboard-bento-desktop-icon-bg);
+    color: #fff;
+}
+
 .dashboard .bento-card-fancy-text {
     display: flex;
     flex-direction: column;
@@ -1386,46 +2865,39 @@ input.myapps-search::placeholder {
     color: var(--dashboard-text-tertiary);
 }
 
-/* Desktop switch bento card */
-.dashboard .bento-desktop-switch {
+/* Open Desktop bento card (full width; links to the desktop interface) */
+.dashboard .bento-desktop {
     grid-column: 1 / -1;
-    min-height: auto;
-    background-color: var(--dashboard-bento-apps-surface);
-    padding: 16px 24px;
-}
-
-.dashboard .bento-desktop-switch-inner {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 16px;
-}
-
-.dashboard .bento-desktop-switch-text {
-    font-size: 14px;
-    font-weight: 500;
-    color: var(--dashboard-text-secondary);
-}
-
-.dashboard .bento-desktop-switch-btn {
-    flex-shrink: 0;
-    padding: 8px 16px;
-    font-size: 13px;
-    font-weight: 500;
-    color: var(--dashboard-background);
-    background: var(--dashboard-icon-blue-start);
-    border: 1px solid var(--dashboard-primary);
-    border-radius: 8px;
-    cursor: pointer;
+    gap: 14px;
+    padding: 18px 24px;
+    background-color: var(--dashboard-bento-desktop-header-bg);
     text-decoration: none;
-    transition: background 0.15s, color 0.15s;
+    color: inherit;
+    transition: box-shadow 0.15s ease;
 }
 
 @media (hover: hover) {
-    .dashboard .bento-desktop-switch-btn:hover {
-        background: var(--dashboard-icon-blue-end);
-        color: white;
+    .dashboard .bento-desktop:hover {
+        box-shadow:
+            0 2px 4px var(--dashboard-shadow-subtle),
+            0 10px 28px var(--dashboard-bento-desktop-icon-shadow);
     }
+
+    .dashboard .bento-desktop:hover .bento-desktop-arrow {
+        transform: translateX(3px);
+        color: var(--dashboard-text-primary);
+    }
+}
+
+.dashboard .bento-desktop-arrow {
+    margin-left: auto;
+    font-size: 22px;
+    font-weight: 300;
+    line-height: 1;
+    color: var(--dashboard-text-hint);
+    transition: transform 0.15s ease, color 0.15s ease;
 }
 
 /* Usage bento card (cool indigo surfaces; orange bars stay as progress accent) */
@@ -1697,6 +3169,11 @@ input.myapps-search::placeholder {
     }
 
     .dashboard .bento-card-fancy-header {
+        padding: 16px 20px;
+        gap: 12px;
+    }
+
+    .dashboard .bento-desktop {
         padding: 16px 20px;
         gap: 12px;
     }

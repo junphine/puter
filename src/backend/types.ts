@@ -453,6 +453,14 @@ interface IConfigOptional {
     env: 'dev' | 'prod';
     /** Free-form name of the config profile (e.g. `oss-default`). Surfaced in logs. */
     config_name: string;
+    /**
+     * Console output format. `json` replaces the global console so every call
+     * emits one structured JSON line (`level`, `timestamp`, `msg`, and the
+     * active `traceId`) — one event per call, so a line-oriented log collector
+     * can't split stack traces across events, and level filtering works. `text`
+     * (the default) leaves console output human-readable for local/dev.
+     */
+    log_format: 'json' | 'text';
     /** Server version. Falls back to `npm_package_version`. */
     version: string;
     /** Stable identity for this server node. Enables pager alerts + graceful shutdown delay. */
@@ -525,6 +533,12 @@ interface IConfigOptional {
      * banner that DefaultUserService prints. Intended for tests.
      */
     no_default_user: boolean;
+    /**
+     * Import `.ts` extension sources instead of built `.js`. Only for
+     * transform-capable runtimes (the test harness sets this); plain node
+     * cannot execute the TypeScript sources.
+     */
+    import_ts_extensions?: boolean;
     /** Optional dev-time frontend watcher overrides. */
     devwatch: IDevWatcherConfig;
 
@@ -569,6 +583,12 @@ interface IConfigOptional {
     min_pass_length: number;
     /** When true, allow the 'system' user to log in. */
     allow_system_login: boolean;
+    /**
+     * When true, anonymous users cannot create new accounts or temporary
+     * sessions. Existing accounts can still log in, and pre-existing
+     * placeholder rows may still be claimed.
+     */
+    disable_user_signup: boolean;
     /** Reject auth-gated routes unless the user has confirmed their email. */
     strict_email_verification_required: boolean;
     /**
@@ -585,6 +605,30 @@ interface IConfigOptional {
      * signups). Requires a payments extension to actually run the $0 auth.
      */
     always_require_card_verification: boolean;
+    /**
+     * Let a user who keeps getting blocked on SMS phone verification fall
+     * back to credit-card verification, which clears the phone gate (and the
+     * card gate too, when one is set). Off by default.
+     *
+     * The fallback opens after `after_attempts` SMS *send* attempts inside
+     * the send rate-limit window — successful sends count too, so a user who
+     * receives codes fine can still choose the card path after that many
+     * requests. This trades the phone signal for a card signal; it does NOT
+     * guarantee SMS actually failed. Once open, the fallback stays open for
+     * 24 hours so the user can finish the card flow. Requires a payments
+     * extension to run the actual card check.
+     */
+    phone_verification_card_fallback: {
+        enabled: boolean;
+        /**
+         * SMS send attempts (within the send rate-limit window) before the
+         * card fallback opens. Defaults to 2 when omitted. Values above the
+         * send route's rate limit (10/hour) are clamped down to it — requests
+         * past the route limit never reach the attempt counter, so a higher
+         * threshold could never be crossed.
+         */
+        after_attempts?: number;
+    };
     /** Captcha configuration. */
     captcha: { enabled: boolean; difficulty?: 'easy' | 'medium' | 'hard' };
     /** OIDC / OAuth2 providers (google + custom). */

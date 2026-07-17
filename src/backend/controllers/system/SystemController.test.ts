@@ -18,9 +18,10 @@
  */
 
 import type { Request, RequestHandler, Response } from 'express';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { v4 as uuidv4 } from 'uuid';
 import type { Actor } from '../../core/actor.js';
+import { kv } from '../../util/kvSingleton.js';
 import { PuterRouter } from '../../core/http/PuterRouter.js';
 import { PuterServer } from '../../server.js';
 import { setupTestServer } from '../../testUtil.js';
@@ -79,10 +80,11 @@ interface CapturedResponse {
 const makeReq = (init: {
     body?: unknown;
     actor?: Actor;
+    query?: Record<string, unknown>;
 }): Request => {
     return {
         body: init.body ?? {},
-        query: {},
+        query: init.query ?? {},
         headers: {},
         actor: init.actor,
     } as unknown as Request;
@@ -138,6 +140,191 @@ describe('SystemController GET /healthcheck', () => {
         // so ok=true is the expected steady state for this harness.
         expect(captured.body).toMatchObject({ ok: true });
         expect(captured.statusCode).toBe(200);
+    });
+
+    it('parses ?ignore and ?marked-degraded into trimmed name lists', async () => {
+        const spy = vi
+            .spyOn(server.services.health, 'getStatus')
+            .mockResolvedValue({ ok: true });
+        try {
+            const { res } = makeRes();
+            await callRoute(
+                'get',
+                '/healthcheck',
+                makeReq({
+                    query: {
+                        ignore: 'database-liveness, thumbnailer',
+                        'marked-degraded': ' socket-initialized ',
+                    },
+                }),
+                res,
+            );
+            expect(spy).toHaveBeenCalledWith({
+                ignore: ['database-liveness', 'thumbnailer'],
+                degrade: ['socket-initialized'],
+            });
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    it('returns ok:true + 200 when the only failures are ignored', async () => {
+        const spy = vi
+            .spyOn(server.services.health, 'getStatus')
+            .mockImplementation(async ({ ignore = [] } = {}) => {
+                const failed = ['database-liveness'].filter(
+                    (name) => !ignore.includes(name),
+                );
+                return failed.length === 0
+                    ? { ok: true }
+                    : { ok: false, failed };
+            });
+        try {
+            const { res, captured } = makeRes();
+            await callRoute(
+                'get',
+                '/healthcheck',
+                makeReq({ query: { ignore: 'database-liveness' } }),
+                res,
+            );
+            expect(captured.body).toEqual({ ok: true });
+            expect(captured.statusCode).toBe(200);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    it('returns ok:true + 207 when the only failures are marked degraded', async () => {
+        const spy = vi
+            .spyOn(server.services.health, 'getStatus')
+            .mockResolvedValue({ ok: true, degraded: ['database-liveness'] });
+        try {
+            const { res, captured } = makeRes();
+            await callRoute(
+                'get',
+                '/healthcheck',
+                makeReq({ query: { 'marked-degraded': 'database-liveness' } }),
+                res,
+            );
+            expect(captured.body).toEqual({
+                ok: true,
+                degraded: ['database-liveness'],
+            });
+            expect(captured.statusCode).toBe(207);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    it('still 503s when a non-ignored failure remains', async () => {
+        const spy = vi
+            .spyOn(server.services.health, 'getStatus')
+            .mockImplementation(async ({ ignore = [] } = {}) => {
+                const failed = ['database-liveness', 'socket-initialized'].filter(
+                    (name) => !ignore.includes(name),
+                );
+                return failed.length === 0
+                    ? { ok: true }
+                    : { ok: false, failed };
+            });
+        try {
+            const { res, captured } = makeRes();
+            await callRoute(
+                'get',
+                '/healthcheck',
+                makeReq({ query: { ignore: 'database-liveness' } }),
+                res,
+            );
+            expect(captured.statusCode).toBe(503);
+            expect(captured.body).toEqual({
+                ok: false,
+                failed: ['socket-initialized'],
+            });
+        } finally {
+            spy.mockRestore();
+        }
+    });
+});
+
+// ── ServerHealthService.getStatus ignore / degrade filtering ────────
+//
+// Exercises the real service by seeding the in-process status cache
+// (the kv.js singleton) it reads from, so the actual per-request
+// classification runs — not a stubbed getStatus.
+
+describe('ServerHealthService.getStatus ignore/degrade filtering', () => {
+    const STATUS_CACHE_KEY = 'server-health:status';
+
+    const seedStatus = (status: unknown) => {
+        kv.set(STATUS_CACHE_KEY, status, { EX: 5 });
+    };
+
+    afterEach(() => {
+        kv.del(STATUS_CACHE_KEY);
+    });
+
+    it('collapses to ok:true when every failure is ignored', async () => {
+        seedStatus({ ok: false, failed: ['database-liveness', 'thumbnailer'] });
+        const status = await server.services.health.getStatus({
+            ignore: ['database-liveness', 'thumbnailer'],
+        });
+        expect(status).toEqual({ ok: true });
+    });
+
+    it('keeps the non-ignored failures', async () => {
+        seedStatus({ ok: false, failed: ['database-liveness', 'thumbnailer'] });
+        const status = await server.services.health.getStatus({
+            ignore: ['database-liveness'],
+        });
+        expect(status).toEqual({ ok: false, failed: ['thumbnailer'] });
+    });
+
+    it('is a no-op for a healthy status', async () => {
+        seedStatus({ ok: true });
+        const status = await server.services.health.getStatus({
+            ignore: ['database-liveness'],
+        });
+        expect(status).toEqual({ ok: true });
+    });
+
+    it('ignores unknown names without affecting real failures', async () => {
+        seedStatus({ ok: false, failed: ['database-liveness'] });
+        const status = await server.services.health.getStatus({
+            ignore: ['not-a-check'],
+        });
+        expect(status).toEqual({ ok: false, failed: ['database-liveness'] });
+    });
+
+    it('demotes marked failures to degraded and stays ok:true', async () => {
+        seedStatus({ ok: false, failed: ['database-liveness'] });
+        const status = await server.services.health.getStatus({
+            degrade: ['database-liveness'],
+        });
+        expect(status).toEqual({ ok: true, degraded: ['database-liveness'] });
+    });
+
+    it('reports degraded alongside remaining hard failures (ok:false)', async () => {
+        seedStatus({
+            ok: false,
+            failed: ['database-liveness', 'socket-initialized'],
+        });
+        const status = await server.services.health.getStatus({
+            degrade: ['database-liveness'],
+        });
+        expect(status).toEqual({
+            ok: false,
+            failed: ['socket-initialized'],
+            degraded: ['database-liveness'],
+        });
+    });
+
+    it('lets ignore take precedence over degrade for the same name', async () => {
+        seedStatus({ ok: false, failed: ['database-liveness'] });
+        const status = await server.services.health.getStatus({
+            ignore: ['database-liveness'],
+            degrade: ['database-liveness'],
+        });
+        expect(status).toEqual({ ok: true });
     });
 });
 
@@ -233,6 +420,7 @@ describe('SystemController GET /whoarewe', () => {
         expect(captured.body).toMatchObject({
             name: 'Puter',
             environment: 'dev',
+            disable_user_signup: false,
         });
     });
 });

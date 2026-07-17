@@ -25,7 +25,9 @@ import type { Application, RequestHandler } from 'express';
 import helmet from 'helmet';
 import uaParser from 'ua-parser-js';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { parseArgs } from 'node:util';
 import http from 'node:http';
 import { puterClients } from './clients';
 import { puterControllers } from './controllers';
@@ -44,6 +46,7 @@ import {
     requireVerifiedGate,
     subdomainGate,
 } from './core/http/middleware/gates';
+import { createStepUpGate } from './core/http/middleware/stepUpSession';
 import { createNotFoundHandler } from './core/http/middleware/notFoundHandler';
 import {
     requireAntiCsrf,
@@ -60,6 +63,7 @@ import {
     createUserSubdomainRedirect,
     createNativeAppStatic,
 } from './core/http/middleware/hostRedirects';
+import { createLocalWorkerProxyMiddleware } from './core/http/middleware/localWorkerProxy';
 import { createPuterSiteMiddleware } from './core/http/middleware/puterSite';
 import { PuterRouter } from './core/http/PuterRouter';
 import { createRouteLifecycleMiddleware } from './core/http/routeLifecycle';
@@ -452,6 +456,18 @@ export class PuterServer {
         this.#app.options('/*splat', (_req, res) => {
             res.sendStatus(200);
         });
+
+        // -- Local Worker proxy (*.workers.puter.localhost) ----------
+        // Dev-only Miniflare dispatch, gated on `config.workers.localServer`.
+        // Mounted BEFORE body parsing so the Worker receives the raw request
+        // stream; no-op in production (real Cloudflare via WorkerDriver).
+        this.#app.use(
+            createLocalWorkerProxyMiddleware(this.#config, {
+                clients: this.clients,
+                stores: this.stores,
+                services: this.services,
+            }),
+        );
 
         // -- Body parsing (JSON + text-as-json shim) -----------------
         const captureRawBody: NonNullable<
@@ -864,10 +880,12 @@ export class PuterServer {
         // carry, so it works for either actor shape.
         //
         // `adminOnly` also does NOT imply `requireUserActor`: admin endpoints
-        // should be callable from scripts/automation using an admin's access
-        // token, not only from browser sessions. `adminOnlyGate` gates on
-        // `actor.user.username`, which is populated for access-token and
-        // app-under-user actors alike.
+        // stay callable from scripts/automation using an admin's full-access
+        // token, not only from browser sessions — both are root tokens.
+        // Beyond the username check, `adminOnlyGate` requires a root token
+        // (rejecting an admin acting through a third-party app) unless the
+        // route is also appId-gated, in which case `allowedAppIdsGate` governs
+        // which apps may pass.
         if (opts.requireUserActor) {
             mwChain.push(
                 requireUserActorGate({
@@ -878,7 +896,24 @@ export class PuterServer {
 
         if (opts.adminOnly) {
             const extras = Array.isArray(opts.adminOnly) ? opts.adminOnly : [];
-            mwChain.push(adminOnlyGate(extras));
+            mwChain.push(
+                adminOnlyGate(extras, {
+                    appGated: Boolean(opts.allowedAppIds),
+                }),
+            );
+            // An admin username on a leaked session isn't enough — also require
+            // a recent re-authentication. Exempt only a token that carries one
+            // of the route's allowlisted app ids: an admin acting through an
+            // allowlisted app can't elevate (apps have no password/TOTP; see
+            // createStepUpGate). A root/human session — no app id in the token —
+            // still requires step-up, and `allowedAppIdsGate` still enforces the
+            // allowlist for the app path.
+            mwChain.push(
+                createStepUpGate({
+                    tokenService: this.services.token,
+                    allowedAppUids: opts.allowedAppIds,
+                }),
+            );
         }
 
         if (opts.allowedAppIds) {
@@ -1067,8 +1102,32 @@ export class PuterServer {
             for (const entry of readdirSync(extDir, { withFileTypes: true })) {
                 const entryPath = `${extDir}/${entry.name}`;
 
-                if (entry.isFile() && !entry.name.includes('.test.')) {
-                    if (/\.(js|mjs|cjs|ts)$/.test(entry.name)) {
+                if (entry.isFile()) {
+                    const name = entry.name;
+                    let shouldImport: boolean;
+                    if (this.#config.import_ts_extensions) {
+                        // Extensions ship as compiled .js at runtime, but
+                        // transform-capable runtimes (the test harness)
+                        // import the .ts sources directly. Skip tests and
+                        // declarations, and skip built .js siblings of a
+                        // .ts source so a previously-built tree doesn't
+                        // double-register.
+                        if (name.endsWith('.ts')) {
+                            shouldImport =
+                                !name.endsWith('.test.ts') &&
+                                !name.endsWith('.d.ts');
+                        } else {
+                            shouldImport =
+                                /\.(js|mjs|cjs)$/.test(name) &&
+                                !/\.test\.(js|mjs|cjs)$/.test(name) &&
+                                !existsSync(
+                                    entryPath.replace(/\.(js|mjs|cjs)$/, '.ts'),
+                                );
+                        }
+                    } else {
+                        shouldImport = /\.(js|mjs|cjs)$/.test(name);
+                    }
+                    if (shouldImport) {
                         console.log(`Importing extension file ${entryPath}`);
                         await import(pathToFileURL(entryPath).href);
                     }
@@ -1131,35 +1190,82 @@ export class PuterServer {
         }
 
         if (!noHttpServer) {
-            this.#server = httpServer.listen(this.#config.port, async () => {
-                const cfg = this.#config;
-                const liveUrl =
-                    cfg.origin ??
-                    `${cfg.protocol ?? 'http'}://${cfg.domain ?? 'localhost'}:${this.#config.port}`;
-                console.log(
-                    '\n************************************************************',
-                );
-                console.log(`* Puter is now live at: ${liveUrl}`);
-                console.log(
-                    '************************************************************\n',
-                );
-
-                await this.#fireOnServerStart();
-                console.log('PuterServer has fully booted.');
-                // Auto-launch the browser on dev boot (matches v1 WebServerService).
-                // Opt out via `no_browser_launch: true` in config.
-                if (this.#config.env === 'dev' && !cfg.no_browser_launch) {
-                    try {
-                        const openModule = await import('open');
-                        await openModule.default(liveUrl);
-                    } catch (e) {
-                        console.log(
-                            '[server] could not auto-open browser:',
-                            (e as Error).message,
-                        );
-                    }
-                }
+            // Await 'listening' (and full boot below) so callers can rely on
+            // the server being reachable once start() resolves — test
+            // harnesses connect real clients immediately after.
+            this.#server = httpServer.listen(this.#config.port);
+            await new Promise<void>((resolve, reject) => {
+                const onError = (err: Error) => reject(err);
+                httpServer.once('error', onError);
+                httpServer.once('listening', () => {
+                    // Detach so post-boot 'error' events aren't swallowed
+                    // by a no-op reject on this settled promise.
+                    httpServer.removeListener('error', onError);
+                    resolve();
+                });
             });
+
+            const cfg = this.#config;
+            const liveUrl =
+                cfg.origin ??
+                `${cfg.protocol ?? 'http'}://${cfg.domain ?? 'localhost'}:${this.#config.port}`;
+            console.log(
+                '\n************************************************************',
+            );
+            console.log(`* Puter is now live at: ${liveUrl}`);
+            console.log(
+                '************************************************************\n',
+            );
+
+            await this.#fireOnServerStart();
+            console.log('PuterServer has fully booted.');
+
+            // CLI: `--server` (optionally `--puter-backend=<gui-origin>`)
+            // runs the AuthMe flow against a remote Puter (default
+            // puter.com), then opens the local GUI already logged in and
+            // pointed at that backend. Restores the v1 WebServerService
+            // `--server` behavior; works in any env. When set, it takes
+            // over browser launch so we don't also open a plain tab.
+            const { values: cliArgs } = parseArgs({
+                args: process.argv.slice(2),
+                options: {
+                    server: { type: 'boolean' },
+                    'puter-backend': { type: 'string' },
+                },
+                strict: false,
+            });
+
+            if (cliArgs.server) {
+                try {
+                    // tools/auth_gui.js is not compiled into dist/, so
+                    // resolve it from the package root (cwd, per the
+                    // `start` script) rather than relative to this module.
+                    const authGuiUrl = pathToFileURL(
+                        path.resolve(process.cwd(), 'tools/auth_gui.js'),
+                    ).href;
+                    const authGui = (await import(authGuiUrl)).default;
+                    await authGui(
+                        cliArgs['puter-backend'] as string | undefined,
+                    );
+                } catch (e) {
+                    console.log(
+                        '[server] could not start AuthMe browser flow:',
+                        (e as Error).message,
+                    );
+                }
+            } else if (this.#config.env === 'dev' && !cfg.no_browser_launch) {
+                // Auto-launch the browser on dev boot (matches v1
+                // WebServerService). Opt out via `no_browser_launch: true`.
+                try {
+                    const openModule = await import('open');
+                    await openModule.default(liveUrl);
+                } catch (e) {
+                    console.log(
+                        '[server] could not auto-open browser:',
+                        (e as Error).message,
+                    );
+                }
+            }
         } else {
             this.#server = {
                 close: (cb: (error?: Error) => void | undefined) => {
@@ -1198,47 +1304,51 @@ export class PuterServer {
         }
     }
 
+    #prepareShutdownHooksRan = false;
+
+    /**
+     * Run every layer's `onServerPrepareShutdown` exactly once, whichever
+     * of `prepareShutdown()` / `shutdown()` gets there first.
+     */
+    async #runPrepareShutdownHooks() {
+        if (this.#prepareShutdownHooksRan) return;
+        this.#prepareShutdownHooksRan = true;
+        for (const client of Object.values(this.clients) as WithLifecycle[]) {
+            if (client.onServerPrepareShutdown) {
+                await client.onServerPrepareShutdown();
+            }
+        }
+        for (const store of Object.values(this.stores) as WithLifecycle[]) {
+            if (store.onServerPrepareShutdown) {
+                await store.onServerPrepareShutdown();
+            }
+        }
+        for (const service of Object.values(this.services) as WithLifecycle[]) {
+            if (service.onServerPrepareShutdown) {
+                await service.onServerPrepareShutdown();
+            }
+        }
+        for (const controller of Object.values(
+            this.controllers,
+        ) as WithLifecycle[]) {
+            if (controller.onServerPrepareShutdown) {
+                await controller.onServerPrepareShutdown();
+            }
+        }
+        for (const driver of Object.values(this.drivers) as WithLifecycle[]) {
+            if (driver.onServerPrepareShutdown) {
+                await driver.onServerPrepareShutdown();
+            }
+        }
+    }
+
     async prepareShutdown() {
         if (this.#server) {
             this.#server.close(async () => {
                 console.log(
                     'PuterServer has stopped accepting new connections',
                 );
-                for (const client of Object.values(
-                    this.clients,
-                ) as WithLifecycle[]) {
-                    if (client.onServerPrepareShutdown) {
-                        await client.onServerPrepareShutdown();
-                    }
-                }
-                for (const store of Object.values(
-                    this.stores,
-                ) as WithLifecycle[]) {
-                    if (store.onServerPrepareShutdown) {
-                        await store.onServerPrepareShutdown();
-                    }
-                }
-                for (const service of Object.values(
-                    this.services,
-                ) as WithLifecycle[]) {
-                    if (service.onServerPrepareShutdown) {
-                        await service.onServerPrepareShutdown();
-                    }
-                }
-                for (const controller of Object.values(
-                    this.controllers,
-                ) as WithLifecycle[]) {
-                    if (controller.onServerPrepareShutdown) {
-                        await controller.onServerPrepareShutdown();
-                    }
-                }
-                for (const driver of Object.values(
-                    this.drivers,
-                ) as WithLifecycle[]) {
-                    if (driver.onServerPrepareShutdown) {
-                        await driver.onServerPrepareShutdown();
-                    }
-                }
+                await this.#runPrepareShutdownHooks();
             });
         }
     }
@@ -1246,7 +1356,18 @@ export class PuterServer {
     async shutdown() {
         if (this.#server) {
             console.log('PuterServer is shutting down');
+            // Prepare hooks come first: SocketService's hook closes
+            // socket.io, disconnecting upgraded websocket connections that
+            // `closeAllConnections()` does not cover — without this,
+            // `close()` waits forever on any connected socket.io client.
+            await this.#runPrepareShutdownHooks();
+            // Stop accepting new connections, then sever live ones; the
+            // close callback fires once the listener is fully released.
+            const closed = new Promise<void>((resolve) => {
+                this.#server!.close(() => resolve());
+            });
             this.#server.closeAllConnections();
+            await closed;
             for (const client of Object.values(
                 this.clients,
             ) as WithLifecycle[]) {

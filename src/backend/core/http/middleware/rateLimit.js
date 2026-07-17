@@ -18,6 +18,7 @@
  */
 
 import crypto from 'node:crypto';
+import { withSpan } from '../../../util/span.js';
 import { HttpError } from '../HttpError.js';
 
 /**
@@ -256,8 +257,32 @@ async function acquireKvConcurrent(kv, key, limit) {
 // limiting — so route / driver code never has to reason about which
 // backend is wired for which mode.
 
+/**
+ * Wrap a backend pair so every rate / acquire call runs inside a span
+ * tagged with the backend name. Applied at registration, so all gates
+ * (route middleware, driver helpers, imperative checks) are covered.
+ */
+function instrumentBackendPair(name, pair) {
+    const attrs = { 'rate_limit.backend': name };
+    return {
+        rate: (key, limit, windowMs) =>
+            withSpan('rate_limit.check', attrs, () =>
+                pair.rate(key, limit, windowMs),
+            ),
+        acquire: (key, limit) =>
+            withSpan('rate_limit.acquire', attrs, () =>
+                pair.acquire(key, limit),
+            ),
+    };
+}
+
+const memoryBackendPair = instrumentBackendPair('memory', {
+    rate: checkMemory,
+    acquire: acquireMemoryConcurrent,
+});
+
 const backends = {
-    memory: { rate: checkMemory, acquire: acquireMemoryConcurrent },
+    memory: memoryBackendPair,
 };
 let defaultBackendName = 'memory';
 
@@ -295,19 +320,19 @@ export function configureRateLimit({
 } = {}) {
     // Reset (test reconfigure clears stale wiring).
     for (const name of Object.keys(backends)) delete backends[name];
-    backends.memory = { rate: checkMemory, acquire: acquireMemoryConcurrent };
+    backends.memory = memoryBackendPair;
     if (redis) {
-        backends.redis = {
+        backends.redis = instrumentBackendPair('redis', {
             rate: (key, limit, windowMs) =>
                 checkRedis(redis, key, limit, windowMs),
             acquire: (key, limit) => acquireRedisConcurrent(redis, key, limit),
-        };
+        });
     }
     if (kv) {
-        backends.kv = {
+        backends.kv = instrumentBackendPair('kv', {
             rate: (key, limit, windowMs) => checkKv(kv, key, limit, windowMs),
             acquire: (key, limit) => acquireKvConcurrent(kv, key, limit),
-        };
+        });
     }
 
     meteringService = metering ?? null;
@@ -351,9 +376,10 @@ function resolveBackend(name) {
  * Build a rate-limit key from the request.
  *
  * Strategies:
- *   'fingerprint' — IP + User-Agent hash (default). Good for
- *                    unauthenticated endpoints where the same IP may
- *                    serve many users (offices, VPNs).
+ *   'fingerprint' — network hash (IP + headers), refined by the client's
+ *                    device fingerprint when one was supplied (default).
+ *                    Good for unauthenticated endpoints where the same
+ *                    IP may serve many users (offices, VPNs).
  *   'ip'          — bare IP. Simpler but coarser.
  *   'user'        — actor UUID. Use for authenticated endpoints where
  *                    you want per-account limits regardless of IP.
@@ -395,7 +421,7 @@ function ip(req) {
 /**
  * A coarse network fingerprint for a request: a short hash of the (proxy-aware)
  * IP plus the headers a client can't trivially vary per-request without also
- * changing how the request looks. Used as the default rate-limit key here, and
+ * changing how the request looks. Anchors the default rate-limit key here, and
  * exported so the global fingerprint middleware can stamp the identical value
  * on `req.networkFingerprint` (one key space shared by both).
  */
@@ -413,8 +439,19 @@ export function computeNetworkFingerprint(req) {
         .slice(0, 16);
 }
 
+/**
+ * The device fingerprint (validated and stamped by the fingerprint middleware)
+ * refines the bucket so devices behind one NAT don't crowd each other's limit.
+ * It stays anchored to the network hash because the value is client-supplied:
+ * alone it could be spoofed to drain another device's bucket, and rotating it
+ * to mint fresh buckets is caught by the same stacked 'ip' backstop that
+ * catches User-Agent rotation.
+ */
 function fingerprint(req) {
-    return computeNetworkFingerprint(req);
+    const network = req.networkFingerprint ?? computeNetworkFingerprint(req);
+    return req.deviceFingerprint
+        ? `${network}:${req.deviceFingerprint}`
+        : network;
 }
 
 // -- Route middleware ------------------------------------------------

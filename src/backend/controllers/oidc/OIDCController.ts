@@ -17,6 +17,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+import crypto from 'node:crypto';
 import type { Request, Response } from 'express';
 import { HttpError } from '../../core/http/HttpError.js';
 import type { PuterRouter } from '../../core/http/PuterRouter.js';
@@ -26,51 +27,77 @@ import { sessionCookieFlags } from '../../util/cookieFlags.js';
 const REVALIDATION_COOKIE_NAME = 'puter_revalidation';
 const REVALIDATION_EXPIRY_SEC = 300;
 
+// Companion cookie that binds an OIDC flow to the browser that started it.
+// Expiry mirrors STATE_EXPIRY_SEC in OIDCService — the state and its
+// browser-binding cookie must expire together.
+const OIDC_NONCE_COOKIE_NAME = 'puter_oidc_nonce';
+const OIDC_NONCE_EXPIRY_SEC = 600;
+
 const OIDC_ERROR_REDIRECT_MAP: Record<string, Record<string, string>> = {
     login: { account_not_found: 'signup', other: 'login' },
     signup: { account_already_exists: 'login', other: 'signup' },
 };
 
-const ALLOWED_ERRORS = ['account_suspended', 'unauthorized'] as const;
+// The `message` query param is clamped to these codes — the GUI maps them to
+// display text. Free-text errors (which may describe internals or, for vetoed
+// signups, the block reason) never reach the redirect URL.
+const ALLOWED_ERRORS = [
+    'account_suspended',
+    'unauthorized',
+    'signup_blocked',
+] as const;
 
 function buildErrorRedirectUrl(
     origin: string,
     sourceFlow: string,
     errorCondition: string,
-    message: (typeof ALLOWED_ERRORS)[number],
+    message: string,
     stateDecoded?: Record<string, unknown>,
+    requestCode?: string,
 ): string {
     const targetFlow =
         OIDC_ERROR_REDIRECT_MAP[sourceFlow]?.[errorCondition] ?? sourceFlow;
     const base = origin.replace(/\/$/, '') || '/';
+    const clamped = (ALLOWED_ERRORS as readonly string[]).includes(message)
+        ? message
+        : 'unauthorized';
 
+    let params: URLSearchParams;
     if (stateDecoded?.embedded_in_popup && stateDecoded?.msg_id != null) {
-        const params = new URLSearchParams({
+        params = new URLSearchParams({
             embedded_in_popup: 'true',
             msg_id: String(stateDecoded.msg_id),
             auth_error: '1',
-            message: ALLOWED_ERRORS.includes(message)
-                ? message
-                : 'unauthorized',
+            message: clamped,
             action: targetFlow,
         });
         if (stateDecoded?.opener_origin) {
             params.set('opener_origin', String(stateDecoded.opener_origin));
         }
-        return `${base}/?${params.toString()}`;
+    } else {
+        params = new URLSearchParams({
+            action: targetFlow,
+            auth_error: '1',
+            message: clamped,
+        });
     }
-
-    const params = new URLSearchParams({
-        action: targetFlow,
-        auth_error: '1',
-        message: ALLOWED_ERRORS.includes(message) ? message : 'unauthorized',
-    });
+    if (requestCode) {
+        params.set('request_code', requestCode);
+    }
     return `${base}/?${params.toString()}`;
 }
 
 function appendQueryParam(url: string, key: string, value: string): string {
     const sep = url.includes('?') ? '&' : '?';
     return `${url}${sep}${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
+}
+
+/** Length-safe constant-time string compare (never throws on mismatch). */
+function constantTimeEqual(a: string, b: string): boolean {
+    const ba = Buffer.from(a);
+    const bb = Buffer.from(b);
+    if (ba.length !== bb.length) return false;
+    return crypto.timingSafeEqual(ba, bb);
 }
 
 /**
@@ -139,6 +166,19 @@ export class OIDCController extends PuterController {
 
                 let appRedirectUri = flowRedirects[flow] ?? (origin || '/');
 
+                // Optional GUI return path so login started from /desktop or
+                // /dashboard lands back there. Strict whitelist — never a
+                // client-supplied URL (no open redirect).
+                const rawReturnTo = Array.isArray(req.query.return_to)
+                    ? req.query.return_to[0]
+                    : req.query.return_to;
+                if (
+                    (flow === 'login' || flow === 'signup') &&
+                    (rawReturnTo === '/desktop' || rawReturnTo === '/dashboard')
+                ) {
+                    appRedirectUri = `${origin}${rawReturnTo}`;
+                }
+
                 // Popup support
                 const rawPopup = Array.isArray(req.query.embedded_in_popup)
                     ? req.query.embedded_in_popup[0]
@@ -198,6 +238,17 @@ export class OIDCController extends PuterController {
                     statePayload.flow = 'revalidate';
                 }
 
+                // Bind this flow to the initiating browser: a single-use
+                // nonce lives both in the signed `state` and in an HttpOnly
+                // companion cookie. The callback requires them to match, so a
+                // `state` captured from an attacker's own flow can't be
+                // replayed in a victim's browser (login-CSRF / session
+                // fixation).
+                const browserNonce = crypto
+                    .randomBytes(32)
+                    .toString('base64url');
+                statePayload.nonce = browserNonce;
+
                 const state = this.services.oidc.signState(statePayload);
                 const url = await this.services.oidc.getAuthorizationUrl(
                     provider,
@@ -211,6 +262,15 @@ export class OIDCController extends PuterController {
                         { legacyCode: 'internal_error' },
                     );
 
+                res.cookie(OIDC_NONCE_COOKIE_NAME, browserNonce, {
+                    // Same flags as the session cookie: SameSite=None;Secure
+                    // on HTTPS so the cookie survives Apple's cross-site
+                    // form_post callback; Lax on plain-HTTP self-host.
+                    ...sessionCookieFlags(this.config),
+                    httpOnly: true,
+                    maxAge: OIDC_NONCE_EXPIRY_SEC * 1000,
+                    path: '/',
+                });
                 res.redirect(302, url);
             },
         );
@@ -224,7 +284,7 @@ export class OIDCController extends PuterController {
 
         const loginCb = async (req: Request, res: Response) => {
             const origin = this.config.origin ?? '';
-            const result = await this.#processCallback(req, 'login');
+            const result = await this.#processCallback(req, res, 'login');
             if ('error' in result) {
                 console.warn(`OIDC login callback error: ${result.error}`);
                 return res.redirect(
@@ -255,8 +315,9 @@ export class OIDCController extends PuterController {
                         origin,
                         'login',
                         'other',
-                        resolved.error,
+                        resolved.code ?? 'unauthorized',
                         stateDecoded,
+                        resolved.requestCode,
                     ),
                 );
             }
@@ -272,7 +333,7 @@ export class OIDCController extends PuterController {
                         origin,
                         'login',
                         'other',
-                        'This account is suspended.',
+                        'account_suspended',
                         stateDecoded,
                     ),
                 );
@@ -287,7 +348,7 @@ export class OIDCController extends PuterController {
 
         const signupCb = async (req: Request, res: Response) => {
             const origin = this.config.origin ?? '';
-            const result = await this.#processCallback(req, 'signup');
+            const result = await this.#processCallback(req, res, 'signup');
             if ('error' in result) {
                 return res.redirect(
                     302,
@@ -308,14 +369,18 @@ export class OIDCController extends PuterController {
                 (stateDecoded.referrer as string) ?? null,
             );
             if ('error' in resolved) {
+                console.warn(
+                    `OIDC signup user resolution error: ${resolved.error}`,
+                );
                 return res.redirect(
                     302,
                     buildErrorRedirectUrl(
                         origin,
                         'signup',
                         'other',
-                        'unauthorized',
+                        resolved.code ?? 'unauthorized',
                         stateDecoded,
+                        resolved.requestCode,
                     ),
                 );
             }
@@ -352,7 +417,7 @@ export class OIDCController extends PuterController {
             req: Request,
             res: Response,
         ): Promise<void> => {
-            const result = await this.#processCallback(req, 'revalidate');
+            const result = await this.#processCallback(req, res, 'revalidate');
             if ('error' in result) {
                 res.status(400).send(result.error);
                 return;
@@ -451,7 +516,7 @@ if (window.opener) {
         userinfo: { sub: string; email?: unknown; [k: string]: unknown },
         referrer?: string | null,
     ): Promise<
-        | { error: string }
+        | { error: string; code?: string; requestCode?: string }
         | {
               user: import('../../stores/user/UserStore.js').UserRow;
               origin: 'linked-sub' | 'linked-email' | 'created';
@@ -497,13 +562,18 @@ if (window.opener) {
             referrer,
         );
         if (!outcome.success || !outcome.user) {
-            return { error: outcome.error ?? 'Account creation failed.' };
+            return {
+                error: outcome.error ?? 'Account creation failed.',
+                code: outcome.code,
+                requestCode: outcome.requestCode,
+            };
         }
         return { user: outcome.user, origin: 'created' };
     }
 
     async #processCallback(
         req: Request,
+        res: Response,
         flow: string,
     ): Promise<
         | { error: string }
@@ -526,6 +596,28 @@ if (window.opener) {
         const stateDecoded = this.services.oidc.verifyState(state);
         if (!stateDecoded || !stateDecoded.provider)
             return { error: 'Invalid or expired state.' };
+
+        // Enforce the browser binding set at /start. Every state minted by
+        // the current /start carries a nonce, so this covers all live flows.
+        // States signed before this shipped have no nonce and pass through
+        // until they expire (STATE_EXPIRY, 10 min) so in-flight logins don't
+        // break on deploy — a caller can't forge a nonce-less state because
+        // /start always adds one and the state is server-signed.
+        const expectedNonce =
+            typeof stateDecoded.nonce === 'string' ? stateDecoded.nonce : '';
+        if (expectedNonce) {
+            const cookieNonce = req.cookies?.[OIDC_NONCE_COOKIE_NAME];
+            // Single-use: drop the cookie regardless of the outcome.
+            res.clearCookie(OIDC_NONCE_COOKIE_NAME, { path: '/' });
+            if (
+                typeof cookieNonce !== 'string' ||
+                !constantTimeEqual(cookieNonce, expectedNonce)
+            ) {
+                return {
+                    error: 'This sign-in could not be verified for your browser. Please start again.',
+                };
+            }
+        }
 
         const provider = String(stateDecoded.provider);
         const callbackUrl = this.services.oidc.getCallbackUrl(flow);

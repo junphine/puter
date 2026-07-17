@@ -37,17 +37,33 @@ export class SystemController extends PuterController {
     ) {
         // -- Healthcheck ---------------------------------------------
         // Delegates to ServerHealthService for the real check-based
-        // status. Returns `{ ok: true }` when all registered checks pass,
-        // or `{ ok: false, failed: [...] }` + 503 when any fail or the
+        // status. Returns `{ ok: true }` + 200 when all registered checks
+        // pass, or `{ ok: false, failed: [...] }` + 503 when any fail or the
         // server is draining.
-        router.get('/healthcheck', { subdomain: '*' }, async (_req, res) => {
+        //
+        // `?ignore=a,b` disregards the named checks for this request only.
+        // `?marked-degraded=a,b` demotes the named checks to a non-fatal
+        // `degraded` list: `ok` stays true but the response is 207 so the
+        // caller can tell the node is running in a degraded state.
+        const parseNames = (value) =>
+            typeof value === 'string'
+                ? value
+                      .split(',')
+                      .map((name) => name.trim())
+                      .filter(Boolean)
+                : [];
+        router.get('/healthcheck', { subdomain: '*' }, async (req, res) => {
             const health = this.services.health;
             if (!health || typeof health.getStatus !== 'function') {
                 // Fallback for boot ordering / missing service.
                 return res.send('ok');
             }
-            const status = await health.getStatus();
+            const status = await health.getStatus({
+                ignore: parseNames(req.query.ignore),
+                degrade: parseNames(req.query['marked-degraded']),
+            });
             if (!status.ok) return res.status(503).json(status);
+            if (status.degraded?.length) return res.status(207).json(status);
             return res.json(status);
         });
 
@@ -137,31 +153,31 @@ export class SystemController extends PuterController {
                 name: 'Puter',
                 version: this.config.version ?? null,
                 environment: this.config.env ?? 'prod',
+                disable_user_signup: Boolean(this.config.disable_user_signup),
             });
         });
 
-        // -- GET /lsmod ----------------------------------------------
-        // Enumerates driver interfaces and their implementors.
+        // -- GET|POST /lsmod -----------------------------------------
+        // Enumerates driver interfaces and their implementors. POST is
+        // also routed because puter.js `drivers.list()` sends POST.
 
-        router.get(
-            '/lsmod',
-            { subdomain: 'api', requireAuth: true },
-            (_req, res) => {
-                const interfaces = {};
-                for (const [key, driver] of Object.entries(this.drivers)) {
-                    const ifaceName = driver?.driverInterface;
-                    if (!ifaceName) continue;
-                    const driverName = driver.driverName ?? key;
-                    if (!interfaces[ifaceName]) {
-                        interfaces[ifaceName] = { implementors: {} };
-                    }
-                    interfaces[ifaceName].implementors[driverName] = {
-                        isDefault: Boolean(driver.isDefault),
-                    };
+        const lsmod = (_req, res) => {
+            const interfaces = {};
+            for (const [key, driver] of Object.entries(this.drivers)) {
+                const ifaceName = driver?.driverInterface;
+                if (!ifaceName) continue;
+                const driverName = driver.driverName ?? key;
+                if (!interfaces[ifaceName]) {
+                    interfaces[ifaceName] = { implementors: {} };
                 }
-                res.json({ interfaces });
-            },
-        );
+                interfaces[ifaceName].implementors[driverName] = {
+                    isDefault: Boolean(driver.isDefault),
+                };
+            }
+            res.json({ interfaces });
+        };
+        router.get('/lsmod', { subdomain: 'api', requireAuth: true }, lsmod);
+        router.post('/lsmod', { subdomain: 'api', requireAuth: true }, lsmod);
     }
 
     onServerStart() {}

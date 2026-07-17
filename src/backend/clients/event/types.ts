@@ -120,6 +120,21 @@ export type EventMap = {
         actor: unknown;
         result: { allowed: boolean; reason?: string; error?: string };
     };
+    // Emitted after an app token is granted (get-user-app-token). The app-side
+    // analogue of `site.htmlServed` — the external-app abuse scanner
+    // (extensions/subdomainAbuse/appScan.ts) listens to screenshot + classify
+    // external `index_url`s that Puter never serves itself.
+    'puter.app.authenticated': {
+        app_uid?: string;
+        user_id?: number | null;
+        app?: {
+            id?: number;
+            uid?: string;
+            index_url?: string | null;
+            owner_user_id?: number | null;
+            name?: string | null;
+        };
+    };
 
     // ---- Auth / signup ----
     'puter.signup.validate': {
@@ -236,6 +251,7 @@ export type EventMap = {
         fingerprint: string | null;
         funding: string | null;
         country: string | null;
+        customer_id: string | null;
         [key: string]: unknown;
     };
     'user.card-verified': {
@@ -244,6 +260,7 @@ export type EventMap = {
         fingerprint: string | null;
         funding: string | null;
         country: string | null;
+        customer_id: string | null;
     };
     'user.username-changed': {
         user_id: number;
@@ -375,6 +392,8 @@ export type EventMap = {
     // normalized path: `route.<method>.<path>.before|after|error|reject`. Same
     // wildcard + veto semantics as the driver lifecycle above.
     [K in `route.${string}`]: RouteLifecycleEvent;
+} & {
+    [K in `pubsub.login.${string}`]: { authtoken: string };
 };
 
 /**

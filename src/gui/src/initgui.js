@@ -57,6 +57,347 @@ import { DashboardService } from './services/DashboardService.js';
 import { ThemeService } from './services/ThemeService.js';
 import { privacy_aware_path } from './util/desktop.js';
 
+const postAuthActions = async (action) => {
+    // -------------------------------------------------------------------------------------
+    // Action: AuthMe — redirect to a third-party URL with the user's auth token
+    // -------------------------------------------------------------------------------------
+    if ( action === 'authme' ) {
+        const redirectURL = window.url_query_params.get('redirectURL');
+        if ( redirectURL ) {
+            const approved = await UIWindowAuthMe({
+                redirect_url: redirectURL,
+            });
+            if ( approved ) {
+                // Hand the app a named, revocable full-API-access
+                // token instead of the raw GUI/session token: it can
+                // use the whole API but can't manage the account.
+                let host = '';
+                try { host = new URL(redirectURL).host; } catch ( e ) { /* ignore */ }
+                let token;
+                try {
+                    token = await create_access_token({
+                        label: host
+                            ? `${i18n('token_label_external_app')} (${host})`
+                            : i18n('token_label_external_app'),
+                    });
+                } catch ( e ) {
+                    await UIAlert({ message: e?.message ?? String(e) });
+                    return;
+                }
+                const url = new URL(redirectURL);
+                url.searchParams.set('token', token);
+                window.location.href = url.href;
+                return;
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Action: CopyAuth — show dialog to copy auth token
+    // -------------------------------------------------------------------------------------
+    if ( action === 'copyauth' ) {
+        await UIWindowCopyToken({ show_header: true });
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Load desktop, only if we're not embedded in a popup and not on the dashboard page
+    // -------------------------------------------------------------------------------------
+    if ( !window.embedded_in_popup && !window.is_dashboard_mode ) {
+        if ( window.is_fullpage_mode ) {
+            // In fullpage mode, skip loading desktop items and background
+            UIDesktop({});
+        } else {
+            await window.get_auto_arrange_data();
+            puter.fs.stat({ path: window.desktop_path, consistency: 'eventual' }).then(desktop_fsentry => {
+                UIDesktop({ desktop_fsentry: desktop_fsentry });
+            });
+        }
+    }
+    // -------------------------------------------------------------------------------------
+    // Dashboard mode
+    // -------------------------------------------------------------------------------------
+    else if ( window.is_dashboard_mode ) {
+        UIDashboard();
+    }
+    // -------------------------------------------------------------------------------------
+    // If embedded in a popup, send the token to the opener and close the popup
+    // -------------------------------------------------------------------------------------
+    else {
+        let msg_id = window.url_query_params.get('msg_id');
+        let isolated = window.url_query_params.get("cross_origin_isolated") === 'true';
+        let session = window.url_query_params.get('signin_session');
+        if (isolated) {
+            try {
+                const data = await window.getUserAppToken(new URL(window.openerOrigin).origin);
+                const resp = await fetch(`${window.api_origin}/login/set`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        auth_token: data.token,
+                        session: session,
+                    }),
+                });
+                if (!resp.ok) {
+                    throw new Error(`/login/set failed: ${resp.status} ${resp.statusText}`);
+                }
+                window.close();
+                window.open('', '_self').close();
+            } catch (err) {
+                console.error(err);
+                await UIAlert({
+                    message: "Couldn't sign you in. Please try again.",
+                });
+            }
+            return;
+        } else {
+            try {
+                let data = await window.getUserAppToken(new URL(window.openerOrigin).origin);
+                // This is an implicit app and the app_uid is sent back from the server
+                // we cache it here so that we can use it later
+                window.host_app_uid = data.app_uid;
+                // send token to parent
+                window.opener.postMessage({
+                    msg: 'puter.token',
+                    success: true,
+                    token: data.token,
+                    app_uid: data.app_uid,
+                    username: window.user.username,
+                    msg_id: msg_id,
+                }, window.openerOrigin);
+                // close popup
+                if ( !action || action === 'sign-in' ) {
+                    window.close();
+                    window.open('', '_self').close();
+                }
+            } catch ( err ) {
+                // send error to parent
+                window.opener.postMessage({
+                    msg: 'puter.token',
+                    success: false,
+                    token: null,
+                    msg_id: msg_id,
+                }, window.openerOrigin);
+                // close popup
+                window.close();
+                window.open('', '_self').close();
+            }
+        }
+
+        let app_uid;
+
+        if ( window.openerOrigin ) {
+            app_uid = await window.getAppUIDFromOrigin(window.openerOrigin);
+            window.host_app_uid = app_uid;
+        }
+
+        if ( action === 'show-open-file-picker' ) {
+            let options = window.url_query_params.get('options');
+            options = JSON.parse(options ?? '{}');
+
+            // Open dialog
+            UIWindow({
+                allowed_file_types: options?.accept,
+                selectable_body: options?.multiple,
+                path: `/${ window.user.username }/Desktop`,
+                // this is the uuid of the window to which this dialog will return
+                return_to_parent_window: true,
+                show_maximize_button: false,
+                show_minimize_button: false,
+                title: 'Open',
+                is_dir: true,
+                is_openFileDialog: true,
+                is_resizable: false,
+                has_head: false,
+                cover_page: true,
+                // selectable_body: is_selectable_body,
+                iframe_msg_uid: msg_id,
+                center: true,
+                initiating_app_uuid: app_uid,
+                on_close: function () {
+                    window.opener.postMessage({
+                        msg: 'fileOpenCanceled',
+                        original_msg_id: msg_id,
+                    }, '*');
+                },
+            });
+        }
+        //--------------------------------------------------------------------------------------
+        // Action: Show Directory Picker
+        //--------------------------------------------------------------------------------------
+        else if ( action === 'show-directory-picker' ) {
+            // open directory picker dialog
+            UIWindow({
+                path: `/${ window.user.username }/Desktop`,
+                // this is the uuid of the window to which this dialog will return
+                // parent_uuid: event.data.appInstanceID,
+                return_to_parent_window: true,
+                show_maximize_button: false,
+                show_minimize_button: false,
+                title: 'Open',
+                is_dir: true,
+                is_directoryPicker: true,
+                is_resizable: false,
+                has_head: false,
+                cover_page: true,
+                // selectable_body: is_selectable_body,
+                iframe_msg_uid: msg_id,
+                center: true,
+                initiating_app_uuid: app_uid,
+                on_close: function () {
+                    window.opener.postMessage({
+                        msg: 'directoryOpenCanceled',
+                        original_msg_id: msg_id,
+                    }, '*');
+                },
+            });
+        }
+        //--------------------------------------------------------------------------------------
+        // Action: Show Save File Dialog
+        //--------------------------------------------------------------------------------------
+        else if ( action === 'show-save-file-picker' ) {
+            let allowed_file_types = window.url_query_params.get('allowed_file_types');
+
+            // send 'sendMeFileData' event to parent
+            window.opener.postMessage({
+                msg: 'sendMeFileData',
+            }, '*');
+
+            // listen for 'showSaveFilePickerPopup' event from parent
+            window.addEventListener('message', async (event) => {
+                if ( event.data.msg !== 'showSaveFilePickerPopup' )
+                {
+                    return;
+                }
+
+                // Open dialog
+                UIWindow({
+                    allowed_file_types: allowed_file_types,
+                    path: `/${ window.user.username }/Desktop`,
+                    // this is the uuid of the window to which this dialog will return
+                    return_to_parent_window: true,
+                    show_maximize_button: false,
+                    show_minimize_button: false,
+                    title: 'Save',
+                    is_dir: true,
+                    is_saveFileDialog: true,
+                    is_resizable: false,
+                    has_head: false,
+                    cover_page: true,
+                    // selectable_body: is_selectable_body,
+                    iframe_msg_uid: msg_id,
+                    center: true,
+                    initiating_app_uuid: app_uid,
+                    on_close: function () {
+                        window.opener.postMessage({
+                            msg: 'fileSaveCanceled',
+                            original_msg_id: msg_id,
+                        }, '*');
+                    },
+                    onSaveFileDialogSave: async function (target_path, el_filedialog_window) {
+                        $(el_filedialog_window).find('.window-disable-mask, .busy-indicator').show();
+                        let busy_init_ts = Date.now();
+
+                        let overwrite = false;
+                        let file_to_upload = new File([event.data.content], path.basename(target_path));
+                        let item_with_same_name_already_exists = true;
+                        while ( item_with_same_name_already_exists ) {
+                            // overwrite?
+                            if ( overwrite )
+                            {
+                                item_with_same_name_already_exists = false;
+                            }
+                            // upload
+                            try {
+                                const res = await puter.fs.write(
+                                    target_path,
+                                    file_to_upload,
+                                    {
+                                        dedupeName: false,
+                                        overwrite: overwrite,
+                                    },
+                                );
+
+                                let file_signature = await puter.fs.sign(app_uid, { uid: res.uid, action: 'write' });
+                                file_signature = file_signature.items;
+
+                                item_with_same_name_already_exists = false;
+                                window.opener.postMessage({
+                                    msg: 'fileSaved',
+                                    original_msg_id: msg_id,
+                                    filename: res.name,
+                                    saved_file: {
+                                        name: file_signature.fsentry_name,
+                                        readURL: file_signature.read_url,
+                                        writeURL: file_signature.write_url,
+                                        metadataURL: file_signature.metadata_url,
+                                        type: file_signature.type,
+                                        uid: file_signature.uid,
+                                        path: privacy_aware_path(res.path),
+                                    },
+                                }, '*');
+
+                                window.close();
+                                window.open('', '_self').close();
+                            }
+                            catch ( err ) {
+                                // item with same name exists
+                                if ( err.code === 'item_with_same_name_exists' ) {
+                                    const alert_resp = await UIAlert({
+                                        message: `<strong>${html_encode(err.entry_name)}</strong> already exists.`,
+                                        buttons: [
+                                            {
+                                                label: i18n('replace'),
+                                                value: 'replace',
+                                                type: 'primary',
+                                            },
+                                            {
+                                                label: i18n('cancel'),
+                                                value: 'cancel',
+                                            },
+                                        ],
+                                        parent_uuid: $(el_filedialog_window).attr('data-element_uuid'),
+                                    });
+                                    if ( alert_resp === 'replace' ) {
+                                        overwrite = true;
+                                    } else if ( alert_resp === 'cancel' ) {
+                                        // enable parent window
+                                        $(el_filedialog_window).find('.window-disable-mask, .busy-indicator').hide();
+                                        return;
+                                    }
+                                }
+                                else {
+                                    console.log(err);
+                                    // show error
+                                    await UIAlert({
+                                        message: err.message ?? 'Upload failed.',
+                                        parent_uuid: $(el_filedialog_window).attr('data-element_uuid'),
+                                    });
+                                    // enable parent window
+                                    $(el_filedialog_window).find('.window-disable-mask, .busy-indicator').hide();
+                                    return;
+                                }
+                            }
+                        }
+
+                        // done
+                        let busy_duration = (Date.now() - busy_init_ts);
+                        if ( busy_duration >= window.busy_indicator_hide_delay ) {
+                            $(el_filedialog_window).close();
+                        } else {
+                            setTimeout(() => {
+                                // close this dialog
+                                $(el_filedialog_window).close();
+                            }, Math.abs(window.busy_indicator_hide_delay - busy_duration));
+                        }
+                    },
+                });
+            });
+        }
+    }
+};
+
 const launch_services = async function (options) {
     // === Services Data Structures ===
     const services_l_ = [];
@@ -64,7 +405,7 @@ const launch_services = async function (options) {
     globalThis.services = {
         get: (name) => services_m_[name],
         emit: (id, args) => {
-            for ( const [_, instance] of services_l_ ) {
+            for (const [_, instance] of services_l_) {
                 instance.__on(id, args ?? []);
             }
         },
@@ -80,7 +421,7 @@ const launch_services = async function (options) {
     const service_script_deferred = { services: [], on_ready: [] };
     const service_script_api = {
         register: (...a) => service_script_deferred.services.push(a),
-        on_ready: fn => service_script_deferred.on_ready.push(fn),
+        on_ready: (fn) => service_script_deferred.on_ready.push(fn),
         // Some files can't be imported by service scripts,
         // so this hack makes that possible.
         def: globalThis.def,
@@ -103,24 +444,24 @@ const launch_services = async function (options) {
     register('__launch-on-init', new LaunchOnInitService());
 
     // === Service-Script Services ===
-    for ( const [name, script] of service_script_deferred.services ) {
+    for (const [name, script] of service_script_deferred.services) {
         register(name, script);
     }
 
-    for ( const [_, instance] of services_l_ ) {
+    for (const [_, instance] of services_l_) {
         await instance.construct({
             gui_params: options,
         });
     }
 
-    for ( const [_, instance] of services_l_ ) {
+    for (const [_, instance] of services_l_) {
         await instance.init({
             services: globalThis.services,
         });
     }
 
     // === Service-Script Ready ===
-    for ( const fn of service_script_deferred.on_ready ) {
+    for (const fn of service_script_deferred.on_ready) {
         await fn();
     }
 
@@ -137,50 +478,105 @@ const launch_services = async function (options) {
 // By setting the 'passive' option appropriately, it ensures that default browser
 // behavior is prevented when necessary, thereby improving page scroll performance.
 // More info: https://stackoverflow.com/a/62177358
-if ( jQuery ) {
+if (jQuery) {
     jQuery.event.special.touchstart = {
-        setup: function ( _, ns, handle ) {
-            this.addEventListener('touchstart', handle, { passive: !ns.includes('noPreventDefault') });
+        setup: function (_, ns, handle) {
+            this.addEventListener('touchstart', handle, {
+                passive: !ns.includes('noPreventDefault'),
+            });
         },
     };
     jQuery.event.special.touchmove = {
-        setup: function ( _, ns, handle ) {
-            this.addEventListener('touchmove', handle, { passive: !ns.includes('noPreventDefault') });
+        setup: function (_, ns, handle) {
+            this.addEventListener('touchmove', handle, {
+                passive: !ns.includes('noPreventDefault'),
+            });
         },
     };
     jQuery.event.special.wheel = {
-        setup: function ( _, ns, handle ) {
+        setup: function (_, ns, handle) {
             this.addEventListener('wheel', handle, { passive: true });
         },
     };
     jQuery.event.special.mousewheel = {
-        setup: function ( _, ns, handle ) {
+        setup: function (_, ns, handle) {
             this.addEventListener('mousewheel', handle, { passive: true });
         },
     };
 }
 
 // are we in dashboard mode?
-if ( window.location.pathname === '/dashboard' || window.location.pathname === '/dashboard/' ) {
-    window.is_dashboard_mode = true;
-    window.dashboard_initial_route = parseDashboardRoute();
+// The dashboard is the default interface at the root path; `/dashboard` is kept as an
+// alias, and `/desktop` loads the desktop instead. Root URLs that carry a desktop-only
+// flow keep booting the desktop: auth popups (`?embedded_in_popup=`), app deep links
+// (`?app=`), direct downloads (`?download=`), fullpage mode (`?puter.fullpage=`), and
+// iframe embeds.
+{
+    const pathname = window.location.pathname;
+    const search_params = new URLSearchParams(window.location.search);
+    if (['true', '1'].includes(search_params.get('embedded_in_popup'))) {
+        window.embedded_in_popup = true;
+    }
+    // note: iframe detection is inlined because globals.js (window.is_embedded) loads after this module
+    const in_iframe = window.location !== window.parent.location;
+    const needs_desktop_at_root =
+        window.embedded_in_popup ||
+        in_iframe ||
+        search_params.has('puter.fullpage') ||
+        search_params.has('app') ||
+        search_params.has('download');
+    const is_dashboard_alias =
+        pathname === '/dashboard' || pathname === '/dashboard/';
+    if (is_dashboard_alias || (pathname === '/' && !needs_desktop_at_root)) {
+        window.is_dashboard_mode = true;
+        window.dashboard_initial_route = parseDashboardRoute();
+    }
 }
 
 /**
  * Parses the dashboard URL hash into a route object.
- * Hash format: #usage or #account etc.
- * @returns {{ tab: string }} Route object with tab name
+ * Apps is the default tab (root URL / no hash); Home is reached via #home.
+ * Hash format: #files/username/Documents or #home or #usage or #account etc.
+ * @returns {{ tab: string, path: string|null }} Route object with tab name and optional file path
  */
-function parseDashboardRoute () {
-    const hash = decodeURIComponent(window.location.hash.slice(1));
-    if ( ! hash ) return { tab: 'home' };
+function parseDashboardRoute() {
+    const hash = decodeURIComponent(window.location.hash.slice(1)); // Remove '#' and decode URL encoding
+    if (!hash) return { tab: 'apps', path: null };
 
-    const tab = hash.split('/').filter(Boolean)[0];
-    return { tab: tab || 'home' };
+    const parts = hash.split('/').filter(Boolean); // ['files', 'username', 'Documents']
+    const tab = parts[0]; // 'files', 'usage', 'account', 'security'
+
+    if (tab === 'files' && parts.length > 1) {
+        const filePath = `/${parts.slice(1).join('/')}`; // /username/Documents
+        return { tab: 'files', path: filePath };
+    }
+    return { tab: tab || 'apps', path: null };
 }
 
 // Make parseDashboardRoute available globally for hashchange handler
 window.parseDashboardRoute = parseDashboardRoute;
+
+/**
+ * Display text for an auth error redirect (`?auth_error=1&message=<code>`).
+ * The backend sends a fixed set of codes — never free text — plus, for a
+ * blocked signup, a `request_code` the user can quote to support. Codes map
+ * to translated messages here; anything unrecognized (including text crafted
+ * directly into the URL) gets the generic message rather than being shown.
+ */
+function authErrorDisplayMessage() {
+    const code = window.url_query_params.get('message');
+    const requestCode = window.url_query_params.get('request_code');
+    if (code === 'signup_blocked') {
+        const contact = requestCode
+            ? i18n('contact_support_with_code', { id: requestCode }, false)
+            : i18n('contact_support', [], false);
+        return `${i18n('signup_blocked_message', [], false)} ${contact}`;
+    }
+    if (code === 'account_suspended') {
+        return i18n('account_suspended_message', [], false);
+    }
+    return i18n('auth_error_generic', [], false);
+}
 
 /**
  * Shows a Turnstile challenge modal for first-time temp user creation
@@ -193,15 +589,16 @@ window.showTurnstileChallenge = function (options) {
         const modalId = 'turnstile-challenge-modal';
         const siteKey = window.gui_params?.turnstileSiteKey;
 
-        if ( ! siteKey ) {
+        if (!siteKey) {
             options.onError('Turnstile site key not configured');
             return resolve();
         }
 
         // message
         let message = 'Setting up your account...';
-        if ( window.embedded_in_popup ) {
-            message = 'Setting up your <a href="https://puter.com" target="_blank">Puter.com</a> account...';
+        if (window.embedded_in_popup) {
+            message =
+                'Setting up your <a href="https://puter.com" target="_blank">Puter.com</a> account...';
         }
         // Create modal HTML
         let modalHtml = `
@@ -211,16 +608,16 @@ window.showTurnstileChallenge = function (options) {
                         <img src="${window.icons['logo-white.svg']}" class="captcha-logo">
                         <h2 class="captcha-title">Welcome to Puter!</h2>
                     </div>
-                    
+
                     <div class="captcha-container">
                         <div id="captcha-widget-${modalId}" data-sitekey="${siteKey}"></div>
                     </div>
-                    
+
                     <div class="loading-state">
                         <div class="loading-state-icon"></div>
                         ${message}
                     </div>
-                    
+
                     <div class="error-message"></div>
                 </div>
             </div>
@@ -235,7 +632,7 @@ window.showTurnstileChallenge = function (options) {
 
         // Initialize Turnstile widget
         const initTurnstile = () => {
-            if ( ! window.turnstile ) {
+            if (!window.turnstile) {
                 setTimeout(initTurnstile, 100);
                 return;
             }
@@ -260,13 +657,17 @@ window.showTurnstileChallenge = function (options) {
                         showError('Verification expired. Please try again.');
                     },
                     'error-callback': function () {
-                        showError('Verification failed. Please refresh the page and try again.');
+                        showError(
+                            'Verification failed. Please refresh the page and try again.',
+                        );
                         options.onError('Turnstile verification failed');
                     },
                 });
-            } catch ( error ) {
+            } catch (error) {
                 console.error('Failed to initialize Turnstile:', error);
-                showError('Failed to load security verification. Please refresh the page.');
+                showError(
+                    'Failed to load security verification. Please refresh the page.',
+                );
                 options.onError(error);
             }
         };
@@ -281,11 +682,11 @@ window.showTurnstileChallenge = function (options) {
 
         // Prevent modal from closing by clicking outside
         modal.addEventListener('click', (e) => {
-            if ( e.target === modal ) {
+            if (e.target === modal) {
                 // Don't close - force users to complete verification
                 turnstileContainer.style.transform = 'scale(1.05)';
                 setTimeout(() => {
-                    if ( turnstileContainer ) {
+                    if (turnstileContainer) {
                         turnstileContainer.style.transform = 'scale(1)';
                     }
                 }, 200);
@@ -306,7 +707,9 @@ window.showTurnstileChallenge = function (options) {
 window.initgui = async function (options) {
     const url = new URL(window.location).href;
     window.url = url;
-    const url_paths = window.location.pathname.split('/').filter(element => element);
+    const url_paths = window.location.pathname
+        .split('/')
+        .filter((element) => element);
     window.url_paths = url_paths;
 
     // Install device signal helpers; collection is lazy. The fingerprint is
@@ -317,23 +720,26 @@ window.initgui = async function (options) {
     let picked_a_user_for_sdk_login = false;
 
     // update SDK if auth_token is different from the one in the SDK
-    if ( window.auth_token && puter.authToken !== window.auth_token )
-    {
+    if (window.auth_token && puter.authToken !== window.auth_token) {
         puter.setAuthToken(window.auth_token);
     }
     // update SDK if api_origin is different from the one in the SDK
-    if ( window.api_origin && puter.APIOrigin !== window.api_origin )
-    {
-        puter.setAPIOrigin(localStorage.getItem('api_origin') || window.api_origin);
+    if (window.api_origin && puter.APIOrigin !== window.api_origin) {
+        puter.setAPIOrigin(
+            localStorage.getItem('api_origin') || window.api_origin,
+        );
     }
 
     // Print the version to the console
-    puter.os.version()
-        .then(res => {
+    puter.os
+        .version()
+        .then((res) => {
             const deployed_date = new Date(res.deploy_timestamp);
-            console.log(`Your Puter information:\n• Version: ${(res.version)}\n• Server: ${(res.location)}\n• Deployed: ${(deployed_date)}`);
+            console.log(
+                `Your Puter information:\n• Version: ${res.version}\n• Server: ${res.location}\n• Deployed: ${deployed_date}`,
+            );
         })
-        .catch(error => {
+        .catch((error) => {
             console.error('Failed to fetch server info:', error);
         });
 
@@ -341,11 +747,15 @@ window.initgui = async function (options) {
     // Depending on the device type, it sets a class attribute on the body tag
     // to style or script the page differently for each device type.
 
-    if ( isMobile.phone ) {
+    if (isMobile.phone) {
         $('body').attr('class', 'device-phone');
-    } else if ( isMobile.tablet ) {
+    } else if (isMobile.tablet) {
         // This is our new, smarter check for tablets
-        if ( window.matchMedia && typeof window.matchMedia === 'function' && window.matchMedia('(hover: hover)').matches ) {
+        if (
+            window.matchMedia &&
+            typeof window.matchMedia === 'function' &&
+            window.matchMedia('(hover: hover)').matches
+        ) {
             // The user has a mouse/trackpad, so give them the desktop UI
             $('body').attr('class', 'device-desktop');
         } else {
@@ -362,7 +772,9 @@ window.initgui = async function (options) {
 
     // Appends a viewport meta tag to the head of the document, ensuring optimal display on mobile devices.
     // This tag sets the width of the viewport to the device width, and locks the zoom level to 1 (prevents user scaling).
-    $('head').append('<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">');
+    $('head').append(
+        '<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">',
+    );
 
     // GET query params provided
     window.url_query_params = new URLSearchParams(window.location.search);
@@ -374,9 +786,12 @@ window.initgui = async function (options) {
     // Extract 'action' from URL
     //--------------------------------------------------------------------------------------
     let action;
-    if ( window.url_paths[0]?.toLocaleLowerCase() === 'action' && window.url_paths[1] ) {
+    if (
+        window.url_paths[0]?.toLocaleLowerCase() === 'action' &&
+        window.url_paths[1]
+    ) {
         action = window.url_paths[1].toLowerCase();
-    } else if ( window.url_query_params.has('action') ) {
+    } else if (window.url_query_params.has('action')) {
         action = window.url_query_params.get('action').toLowerCase();
     }
 
@@ -384,15 +799,23 @@ window.initgui = async function (options) {
     // Determine if we are in full-page mode
     // i.e. https://puter.com/app/<app_name>/?puter.fullpage=true
     //--------------------------------------------------------------------------------------
-    if ( window.url_query_params.has('puter.fullpage') && (window.url_query_params.get('puter.fullpage') === 'false' || window.url_query_params.get('puter.fullpage') === '0') ) {
+    if (
+        window.url_query_params.has('puter.fullpage') &&
+        (window.url_query_params.get('puter.fullpage') === 'false' ||
+            window.url_query_params.get('puter.fullpage') === '0')
+    ) {
         window.is_fullpage_mode = false;
-    } else if ( window.url_query_params.has('puter.fullpage') && (window.url_query_params.get('puter.fullpage') === 'true' || window.url_query_params.get('puter.fullpage') === '1') ) {
+    } else if (
+        window.url_query_params.has('puter.fullpage') &&
+        (window.url_query_params.get('puter.fullpage') === 'true' ||
+            window.url_query_params.get('puter.fullpage') === '1')
+    ) {
         // In fullpage mode, we want to hide the taskbar for better UX
         window.taskbar_height = 0;
 
         // Puter is in fullpage mode.
         window.is_fullpage_mode = true;
-    } else if ( window.is_dashboard_mode ) {
+    } else if (window.is_dashboard_mode) {
         window.is_fullpage_mode = true;
     }
 
@@ -401,22 +824,39 @@ window.initgui = async function (options) {
 
     // If no token in storage but we have a session cookie (e.g. after OIDC redirect), fetch GUI token
     try {
-        const r = await fetch(`${window.gui_origin}/get-gui-token`, { credentials: 'include' });
-        if ( r.ok ) {
+        const r = await fetch(`${window.gui_origin}/get-gui-token`, {
+            credentials: 'include',
+        });
+        if (r.ok) {
             const { token } = await r.json();
             window.auth_token = token;
             // Write the v2 key; drop legacy v1 key.
-            localStorage.setItem(window.AUTH_TOKEN_KEY_V2 || 'auth_token_v2', token);
-            try { localStorage.removeItem(window.AUTH_TOKEN_KEY_V1 || 'auth_token'); } catch ( e ) { /* ignore */ }
-            if ( typeof puter !== 'undefined' ) puter.setAuthToken(token, window.api_origin);
+            localStorage.setItem(
+                window.AUTH_TOKEN_KEY_V2 || 'auth_token_v2',
+                token,
+            );
+            try {
+                localStorage.removeItem(
+                    window.AUTH_TOKEN_KEY_V1 || 'auth_token',
+                );
+            } catch (e) {
+                /* ignore */
+            }
+            if (typeof puter !== 'undefined')
+                puter.setAuthToken(token, window.api_origin);
             const tokenChanged = token !== window.auth_token;
-            if ( tokenChanged ) {
+            if (tokenChanged) {
                 // This will update the list of logged in users and set the current one
                 try {
-                    const whoami = await puter.os.user({ query: 'icon_size=64' });
-                    if ( whoami ) await window.update_auth_data(token, whoami);
+                    const whoami = await puter.os.user({
+                        query: 'icon_size=64',
+                    });
+                    if (whoami) await window.update_auth_data(token, whoami);
                 } catch (e) {
-                    console.error('get-gui-token follow-up whoami/update_auth_data', e);
+                    console.error(
+                        'get-gui-token follow-up whoami/update_auth_data',
+                        e,
+                    );
                 }
             }
         }
@@ -428,26 +868,31 @@ window.initgui = async function (options) {
     // Is attempt_temp_user_creation?
     // i.e. https://puter.com/?attempt_temp_user_creation=true
     //--------------------------------------------------------------------------------------
-    if ( window.url_query_params.has('attempt_temp_user_creation') && (window.url_query_params.get('attempt_temp_user_creation') === 'true' || window.url_query_params.get('attempt_temp_user_creation') === '1') ) {
+    if (
+        window.url_query_params.has('attempt_temp_user_creation') &&
+        (window.url_query_params.get('attempt_temp_user_creation') === 'true' ||
+            window.url_query_params.get('attempt_temp_user_creation') === '1')
+    ) {
         window.attempt_temp_user_creation = true;
     }
 
     //--------------------------------------------------------------------------------------
     // Is GUI embedded in a popup?
     // i.e. https://puter.com/?embedded_in_popup=true
+    // (the flag itself is parsed once at module level, alongside the dashboard-mode check)
     //--------------------------------------------------------------------------------------
-    if ( window.url_query_params.has('embedded_in_popup') && (window.url_query_params.get('embedded_in_popup') === 'true' || window.url_query_params.get('embedded_in_popup') === '1') ) {
-        window.embedded_in_popup = true;
+    if (window.embedded_in_popup) {
         $('body').addClass('embedded-in-popup');
 
         // determine the origin of the opener (preserved across OIDC redirect via URL param, else referrer or messaging)
-        const openerOriginFromUrl = window.url_query_params.get('opener_origin');
-        if ( openerOriginFromUrl ) {
+        const openerOriginFromUrl =
+            window.url_query_params.get('opener_origin');
+        if (openerOriginFromUrl) {
             window.openerOrigin = openerOriginFromUrl;
         } else {
             window.openerOrigin = document.referrer;
         }
-        if ( ! window.openerOrigin ) {
+        if (!window.openerOrigin) {
             try {
                 window.openerOrigin = await requestOpenerOrigin();
             } catch (e) {
@@ -458,33 +903,46 @@ window.initgui = async function (options) {
         // this is the referrer in terms of user acquisition
         window.referrerStr = window.openerOrigin;
 
-        if ( action === 'sign-in' && !window.is_auth() && !(window.attempt_temp_user_creation && window.first_visit_ever) ) {
+        if (
+            action === 'sign-in' &&
+            !window.is_auth() &&
+            !(window.attempt_temp_user_creation && window.first_visit_ever)
+        ) {
             // show signup window
-            if ( await UIWindowSignup({
-                reload_on_success: false,
-                send_confirmation_code: true,
-                show_close_button: false,
-                window_options: {
-                    has_head: false,
-                    cover_page: true,
-                },
-            }) )
-            {
+            if (
+                await UIWindowSignup({
+                    reload_on_success: false,
+                    send_confirmation_code: true,
+                    show_close_button: false,
+                    window_options: {
+                        has_head: false,
+                        cover_page: true,
+                    },
+                })
+            ) {
                 await window.getUserAppToken(window.openerOrigin);
             }
-        }
-        else if ( action === 'sign-in' && window.is_auth() && !(window.attempt_temp_user_creation && window.first_visit_ever) ) {
+        } else if (
+            action === 'sign-in' &&
+            window.is_auth() &&
+            !(window.attempt_temp_user_creation && window.first_visit_ever)
+        ) {
             // Ensure current user is in logged_in_users (e.g. after OIDC redirect we have token but no user in list)
             try {
-                const whoami_popup = await puter.os.user({ query: 'icon_size=64' });
-                await window.update_auth_data(whoami_popup.token || window.auth_token, whoami_popup);
+                const whoami_popup = await puter.os.user({
+                    query: 'icon_size=64',
+                });
+                await window.update_auth_data(
+                    whoami_popup.token || window.auth_token,
+                    whoami_popup,
+                );
             } catch (e) {
                 // session/auth errors will be handled further ahead;
                 // let's log the error for now in case a change in state occurred.
-                console.error('error in \'sign-in\' flow', e);
+                console.error("error in 'sign-in' flow", e);
             }
 
-            if ( window.url_query_params.get('oidc_login') === 'true' ) {
+            if (window.url_query_params.get('oidc_login') === 'true') {
                 // OIDC login just completed in popup — skip session list and finish the flow
                 picked_a_user_for_sdk_login = true;
                 await window.getUserAppToken(window.openerOrigin);
@@ -497,7 +955,7 @@ window.initgui = async function (options) {
                     cover_page: true,
                 });
 
-                if ( picked_a_user_for_sdk_login ) {
+                if (picked_a_user_for_sdk_login) {
                     await window.getUserAppToken(window.openerOrigin);
                 }
             }
@@ -507,7 +965,7 @@ window.initgui = async function (options) {
     //--------------------------------------------------------------------------------------
     // Display an error if the query parameters have an error
     //--------------------------------------------------------------------------------------
-    if ( window.url_query_params.has('error') ) {
+    if (window.url_query_params.has('error')) {
         // TODO: i18n
         await UIAlert({
             message: window.url_query_params.get('message'),
@@ -517,7 +975,10 @@ window.initgui = async function (options) {
     //--------------------------------------------------------------------------------------
     // Inform the user if they chose "signup" but were logged into an existing account
     //--------------------------------------------------------------------------------------
-    if ( window.url_query_params.get('oidc_switched') === 'login' && window.is_auth() ) {
+    if (
+        window.url_query_params.get('oidc_switched') === 'login' &&
+        window.is_auth()
+    ) {
         await UIAlert({
             message: i18n('oidc_switched_to_login_message'),
         });
@@ -535,10 +996,16 @@ window.initgui = async function (options) {
     // If the user navigated to /app/<app_name> and the app has fullpage_on_landing,
     // set fullpage mode now so we can skip loading the desktop background and items.
     //--------------------------------------------------------------------------------------
-    if ( !window.is_fullpage_mode && window.url_paths[0]?.toLocaleLowerCase() === 'app' && window.url_paths[1] ) {
+    if (
+        !window.is_fullpage_mode &&
+        window.url_paths[0]?.toLocaleLowerCase() === 'app' &&
+        window.url_paths[1]
+    ) {
         try {
-            const app_info = await puter.apps.get(window.url_paths[1], { icon_size: 64 });
-            if ( app_info?.metadata?.fullpage_on_landing ) {
+            const app_info = await puter.apps.get(window.url_paths[1], {
+                icon_size: 64,
+            });
+            if (app_info?.metadata?.fullpage_on_landing) {
                 window.is_fullpage_mode = true;
                 window.taskbar_height = 0;
                 window.app_launched_from_url = app_info;
@@ -552,16 +1019,17 @@ window.initgui = async function (options) {
     // Desktop background (early)
     // Set before action=login/signup so OIDC error redirects show the background behind the form.
     // -------------------------------------------------------------------------------------
-    if ( !window.is_fullpage_mode && !window.embedded_in_popup ) {
+    if (!window.is_fullpage_mode && !window.embedded_in_popup) {
         window.refresh_desktop_background();
     }
 
     //--------------------------------------------------------------------------------------
     // Action: Request Permission
     //--------------------------------------------------------------------------------------
-    if ( action === 'request-permission' ) {
+    if (action === 'request-permission') {
         let app_uid = window.url_query_params.get('app_uid');
-        let origin = window.openerOrigin ?? window.url_query_params.get('origin');
+        let origin =
+            window.openerOrigin ?? window.url_query_params.get('origin');
         let permission = window.url_query_params.get('permission');
 
         let granted = await UIWindowRequestPermission({
@@ -570,16 +1038,21 @@ window.initgui = async function (options) {
             permission: permission,
         });
 
-        let messageTarget = window.embedded_in_popup ? window.opener : window.parent;
-        messageTarget.postMessage({
-            msg: 'permissionGranted',
-            granted: granted,
-        }, origin);
+        let messageTarget = window.embedded_in_popup
+            ? window.opener
+            : window.parent;
+        messageTarget.postMessage(
+            {
+                msg: 'permissionGranted',
+                granted: granted,
+            },
+            origin,
+        );
     }
     //--------------------------------------------------------------------------------------
     // Action: Password recovery
     //--------------------------------------------------------------------------------------
-    else if ( action === 'set-new-password' ) {
+    else if (action === 'set-new-password') {
         let user = window.url_query_params.get('user');
         let token = window.url_query_params.get('token');
 
@@ -591,16 +1064,17 @@ window.initgui = async function (options) {
     //--------------------------------------------------------------------------------------
     // Action: Change Username
     //--------------------------------------------------------------------------------------
-    else if ( action === 'change-username' ) {
+    else if (action === 'change-username') {
         await UIWindowChangeUsername();
     }
     //--------------------------------------------------------------------------------------
     // Action: Login
     //--------------------------------------------------------------------------------------
-    else if ( action === 'login' ) {
-        const authError = window.url_query_params.get('message') || null;
-        const opts = window.url_query_params.has('auth_error') ? { authError } : {};
-        if ( ! window.is_auth() ) {
+    else if (action === 'login') {
+        const opts = window.url_query_params.has('auth_error')
+            ? { authError: authErrorDisplayMessage() }
+            : {};
+        if (!window.is_auth()) {
             opts.window_options = { cover_page: true, has_head: false };
         }
         await UIWindowLogin(Object.keys(opts).length ? opts : undefined);
@@ -608,7 +1082,7 @@ window.initgui = async function (options) {
     //--------------------------------------------------------------------------------------
     // Action: Password recovery
     //--------------------------------------------------------------------------------------
-    else if ( action === 'password-recovery' ) {
+    else if (action === 'password-recovery') {
         await UIWindowRecoverPassword({
             window_options: {
                 cover_page: true,
@@ -619,10 +1093,11 @@ window.initgui = async function (options) {
     //--------------------------------------------------------------------------------------
     // Action: Signup
     //--------------------------------------------------------------------------------------
-    else if ( action === 'signup' ) {
-        const authError = window.url_query_params.get('message') || null;
-        const opts = window.url_query_params.has('auth_error') ? { authError } : {};
-        if ( ! window.is_auth() ) {
+    else if (action === 'signup') {
+        const opts = window.url_query_params.has('auth_error')
+            ? { authError: authErrorDisplayMessage() }
+            : {};
+        if (!window.is_auth()) {
             opts.window_options = { cover_page: true, has_head: false };
         }
         opts.send_confirmation_code = true;
@@ -633,11 +1108,18 @@ window.initgui = async function (options) {
     // if yes, we need to get the user app token and send it to the opener
     // if not, we need to ask the user for confirmation before proceeding BUT only if the action is a file-picker action
     // -------------------------------------------------------------------------------------
-    if ( window.embedded_in_popup && window.openerOrigin ) {
-        let response = await window.checkUserSiteRelationship(window.openerOrigin);
+    if (window.embedded_in_popup && window.openerOrigin) {
+        let response = await window.checkUserSiteRelationship(
+            window.openerOrigin,
+        );
         window.userAppToken = response.token;
 
-        if ( !picked_a_user_for_sdk_login && window.logged_in_users.length > 1 && (!window.userAppToken || window.url_query_params.get('request_auth') ) ) {
+        if (
+            !picked_a_user_for_sdk_login &&
+            window.logged_in_users.length > 1 &&
+            (!window.userAppToken ||
+                window.url_query_params.get('request_auth'))
+        ) {
             picked_a_user_for_sdk_login = await UIWindowSessionList({
                 reload_on_success: false,
                 draggable_body: false,
@@ -649,12 +1131,12 @@ window.initgui = async function (options) {
     // -------------------------------------------------------------------------------------
     // `auth_token` provided in URL, use it to log in
     // -------------------------------------------------------------------------------------
-    else if ( window.url_query_params.has('auth_token') ) {
+    else if (window.url_query_params.has('auth_token')) {
         let query_param_auth_token = window.url_query_params.get('auth_token');
         let api_origin;
 
         // check if we have api_origin in the URL query params
-        if ( window.url_query_params.has('api_origin') ) {
+        if (window.url_query_params.has('api_origin')) {
             api_origin = window.url_query_params.get('api_origin');
             puter.setAPIOrigin(api_origin);
         }
@@ -664,29 +1146,16 @@ window.initgui = async function (options) {
         try {
             whoami = await puter.os.user({ query: 'icon_size=64' });
         } catch (e) {
-            if ( e.status === 401 ) {
+            if (e.status === 401) {
                 window.logout();
                 return;
             }
         }
 
-        if ( whoami ) {
-            // is phone verification required? (hard gate for low-rep signups)
-            if ( whoami.requires_phone_verification ) {
-                let is_verified;
-                do {
-                    is_verified = await UIWindowPhoneVerificationRequired({
-                        show_close_button: false,
-                        stay_on_top: true,
-                        has_head: false,
-                        window_options: {
-                            is_draggable: false,
-                        },
-                    });
-                }
-                while ( !is_verified );
-            }
-            if ( whoami.requires_email_confirmation ) {
+        if (whoami) {
+            // Verification gates run in order: email → phone (SMS) → card,
+            // matching the server-side order in assertVerifiedAccount.
+            if (whoami.requires_email_confirmation) {
                 let is_verified;
                 do {
                     is_verified = await UIWindowEmailConfirmationRequired({
@@ -697,12 +1166,25 @@ window.initgui = async function (options) {
                             is_draggable: false,
                         },
                     });
-                }
-                while ( !is_verified );
+                } while (!is_verified);
+            }
+            // is phone verification required? (hard gate for low-rep signups)
+            if (whoami.requires_phone_verification) {
+                let is_verified;
+                do {
+                    is_verified = await UIWindowPhoneVerificationRequired({
+                        show_close_button: false,
+                        stay_on_top: true,
+                        has_head: false,
+                        window_options: {
+                            is_draggable: false,
+                        },
+                    });
+                } while (!is_verified);
             }
             // Card verification is the last gate: only show it once the email and
             // phone (SMS) gates are cleared, since those show up first.
-            if ( whoami.requires_card_verification ) {
+            if (whoami.requires_card_verification) {
                 let is_verified;
                 do {
                     is_verified = await UIWindowCardVerificationRequired({
@@ -713,8 +1195,7 @@ window.initgui = async function (options) {
                             is_draggable: false,
                         },
                     });
-                }
-                while ( !is_verified );
+                } while (!is_verified);
             }
             // if user is logging in using an auth token that means it's not their first ever visit to Puter.com
             // it might be their first visit to Puter on this specific device but it's not their first time ever visiting Puter.
@@ -722,10 +1203,19 @@ window.initgui = async function (options) {
             // show login progress window
             UIWindowLoginInProgress({ user_info: whoami });
             // update auth data
-            await window.update_auth_data(query_param_auth_token, whoami, api_origin);
+            await window.update_auth_data(
+                query_param_auth_token,
+                whoami,
+                api_origin,
+            );
         }
-        // remove auth_token from URL
-        window.history.pushState(null, document.title, '/');
+        // remove auth_token from URL, keeping the current path (e.g. `/` or `/desktop`)
+        // and hash (dashboard tab links like /#usage)
+        window.history.pushState(
+            null,
+            document.title,
+            window.location.pathname + window.location.hash,
+        );
     }
 
     /**
@@ -745,7 +1235,8 @@ window.initgui = async function (options) {
         } catch (e) {
             // TODO: i18n
             await UIAlert({
-                message: 'Session is invalid and logout failed; ' +
+                message:
+                    'Session is invalid and logout failed; ' +
                     'please clear local storage manually.',
             });
         }
@@ -764,9 +1255,10 @@ window.initgui = async function (options) {
      */
     $(document).on('logout', async function (event) {
         // is temp user?
-        if ( window.user && window.user.is_temp && !window.user.deleted ) {
+        if (window.user && window.user.is_temp && !window.user.deleted) {
             const alert_resp = await UIAlert({
-                message: '<strong>Save account before logging out!</strong><p>You are using a temporary account and logging out will erase all your data.</p>',
+                message:
+                    '<strong>Save account before logging out!</strong><p>You are using a temporary account and logging out will erase all your data.</p>',
                 buttons: [
                     {
                         label: i18n('save_account'),
@@ -783,19 +1275,17 @@ window.initgui = async function (options) {
                     },
                 ],
             });
-            if ( alert_resp === 'save_account' ) {
+            if (alert_resp === 'save_account') {
                 let saved = await UIWindowSaveAccount({
                     send_confirmation_code: false,
                     default_username: window.user.username,
                 });
-                if ( saved )
-                {
+                if (saved) {
                     window.logout();
                 }
-            } else if ( alert_resp === 'log_out' ) {
+            } else if (alert_resp === 'log_out') {
                 window.logout();
-            }
-            else {
+            } else {
                 return;
             }
         }
@@ -805,17 +1295,16 @@ window.initgui = async function (options) {
             const resp = await fetch(`${window.gui_origin}/get-anticsrf-token`);
             const { token } = await resp.json();
             await $.ajax({
-                url: `${window.gui_origin }/logout`,
+                url: `${window.gui_origin}/logout`,
                 type: 'POST',
                 async: true,
                 contentType: 'application/json',
                 headers: {
-                    'Authorization': `Bearer ${ window.auth_token}`,
+                    Authorization: `Bearer ${window.auth_token}`,
                 },
                 data: JSON.stringify({ anti_csrf: token }),
                 statusCode: {
-                    401: function () {
-                    },
+                    401: function () {},
                 },
             });
         } catch (e) {
@@ -823,15 +1312,18 @@ window.initgui = async function (options) {
         }
 
         // remove this user from the array of logged_in_users
-        for ( let i = 0; i < window.logged_in_users.length; i++ ) {
-            if ( window.logged_in_users[i].uuid === window.user.uuid ) {
+        for (let i = 0; i < window.logged_in_users.length; i++) {
+            if (window.logged_in_users[i].uuid === window.user.uuid) {
                 window.logged_in_users.splice(i, 1);
                 break;
             }
         }
 
         // update logged_in_users in local storage
-        localStorage.setItem('logged_in_users', JSON.stringify(window.logged_in_users));
+        localStorage.setItem(
+            'logged_in_users',
+            JSON.stringify(window.logged_in_users),
+        );
 
         // delete this user from local storage
         window.user = null;
@@ -849,46 +1341,74 @@ window.initgui = async function (options) {
         $('.taskbar').remove();
         // disable native browser exit confirmation
         window.onbeforeunload = null;
-        // go to home page
-        window.location.replace('/');
+        // go back to the interface the user was in: dashboard users to the root
+        // dashboard, desktop users to /desktop
+        window.location.replace(window.is_dashboard_mode ? '/' : '/desktop');
+    });
+
+    const verification_gate_windows = {
+        phone_verification_required: UIWindowPhoneVerificationRequired,
+        email_confirmation_required: UIWindowEmailConfirmationRequired,
+        card_verification_required: UIWindowCardVerificationRequired,
+    };
+    let verification_gate_open = false;
+    $(document).ajaxError(async function (event, jqxhr) {
+        if (jqxhr?.status !== 403 || verification_gate_open) {
+            return;
+        }
+        let body = jqxhr.responseJSON;
+        if (!body && jqxhr.responseText) {
+            try {
+                body = JSON.parse(jqxhr.responseText);
+            } catch (e) {
+                body = null;
+            }
+        }
+        const UIWindowVerificationGate = verification_gate_windows[body?.code];
+        if (!UIWindowVerificationGate) {
+            return;
+        }
+        verification_gate_open = true;
+        try {
+            const is_verified = await UIWindowVerificationGate({
+                show_close_button: false,
+                stay_on_top: true,
+                has_head: false,
+                logout_in_footer: true,
+                window_options: {
+                    is_draggable: false,
+                },
+            });
+            if (is_verified) {
+                await window.refresh_user_data(window.auth_token);
+            }
+        } catch (e) {
+            console.error('verification gate dialog failed:', e);
+        } finally {
+            verification_gate_open = false;
+        }
     });
 
     // -------------------------------------------------------------------------------------
     // Authed
     // -------------------------------------------------------------------------------------
-    if ( window.is_auth() ) {
+    if (window.is_auth()) {
         // try to get user data using /whoami, only if that data is missing
-        if ( ! whoami ) {
+        if (!whoami) {
             try {
                 whoami = await puter.os.user({ query: 'icon_size=64' });
             } catch (e) {
-                if ( e.status === 401 ) {
+                if (e.status === 401) {
                     bad_session_logout();
                     return;
                 }
             }
         }
         // update local user data
-        if ( whoami ) {
-            // is phone verification required? (hard gate for low-rep signups)
-            if ( whoami.requires_phone_verification ) {
-                let is_verified;
-                do {
-                    is_verified = await UIWindowPhoneVerificationRequired({
-                        show_close_button: false,
-                        stay_on_top: true,
-                        has_head: false,
-                        logout_in_footer: true,
-                        window_options: {
-                            is_draggable: false,
-                            cover_page: window.is_embedded,
-                        },
-                    });
-                }
-                while ( !is_verified );
-            }
-            // is email confirmation required?
-            if ( whoami.requires_email_confirmation ) {
+        if (whoami) {
+            // Verification gates run in order: email → phone (SMS) → card,
+            // matching the server-side order in assertVerifiedAccount.
+            if (whoami.requires_email_confirmation) {
                 let is_verified;
                 do {
                     is_verified = await UIWindowEmailConfirmationRequired({
@@ -901,12 +1421,27 @@ window.initgui = async function (options) {
                             cover_page: window.is_embedded,
                         },
                     });
-                }
-                while ( !is_verified );
+                } while (!is_verified);
+            }
+            // is phone verification required? (hard gate for low-rep signups)
+            if (whoami.requires_phone_verification) {
+                let is_verified;
+                do {
+                    is_verified = await UIWindowPhoneVerificationRequired({
+                        show_close_button: false,
+                        stay_on_top: true,
+                        has_head: false,
+                        logout_in_footer: true,
+                        window_options: {
+                            is_draggable: false,
+                            cover_page: window.is_embedded,
+                        },
+                    });
+                } while (!is_verified);
             }
             // Card verification is the last gate: only show it once the email and
             // phone (SMS) gates are cleared, since those show up first.
-            if ( whoami.requires_card_verification ) {
+            if (whoami.requires_card_verification) {
                 let is_verified;
                 do {
                     is_verified = await UIWindowCardVerificationRequired({
@@ -919,321 +1454,14 @@ window.initgui = async function (options) {
                             cover_page: window.is_embedded,
                         },
                     });
-                }
-                while ( !is_verified );
+                } while (!is_verified);
             }
-            await window.update_auth_data(whoami.token || window.auth_token, whoami);
+            await window.update_auth_data(
+                whoami.token || window.auth_token,
+                whoami,
+            );
 
-            // -------------------------------------------------------------------------------------
-            // Action: AuthMe — redirect to a third-party URL with the user's auth token
-            // -------------------------------------------------------------------------------------
-            if ( action === 'authme' ) {
-                const redirectURL = window.url_query_params.get('redirectURL');
-                if ( redirectURL ) {
-                    const approved = await UIWindowAuthMe({
-                        redirect_url: redirectURL,
-                    });
-                    if ( approved ) {
-                        // Hand the app a named, revocable full-API-access
-                        // token instead of the raw GUI/session token: it can
-                        // use the whole API but can't manage the account.
-                        let host = '';
-                        try { host = new URL(redirectURL).host; } catch ( e ) { /* ignore */ }
-                        let token;
-                        try {
-                            token = await create_access_token({
-                                label: host
-                                    ? `${i18n('token_label_external_app')} (${host})`
-                                    : i18n('token_label_external_app'),
-                            });
-                        } catch ( e ) {
-                            await UIAlert({ message: e?.message ?? String(e) });
-                            return;
-                        }
-                        const url = new URL(redirectURL);
-                        url.searchParams.set('token', token);
-                        window.location.href = url.href;
-                        return;
-                    }
-                }
-            }
-
-            // -------------------------------------------------------------------------------------
-            // Action: CopyAuth — show dialog to copy auth token
-            // -------------------------------------------------------------------------------------
-            if ( action === 'copyauth' ) {
-                await UIWindowCopyToken({ show_header: true });
-            }
-
-            // -------------------------------------------------------------------------------------
-            // Load desktop, only if we're not embedded in a popup and not on the dashboard page
-            // -------------------------------------------------------------------------------------
-            if ( !window.embedded_in_popup && !window.is_dashboard_mode ) {
-                if ( window.is_fullpage_mode ) {
-                    // In fullpage mode, skip loading desktop items and background
-                    UIDesktop({});
-                } else {
-                    await window.get_auto_arrange_data();
-                    puter.fs.stat({ path: window.desktop_path, consistency: 'eventual' }).then(desktop_fsentry => {
-                        UIDesktop({ desktop_fsentry: desktop_fsentry });
-                    });
-                }
-            }
-            // -------------------------------------------------------------------------------------
-            // Dashboard mode
-            // -------------------------------------------------------------------------------------
-            else if ( window.is_dashboard_mode ) {
-                UIDashboard();
-            }
-            // -------------------------------------------------------------------------------------
-            // If embedded in a popup, send the token to the opener and close the popup
-            // -------------------------------------------------------------------------------------
-            else {
-                let msg_id = window.url_query_params.get('msg_id');
-                try {
-                    let data = await window.getUserAppToken(new URL(window.openerOrigin).origin);
-                    // This is an implicit app and the app_uid is sent back from the server
-                    // we cache it here so that we can use it later
-                    window.host_app_uid = data.app_uid;
-                    // send token to parent
-                    window.opener.postMessage({
-                        msg: 'puter.token',
-                        success: true,
-                        token: data.token,
-                        app_uid: data.app_uid,
-                        username: window.user.username,
-                        msg_id: msg_id,
-                    }, window.openerOrigin);
-                    // close popup
-                    if ( !action || action === 'sign-in' ) {
-                        window.close();
-                        window.open('', '_self').close();
-                    }
-                } catch ( err ) {
-                    // send error to parent
-                    window.opener.postMessage({
-                        msg: 'puter.token',
-                        success: false,
-                        token: null,
-                        msg_id: msg_id,
-                    }, window.openerOrigin);
-                    // close popup
-                    window.close();
-                    window.open('', '_self').close();
-                }
-
-                let app_uid;
-
-                if ( window.openerOrigin ) {
-                    app_uid = await window.getAppUIDFromOrigin(window.openerOrigin);
-                    window.host_app_uid = app_uid;
-                }
-
-                if ( action === 'show-open-file-picker' ) {
-                    let options = window.url_query_params.get('options');
-                    options = JSON.parse(options ?? '{}');
-
-                    // Open dialog
-                    UIWindow({
-                        allowed_file_types: options?.accept,
-                        selectable_body: options?.multiple,
-                        path: `/${ window.user.username }/Desktop`,
-                        // this is the uuid of the window to which this dialog will return
-                        return_to_parent_window: true,
-                        show_maximize_button: false,
-                        show_minimize_button: false,
-                        title: 'Open',
-                        is_dir: true,
-                        is_openFileDialog: true,
-                        is_resizable: false,
-                        has_head: false,
-                        cover_page: true,
-                        // selectable_body: is_selectable_body,
-                        iframe_msg_uid: msg_id,
-                        center: true,
-                        initiating_app_uuid: app_uid,
-                        on_close: function () {
-                            window.opener.postMessage({
-                                msg: 'fileOpenCanceled',
-                                original_msg_id: msg_id,
-                            }, '*');
-                        },
-                    });
-                }
-                //--------------------------------------------------------------------------------------
-                // Action: Show Directory Picker
-                //--------------------------------------------------------------------------------------
-                else if ( action === 'show-directory-picker' ) {
-                    // open directory picker dialog
-                    UIWindow({
-                        path: `/${ window.user.username }/Desktop`,
-                        // this is the uuid of the window to which this dialog will return
-                        // parent_uuid: event.data.appInstanceID,
-                        return_to_parent_window: true,
-                        show_maximize_button: false,
-                        show_minimize_button: false,
-                        title: 'Open',
-                        is_dir: true,
-                        is_directoryPicker: true,
-                        is_resizable: false,
-                        has_head: false,
-                        cover_page: true,
-                        // selectable_body: is_selectable_body,
-                        iframe_msg_uid: msg_id,
-                        center: true,
-                        initiating_app_uuid: app_uid,
-                        on_close: function () {
-                            window.opener.postMessage({
-                                msg: 'directoryOpenCanceled',
-                                original_msg_id: msg_id,
-                            }, '*');
-                        },
-                    });
-                }
-                //--------------------------------------------------------------------------------------
-                // Action: Show Save File Dialog
-                //--------------------------------------------------------------------------------------
-                else if ( action === 'show-save-file-picker' ) {
-                    let allowed_file_types = window.url_query_params.get('allowed_file_types');
-
-                    // send 'sendMeFileData' event to parent
-                    window.opener.postMessage({
-                        msg: 'sendMeFileData',
-                    }, '*');
-
-                    // listen for 'showSaveFilePickerPopup' event from parent
-                    window.addEventListener('message', async (event) => {
-                        if ( event.data.msg !== 'showSaveFilePickerPopup' )
-                        {
-                            return;
-                        }
-
-                        // Open dialog
-                        UIWindow({
-                            allowed_file_types: allowed_file_types,
-                            path: `/${ window.user.username }/Desktop`,
-                            // this is the uuid of the window to which this dialog will return
-                            return_to_parent_window: true,
-                            show_maximize_button: false,
-                            show_minimize_button: false,
-                            title: 'Save',
-                            is_dir: true,
-                            is_saveFileDialog: true,
-                            is_resizable: false,
-                            has_head: false,
-                            cover_page: true,
-                            // selectable_body: is_selectable_body,
-                            iframe_msg_uid: msg_id,
-                            center: true,
-                            initiating_app_uuid: app_uid,
-                            on_close: function () {
-                                window.opener.postMessage({
-                                    msg: 'fileSaveCanceled',
-                                    original_msg_id: msg_id,
-                                }, '*');
-                            },
-                            onSaveFileDialogSave: async function (target_path, el_filedialog_window) {
-                                $(el_filedialog_window).find('.window-disable-mask, .busy-indicator').show();
-                                let busy_init_ts = Date.now();
-
-                                let overwrite = false;
-                                let file_to_upload = new File([event.data.content], path.basename(target_path));
-                                let item_with_same_name_already_exists = true;
-                                while ( item_with_same_name_already_exists ) {
-                                    // overwrite?
-                                    if ( overwrite )
-                                    {
-                                        item_with_same_name_already_exists = false;
-                                    }
-                                    // upload
-                                    try {
-                                        const res = await puter.fs.write(
-                                            target_path,
-                                            file_to_upload,
-                                            {
-                                                dedupeName: false,
-                                                overwrite: overwrite,
-                                            },
-                                        );
-
-                                        let file_signature = await puter.fs.sign(app_uid, { uid: res.uid, action: 'write' });
-                                        file_signature = file_signature.items;
-
-                                        item_with_same_name_already_exists = false;
-                                        window.opener.postMessage({
-                                            msg: 'fileSaved',
-                                            original_msg_id: msg_id,
-                                            filename: res.name,
-                                            saved_file: {
-                                                name: file_signature.fsentry_name,
-                                                readURL: file_signature.read_url,
-                                                writeURL: file_signature.write_url,
-                                                metadataURL: file_signature.metadata_url,
-                                                type: file_signature.type,
-                                                uid: file_signature.uid,
-                                                path: privacy_aware_path(res.path),
-                                            },
-                                        }, '*');
-
-                                        window.close();
-                                        window.open('', '_self').close();
-                                    }
-                                    catch ( err ) {
-                                        // item with same name exists
-                                        if ( err.code === 'item_with_same_name_exists' ) {
-                                            const alert_resp = await UIAlert({
-                                                message: `<strong>${html_encode(err.entry_name)}</strong> already exists.`,
-                                                buttons: [
-                                                    {
-                                                        label: i18n('replace'),
-                                                        value: 'replace',
-                                                        type: 'primary',
-                                                    },
-                                                    {
-                                                        label: i18n('cancel'),
-                                                        value: 'cancel',
-                                                    },
-                                                ],
-                                                parent_uuid: $(el_filedialog_window).attr('data-element_uuid'),
-                                            });
-                                            if ( alert_resp === 'replace' ) {
-                                                overwrite = true;
-                                            } else if ( alert_resp === 'cancel' ) {
-                                                // enable parent window
-                                                $(el_filedialog_window).find('.window-disable-mask, .busy-indicator').hide();
-                                                return;
-                                            }
-                                        }
-                                        else {
-                                            console.log(err);
-                                            // show error
-                                            await UIAlert({
-                                                message: err.message ?? 'Upload failed.',
-                                                parent_uuid: $(el_filedialog_window).attr('data-element_uuid'),
-                                            });
-                                            // enable parent window
-                                            $(el_filedialog_window).find('.window-disable-mask, .busy-indicator').hide();
-                                            return;
-                                        }
-                                    }
-                                }
-
-                                // done
-                                let busy_duration = (Date.now() - busy_init_ts);
-                                if ( busy_duration >= window.busy_indicator_hide_delay ) {
-                                    $(el_filedialog_window).close();
-                                } else {
-                                    setTimeout(() => {
-                                        // close this dialog
-                                        $(el_filedialog_window).close();
-                                    }, Math.abs(window.busy_indicator_hide_delay - busy_duration));
-                                }
-                            },
-                        });
-                    });
-                }
-            }
-
+            await postAuthActions(action);
             // ----------------------------------------------------------
             // Get user's sites
             // ----------------------------------------------------------
@@ -1245,27 +1473,34 @@ window.initgui = async function (options) {
     // If we're in fullpage/emebedded/Auth Popup mode, we don't want to load the custom background
     // because it's not visible anyway and it's a waste of bandwidth
     // -------------------------------------------------------------------------------------
-    if ( !window.is_fullpage_mode && !window.embedded_in_popup ) {
+    if (!window.is_fullpage_mode && !window.embedded_in_popup) {
         window.refresh_desktop_background();
     }
     // -------------------------------------------------------------------------------------
     // Un-authed but not first visit -> try to log in/sign up
     // -------------------------------------------------------------------------------------
-    if ( !window.is_auth() && (!window.first_visit_ever || window.disable_temp_users) ) {
+    if (
+        !window.is_auth() &&
+        (!window.first_visit_ever || window.disable_temp_users)
+    ) {
         const needs_action = action === 'authme' || action === 'copyauth';
         const reload_on_success = needs_action;
-        if ( window.logged_in_users.length > 0 ) {
+        if (window.logged_in_users.length > 0) {
+            // dashboard mode skips the wallpaper (fullpage), but the session list
+            // has no cover page — restore the wallpaper so it isn't on a blank page
+            if (window.is_dashboard_mode) {
+                window.refresh_desktop_background();
+            }
             await UIWindowSessionList({
                 redirect_url: needs_action ? window.location.href : undefined,
             });
-        }
-        else {
-            const resp = await fetch(`${window.gui_origin }/whoarewe`);
+        } else {
+            const resp = await fetch(`${window.gui_origin}/whoarewe`);
             const whoarewe = await resp.json();
             await UIWindowLogin({
                 reload_on_success: !window.embedded_in_popup,
                 send_confirmation_code: true,
-                show_signup_button: ( !whoarewe.disable_user_signup ),
+                show_signup_button: !whoarewe.disable_user_signup,
                 redirect_url: needs_action ? window.location.href : undefined,
                 window_options: {
                     cover_page: true,
@@ -1273,7 +1508,7 @@ window.initgui = async function (options) {
                 },
             });
         }
-        if ( !reload_on_success && window.is_auth() ) {
+        if (!reload_on_success && window.is_auth()) {
             window.__login_completed = true;
         }
     }
@@ -1301,17 +1536,15 @@ window.initgui = async function (options) {
         window.referrerStr = referrer;
 
         // in case there is also a referrer query param, add it to the referrer URL
-        if ( window.url_query_params.has('ref') ) {
-            if ( ! referrer )
-            {
+        if (window.url_query_params.has('ref')) {
+            if (!referrer) {
                 referrer = '/';
             }
-            referrer += `?ref=${ html_encode(window.url_query_params.get('ref'))}`;
+            referrer += `?ref=${html_encode(window.url_query_params.get('ref'))}`;
         }
 
         let headers = {};
-        if ( window.custom_headers )
-        {
+        if (window.custom_headers) {
             headers = window.custom_headers;
         }
 
@@ -1325,14 +1558,14 @@ window.initgui = async function (options) {
             };
 
             // Add Turnstile token if available
-            if ( turnstileToken ) {
+            if (turnstileToken) {
                 requestData['cf-turnstile-response'] = turnstileToken;
             }
 
             // Device signal for abuse prevention; omitted when unavailable
             try {
                 const fingerprint = await window.getDeviceFingerprint?.();
-                if ( fingerprint ) {
+                if (fingerprint) {
                     requestData.fingerprint = fingerprint;
                 }
             } catch (e) {
@@ -1340,7 +1573,7 @@ window.initgui = async function (options) {
             }
 
             $.ajax({
-                url: `${window.gui_origin }/signup`,
+                url: `${window.gui_origin}/signup`,
                 type: 'POST',
                 async: true,
                 headers: headers,
@@ -1348,63 +1581,74 @@ window.initgui = async function (options) {
                 data: JSON.stringify(requestData),
                 success: async function (data) {
                     /*eslint-disable*/
-                    const turnstile_duration = Date.now() - window.turnstile_success_ts;
+                    const turnstile_duration =
+                        Date.now() - window.turnstile_success_ts;
                     if (turnstile_duration < 2000) {
                         // Sleep until 2 seconds have passed
                         await window.sleep(2000 - turnstile_duration);
                     }
 
                     const $captchaModal = $('.captcha-modal');
-                    if ( $captchaModal.length > 0 ) await new Promise(async resolve => {
-                        // The callback operand for fadeOut could be called
-                        // more than once if there are multiple `.captcha-modal`
-                        // elements, but only the first call to `resolve()` will
-                        // have any effect.
-                        $captchaModal.fadeOut(200, function () {
-                            $(this).remove();
+                    if ($captchaModal.length > 0)
+                        await new Promise(async (resolve) => {
+                            // The callback operand for fadeOut could be called
+                            // more than once if there are multiple `.captcha-modal`
+                            // elements, but only the first call to `resolve()` will
+                            // have any effect.
+                            $captchaModal.fadeOut(200, function () {
+                                $(this).remove();
+                                resolve();
+                            });
+
+                            // Just in case anything fails, also resolve after 500ms
+                            await window.sleep(500);
                             resolve();
                         });
-                        
-                        // Just in case anything fails, also resolve after 500ms
-                        await window.sleep(500);
-                        resolve();
-                    });
 
                     await window.update_auth_data(data.token, data.user);
 
                     // if this is a popup, hide the spinner, make sure it was visible for at least 2 seconds
-                    if(window.embedded_in_popup) await new Promise(async resolve => {
-                        let spinner_duration = (Date.now() - spinner_init_ts);
+                    if (window.embedded_in_popup)
+                        await new Promise(async (resolve) => {
+                            let spinner_duration = Date.now() - spinner_init_ts;
 
-                        (async () => {
-                            let msg_id = window.url_query_params.get('msg_id');
-                            let data = await window.getUserAppToken(new URL(window.openerOrigin).origin);
-                            // This is an implicit app and the app_uid is sent back from the server
-                            // we cache it here so that we can use it later
-                            window.host_app_uid = data.app_uid;
-                            // send token to parent
-                            window.opener.postMessage({
-                                msg: 'puter.token',
-                                success: true,
-                                msg_id: msg_id,
-                                token: data.token,
-                                username: window.user.username,
-                                app_uid: data.app_uid,
-                            }, window.openerOrigin);
-                            // close popup
-                            if ( !action || action === 'sign-in' ) {
-                                window.close();
-                                window.open('', '_self').close();
+                            (async () => {
+                                let msg_id =
+                                    window.url_query_params.get('msg_id');
+                                let data = await window.getUserAppToken(
+                                    new URL(window.openerOrigin).origin,
+                                );
+                                // This is an implicit app and the app_uid is sent back from the server
+                                // we cache it here so that we can use it later
+                                window.host_app_uid = data.app_uid;
+                                // send token to parent
+                                window.opener.postMessage(
+                                    {
+                                        msg: 'puter.token',
+                                        success: true,
+                                        msg_id: msg_id,
+                                        token: data.token,
+                                        username: window.user.username,
+                                        app_uid: data.app_uid,
+                                    },
+                                    window.openerOrigin,
+                                );
+                                // close popup
+                                if (!action || action === 'sign-in') {
+                                    window.close();
+                                    window.open('', '_self').close();
+                                }
+                            })();
+                            if (spinner_duration < 2000) {
+                                await window.sleep(2000 - spinner_duration);
+                                resolve();
                             }
-                        })();
-                        if (spinner_duration < 2000) {
-                            await window.sleep(2000 - spinner_duration);
-                            resolve();
-                        }
-                    });
+                        });
                     /*eslint-enable*/
 
-                    document.dispatchEvent(new Event('login', { bubbles: true }));
+                    document.dispatchEvent(
+                        new Event('login', { bubbles: true }),
+                    );
                 },
                 error: async (err) => {
                     let err_obj = null;
@@ -1413,7 +1657,7 @@ window.initgui = async function (options) {
                     } catch (e) {
                         err_obj = e;
                     }
-                    if ( err_obj.code === 'must_login_or_signup' ) {
+                    if (err_obj.code === 'must_login_or_signup') {
                         // hide Turnstile challenge
                         $('.captcha-modal').hide();
 
@@ -1428,26 +1672,31 @@ window.initgui = async function (options) {
 
                         (async () => {
                             let msg_id = window.url_query_params.get('msg_id');
-                            let data = await window.getUserAppToken(new URL(window.openerOrigin).origin);
+                            let data = await window.getUserAppToken(
+                                new URL(window.openerOrigin).origin,
+                            );
                             // This is an implicit app and the app_uid is sent back from the server
                             // we cache it here so that we can use it later
                             window.host_app_uid = data.app_uid;
                             // send token to parent
-                            window.opener.postMessage({
-                                msg: 'puter.token',
-                                success: true,
-                                msg_id: msg_id,
-                                token: data.token,
-                                username: window.user.username,
-                                app_uid: data.app_uid,
-                            }, window.openerOrigin);
+                            window.opener.postMessage(
+                                {
+                                    msg: 'puter.token',
+                                    success: true,
+                                    msg_id: msg_id,
+                                    token: data.token,
+                                    username: window.user.username,
+                                    app_uid: data.app_uid,
+                                },
+                                window.openerOrigin,
+                            );
                             // close popup
-                            if ( !action || action === 'sign-in' ) {
+                            if (!action || action === 'sign-in') {
                                 window.close();
                                 window.open('', '_self').close();
                             }
                         })();
-                    } else if ( err_obj.code === 'signup_blocked' ) {
+                    } else if (err_obj.code === 'signup_blocked') {
                         // Hide any captcha modal
                         $('.captcha-modal').hide();
 
@@ -1464,23 +1713,25 @@ window.initgui = async function (options) {
                         document.body.appendChild(overlay);
                     } else {
                         UIAlert({
-                            message: err_obj.message ?? 'There was an error creating your account. Please try again.',
+                            message:
+                                err_obj.message ??
+                                'There was an error creating your account. Please try again.',
                         });
                     }
                 },
-                complete: function () {
-                },
+                complete: function () {},
             });
         };
 
         // Check if Turnstile is enabled and show challenge
-        if ( window.gui_params?.turnstileSiteKey ) {
+        if (window.gui_params?.turnstileSiteKey) {
             window.showTurnstileChallenge({
                 onSuccess: createTempUser,
                 onError: (error) => {
                     console.error('Turnstile verification failed:', error);
                     UIAlert({
-                        message: 'Security verification failed. Please refresh the page and try again.',
+                        message:
+                            'Security verification failed. Please refresh the page and try again.',
                     });
                 },
             });
@@ -1491,10 +1742,9 @@ window.initgui = async function (options) {
     }
 
     // if there is at least one window open (only non-Explorer windows), ask user for confirmation when navigating away from puter
-    if ( window.feature_flags.prompt_user_when_navigation_away_from_puter ) {
+    if (window.feature_flags.prompt_user_when_navigation_away_from_puter) {
         window.onbeforeunload = function () {
-            if ( $('.window:not(.window[data-app="explorer"])').length > 0 )
-            {
+            if ($('.window:not(.window[data-app="explorer"])').length > 0) {
                 return true;
             }
         };
@@ -1508,53 +1758,18 @@ window.initgui = async function (options) {
         $('.window').close();
 
         // -------------------------------------------------------------------------------------
-        // Action: AuthMe — redirect to a third-party URL with the user's auth token
-        // -------------------------------------------------------------------------------------
-        if ( action === 'authme' ) {
-            const redirectURL = window.url_query_params.get('redirectURL');
-            if ( redirectURL ) {
-                const approved = await UIWindowAuthMe({
-                    redirect_url: redirectURL,
-                });
-                if ( approved ) {
-                    // Hand the app a named, revocable full-API-access token
-                    // instead of the raw GUI/session token: it can use the
-                    // whole API but can't manage the account.
-                    let host = '';
-                    try { host = new URL(redirectURL).host; } catch ( e ) { /* ignore */ }
-                    let token;
-                    try {
-                        token = await create_access_token({
-                            label: host
-                                ? `${i18n('token_label_external_app')} (${host})`
-                                : i18n('token_label_external_app'),
-                        });
-                    } catch ( e ) {
-                        await UIAlert({ message: e?.message ?? String(e) });
-                        return;
-                    }
-                    const url = new URL(redirectURL);
-                    url.searchParams.set('token', token);
-                    window.location.href = url.href;
-                    return;
-                }
-            }
-        }
-
-        // -------------------------------------------------------------------------------------
-        // Action: CopyAuth — show dialog to copy auth token
-        // -------------------------------------------------------------------------------------
-        if ( action === 'copyauth' ) {
-            await UIWindowCopyToken({ show_header: true });
-        }
-
-        // -------------------------------------------------------------------------------------
         // Early check for fullpage mode from app metadata (after login)
         // -------------------------------------------------------------------------------------
-        if ( !window.is_fullpage_mode && window.url_paths[0]?.toLocaleLowerCase() === 'app' && window.url_paths[1] ) {
+        if (
+            !window.is_fullpage_mode &&
+            window.url_paths[0]?.toLocaleLowerCase() === 'app' &&
+            window.url_paths[1]
+        ) {
             try {
-                const app_info = await puter.apps.get(window.url_paths[1], { icon_size: 64 });
-                if ( app_info?.metadata?.fullpage_on_landing ) {
+                const app_info = await puter.apps.get(window.url_paths[1], {
+                    icon_size: 64,
+                });
+                if (app_info?.metadata?.fullpage_on_landing) {
                     window.is_fullpage_mode = true;
                     window.taskbar_height = 0;
                     window.app_launched_from_url = app_info;
@@ -1564,284 +1779,10 @@ window.initgui = async function (options) {
             }
         }
 
-        // -------------------------------------------------------------------------------------
-        // Load desktop, if not embedded in a popup and not on the dashboard page
-        // -------------------------------------------------------------------------------------
-        if ( !window.embedded_in_popup && !window.is_dashboard_mode ) {
-            if ( window.is_fullpage_mode ) {
-                // In fullpage mode, skip loading desktop items and background
-                UIDesktop({});
-            } else {
-                await window.get_auto_arrange_data();
-                puter.fs.stat({ path: window.desktop_path, consistency: 'eventual' }).then(desktop_fsentry => {
-                    UIDesktop({ desktop_fsentry: desktop_fsentry });
-                });
-            }
-        }
-        // -------------------------------------------------------------------------------------
-        // Dashboard mode: open explorer pointing to home directory
-        // -------------------------------------------------------------------------------------
-        else if ( window.is_dashboard_mode ) {
-            UIDashboard();
-        }
-        // -------------------------------------------------------------------------------------
-        // If embedded in a popup, send the 'ready' event to referrer and close the popup
-        // -------------------------------------------------------------------------------------
-        else {
-            let msg_id = window.url_query_params.get('msg_id');
-            try {
-
-                let data = await window.getUserAppToken(new URL(window.openerOrigin).origin);
-                // This is an implicit app and the app_uid is sent back from the server
-                // we cache it here so that we can use it later
-                window.host_app_uid = data.app_uid;
-                // send token to parent
-                window.opener.postMessage({
-                    msg: 'puter.token',
-                    success: true,
-                    msg_id: msg_id,
-                    token: data.token,
-                    username: window.user.username,
-                    app_uid: data.app_uid,
-                }, window.openerOrigin);
-                // close popup
-                if ( !action || action === 'sign-in' ) {
-                    window.close();
-                    window.open('', '_self').close();
-                }
-            } catch ( err ) {
-                // send error to parent
-                window.opener.postMessage({
-                    msg: 'puter.token',
-                    msg_id: msg_id,
-                    success: false,
-                    token: null,
-                }, window.openerOrigin);
-                // close popup
-                window.close();
-                window.open('', '_self').close();
-            }
-
-            let app_uid;
-
-            if ( window.openerOrigin ) {
-                app_uid = await window.getAppUIDFromOrigin(window.openerOrigin);
-                window.host_app_uid = app_uid;
-            }
-
-            //--------------------------------------------------------------------------------------
-            // Action: Show Open File Picker
-            //--------------------------------------------------------------------------------------
-            if ( action === 'show-open-file-picker' ) {
-                let options = window.url_query_params.get('options');
-                options = JSON.parse(options ?? '{}');
-
-                // Open dialog
-                UIWindow({
-                    allowed_file_types: options?.accept,
-                    selectable_body: options?.multiple,
-                    path: `/${ window.user.username }/Desktop`,
-                    return_to_parent_window: true,
-                    show_maximize_button: false,
-                    show_minimize_button: false,
-                    title: 'Open',
-                    is_dir: true,
-                    is_openFileDialog: true,
-                    is_resizable: false,
-                    has_head: false,
-                    cover_page: true,
-                    iframe_msg_uid: msg_id,
-                    center: true,
-                    initiating_app_uuid: app_uid,
-                    on_close: function () {
-                        window.opener.postMessage({
-                            msg: 'fileOpenCanceled',
-                            original_msg_id: msg_id,
-                        }, '*');
-                    },
-                });
-            }
-            //--------------------------------------------------------------------------------------
-            // Action: Show Directory Picker
-            //--------------------------------------------------------------------------------------
-            else if ( action === 'show-directory-picker' ) {
-                // open directory picker dialog
-                UIWindow({
-                    path: `/${ window.user.username }/Desktop`,
-                    // this is the uuid of the window to which this dialog will return
-                    // parent_uuid: event.data.appInstanceID,
-                    return_to_parent_window: true,
-                    show_maximize_button: false,
-                    show_minimize_button: false,
-                    title: 'Open',
-                    is_dir: true,
-                    is_directoryPicker: true,
-                    is_resizable: false,
-                    has_head: false,
-                    cover_page: true,
-                    // selectable_body: is_selectable_body,
-                    iframe_msg_uid: msg_id,
-                    center: true,
-                    initiating_app_uuid: app_uid,
-                    on_close: function () {
-                        window.opener.postMessage({
-                            msg: 'directoryOpenCanceled',
-                            original_msg_id: msg_id,
-                        }, '*');
-                    },
-                });
-            }
-
-            //--------------------------------------------------------------------------------------
-            // Action: Show Save File Dialog
-            //--------------------------------------------------------------------------------------
-            else if ( action === 'show-save-file-picker' ) {
-                let allowed_file_types = window.url_query_params.get('allowed_file_types');
-
-                // send 'sendMeFileData' event to parent
-                window.opener.postMessage({
-                    msg: 'sendMeFileData',
-                }, '*');
-
-                // listen for 'showSaveFilePickerPopup' event from parent
-                window.addEventListener('message', async (event) => {
-                    if ( event.data.msg !== 'showSaveFilePickerPopup' )
-                    {
-                        return;
-                    }
-
-                    // Open dialog
-                    UIWindow({
-                        allowed_file_types: allowed_file_types,
-                        path: `/${ window.user.username }/Desktop`,
-                        // this is the uuid of the window to which this dialog will return
-                        return_to_parent_window: true,
-                        show_maximize_button: false,
-                        show_minimize_button: false,
-                        title: 'Save',
-                        is_dir: true,
-                        is_saveFileDialog: true,
-                        is_resizable: false,
-                        has_head: false,
-                        cover_page: true,
-                        // selectable_body: is_selectable_body,
-                        iframe_msg_uid: msg_id,
-                        center: true,
-                        initiating_app_uuid: app_uid,
-                        on_close: function () {
-                            window.opener.postMessage({
-                                msg: 'fileSaveCanceled',
-                                original_msg_id: msg_id,
-                            }, '*');
-                        },
-                        onSaveFileDialogSave: async function (target_path, el_filedialog_window) {
-                            $(el_filedialog_window).find('.window-disable-mask, .busy-indicator').show();
-                            let busy_init_ts = Date.now();
-
-                            let overwrite = false;
-                            let file_to_upload = new File([event.data.content], path.basename(target_path));
-                            let item_with_same_name_already_exists = true;
-                            while ( item_with_same_name_already_exists ) {
-                                // overwrite?
-                                if ( overwrite )
-                                {
-                                    item_with_same_name_already_exists = false;
-                                }
-                                // upload
-                                try {
-                                    const res = await puter.fs.write(
-                                        target_path,
-                                        file_to_upload,
-                                        {
-                                            dedupeName: false,
-                                            overwrite: overwrite,
-                                        },
-                                    );
-
-                                    let file_signature = await puter.fs.sign(app_uid, { uid: res.uid, action: 'write' });
-                                    file_signature = file_signature.items;
-
-                                    item_with_same_name_already_exists = false;
-                                    window.opener.postMessage({
-                                        msg: 'fileSaved',
-                                        original_msg_id: msg_id,
-                                        filename: res.name,
-                                        saved_file: {
-                                            name: file_signature.fsentry_name,
-                                            readURL: file_signature.read_url,
-                                            writeURL: file_signature.write_url,
-                                            metadataURL: file_signature.metadata_url,
-                                            type: file_signature.type,
-                                            uid: file_signature.uid,
-                                            path: privacy_aware_path(res.path),
-                                        },
-                                    }, '*');
-
-                                    window.close();
-                                    window.open('', '_self').close();
-                                    // show_save_account_notice_if_needed();
-                                }
-                                catch ( err ) {
-                                    // item with same name exists
-                                    if ( err.code === 'item_with_same_name_exists' ) {
-                                        const alert_resp = await UIAlert({
-                                            message: `<strong>${html_encode(err.entry_name)}</strong> already exists.`,
-                                            buttons: [
-                                                {
-                                                    label: i18n('replace'),
-                                                    value: 'replace',
-                                                    type: 'primary',
-                                                },
-                                                {
-                                                    label: i18n('cancel'),
-                                                    value: 'cancel',
-                                                },
-                                            ],
-                                            parent_uuid: $(el_filedialog_window).attr('data-element_uuid'),
-                                        });
-                                        if ( alert_resp === 'replace' ) {
-                                            overwrite = true;
-                                        } else if ( alert_resp === 'cancel' ) {
-                                            // enable parent window
-                                            $(el_filedialog_window).find('.window-disable-mask, .busy-indicator').hide();
-                                            return;
-                                        }
-                                    }
-                                    else {
-                                        console.log(err);
-                                        // show error
-                                        await UIAlert({
-                                            message: err.message ?? 'Upload failed.',
-                                            parent_uuid: $(el_filedialog_window).attr('data-element_uuid'),
-                                        });
-                                        // enable parent window
-                                        $(el_filedialog_window).find('.window-disable-mask, .busy-indicator').hide();
-                                        return;
-                                    }
-                                }
-                            }
-
-                            // done
-                            let busy_duration = (Date.now() - busy_init_ts);
-                            if ( busy_duration >= window.busy_indicator_hide_delay ) {
-                                $(el_filedialog_window).close();
-                            } else {
-                                setTimeout(() => {
-                                    // close this dialog
-                                    $(el_filedialog_window).close();
-                                }, Math.abs(window.busy_indicator_hide_delay - busy_duration));
-                            }
-                        },
-
-                    });
-                });
-            }
-
-        }
-
+        await postAuthActions(action);
     });
 
-    if ( window.__login_completed ) {
+    if (window.__login_completed) {
         document.dispatchEvent(new Event('login', { bubbles: true }));
         window.__login_completed = false;
     }
@@ -1856,33 +1797,38 @@ window.initgui = async function (options) {
         update_last_touch_coordinates(e);
 
         // dismiss touchstart on regular devices
-        if ( e.type === 'touchstart' && !isMobile.phone && !isMobile.tablet )
-        {
+        if (e.type === 'touchstart' && !isMobile.phone && !isMobile.tablet) {
             return;
         }
 
         // If .item-container clicked, unselect all its item children
-        if ( $(e.target).hasClass('item-container') && !e.ctrlKey && !e.metaKey ) {
+        if (
+            $(e.target).hasClass('item-container') &&
+            !e.ctrlKey &&
+            !e.metaKey
+        ) {
             $(e.target).children('.item-selected').removeClass('item-selected');
             window.update_explorer_footer_selected_items_count(e.target);
         }
 
         // If the clicked element is not a context menu, remove all context menus
-        if ( $(e.target).parents('.context-menu').length === 0 ) {
+        if ($(e.target).parents('.context-menu').length === 0) {
             $('.context-menu').fadeOut(200, function () {
                 $(this).remove();
             });
         }
 
         // click on anything will close all popovers, but there are some exceptions
-        if ( !$(e.target).hasClass('start-app')
-            && !$(e.target).hasClass('launch-search')
-            && !$(e.target).hasClass('launch-search-clear')
-            && $(e.target).closest('.start-app').length === 0
-            && !isMobile.phone && !isMobile.tablet
-            && !$(e.target).hasClass('popover')
-            && $(e.target).parents('.popover').length === 0 ) {
-
+        if (
+            !$(e.target).hasClass('start-app') &&
+            !$(e.target).hasClass('launch-search') &&
+            !$(e.target).hasClass('launch-search-clear') &&
+            $(e.target).closest('.start-app').length === 0 &&
+            !isMobile.phone &&
+            !isMobile.tablet &&
+            !$(e.target).hasClass('popover') &&
+            $(e.target).parents('.popover').length === 0
+        ) {
             $('.popover').fadeOut(200, function () {
                 $('.popover').remove();
             });
@@ -1892,21 +1838,21 @@ window.initgui = async function (options) {
         $('.ui-tooltip').remove();
 
         // rename items whose names were being edited
-        if ( ! $(e.target).hasClass('item-name-editor') ) {
+        if (!$(e.target).hasClass('item-name-editor')) {
             // blurring an Item Name Editor will automatically trigger renaming the item
             $('.item-name-editor-active').blur();
         }
 
         // update active_item_container
-        if ( $(e.target).hasClass('item-container') ) {
+        if ($(e.target).hasClass('item-container')) {
             window.active_item_container = e.target;
         } else {
             let ic = $(e.target).closest('.item-container');
-            if ( ic.length > 0 ) {
+            if (ic.length > 0) {
                 window.active_item_container = ic.get(0);
             } else {
                 let pp = $(e.target).find('.item-container');
-                if ( pp.length > 0 ) {
+                if (pp.length > 0) {
                     window.active_item_container = pp.get(0);
                 }
             }
@@ -1926,25 +1872,37 @@ window.initgui = async function (options) {
     //--------------------------------------------------------
     $(document).on('mousedown', function (e) {
         // if taskbar or any parts of it is clicked, drop the event
-        if ( $(e.target).hasClass('taskbar') || $(e.target).closest('.taskbar').length > 0 ) {
+        if (
+            $(e.target).hasClass('taskbar') ||
+            $(e.target).closest('.taskbar').length > 0
+        ) {
             return;
         }
         // if toolbar or any parts of it is clicked, drop the event
-        if ( $(e.target).hasClass('toolbar') || $(e.target).closest('.toolbar').length > 0 ) {
+        if (
+            $(e.target).hasClass('toolbar') ||
+            $(e.target).closest('.toolbar').length > 0
+        ) {
             return;
         }
 
         // if close or minimize button clicked, drop the event
-        if ( document.elementFromPoint(e.clientX, e.clientY).closest('.window-close-btn, .window-minimize-btn') ) {
+        if (
+            document
+                .elementFromPoint(e.clientX, e.clientY)
+                .closest('.window-close-btn, .window-minimize-btn')
+        ) {
             return;
         }
 
         // if mouse is clicked on a window, activate it
-        if ( window.mouseover_window !== undefined ) {
+        if (window.mouseover_window !== undefined) {
             // if popover clicked on, don't activate window. This is because if an app
             // is using the popover API to show a popover, the popover will be closed if the window is activated
-            if ( $(e.target).hasClass('popover') || $(e.target).parents('.popover').length > 0 )
-            {
+            if (
+                $(e.target).hasClass('popover') ||
+                $(e.target).parents('.popover').length > 0
+            ) {
                 return;
             }
             $(window.mouseover_window).focusWindow(e);
@@ -1965,21 +1923,20 @@ window.initgui = async function (options) {
     });
 
     document.addEventListener('visibilitychange', (event) => {
-        if ( document.visibilityState !== 'visible' ) {
+        if (document.visibilityState !== 'visible') {
             window.doc_title_before_blur = document.title;
-            if ( Object.keys(window.active_uploads).length > 0 ) {
+            if (Object.keys(window.active_uploads).length > 0) {
                 update_title_based_on_uploads();
             }
-        } else if ( window.active_uploads ) {
+        } else if (window.active_uploads) {
             document.title = window.doc_title_before_blur ?? 'Puter';
         }
     });
-
 };
 
-function requestOpenerOrigin () {
+function requestOpenerOrigin() {
     return new Promise((resolve, reject) => {
-        if ( ! window.opener ) {
+        if (!window.opener) {
             reject(new Error('No window.opener available'));
             return;
         }
@@ -1987,7 +1944,7 @@ function requestOpenerOrigin () {
         // Function to handle the message event
         const handleMessage = (event) => {
             // Check if the message is the expected response
-            if ( event.data.msg === 'originResponse' ) {
+            if (event.data.msg === 'originResponse') {
                 // Clean up by removing the event listener
                 window.removeEventListener('message', handleMessage);
                 resolve(event.origin);
@@ -2013,7 +1970,11 @@ $(document).on('click', '.generic-close-window-button', function (e) {
 });
 
 $(document).on('click', function (e) {
-    if ( !$(e.target).hasClass('window-search') && $(e.target).closest('.window-search').length === 0 && !$(e.target).is('.toolbar-btn.search-btn') ) {
+    if (
+        !$(e.target).hasClass('window-search') &&
+        $(e.target).closest('.window-search').length === 0 &&
+        !$(e.target).is('.toolbar-btn.search-btn')
+    ) {
         $('.window-search').close();
     }
 });
@@ -2021,14 +1982,14 @@ $(document).on('click', function (e) {
 // Re-calculate desktop height and width on window resize and re-position the login and signup windows
 $(window).on('resize', function () {
     // If host env is popup, don't continue because the popup window has its own resize requirements.
-    if ( window.embedded_in_popup )
-    {
+    if (window.embedded_in_popup) {
         return;
     }
 
     const ratio = window.desktop_width / window.innerWidth;
 
-    window.desktop_height = window.innerHeight - window.toolbar_height - window.taskbar_height;
+    window.desktop_height =
+        window.innerHeight - window.toolbar_height - window.taskbar_height;
     window.desktop_width = window.innerWidth;
 
     // Re-center the login window
@@ -2049,7 +2010,7 @@ $(window).on('resize', function () {
 });
 
 $(document).on('contextmenu', '.disable-context-menu', function (e) {
-    if ( $(e.target).hasClass('disable-context-menu') ) {
+    if ($(e.target).hasClass('disable-context-menu')) {
         e.preventDefault();
         return false;
     }

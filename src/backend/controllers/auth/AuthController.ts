@@ -20,13 +20,19 @@
 import bcrypt from 'bcrypt';
 import type { Request, RequestHandler, Response } from 'express';
 import crypto from 'node:crypto';
-import { v4 as uuidv4 } from 'uuid';
+import { v4 as uuidv4, validate as validateUuid } from 'uuid';
 import validator from 'validator';
 import { Controller, Get, Post } from '../../core/http/decorators.js';
+import type { HttpErrorOptions } from '../../core/http/HttpError.js';
 import { HttpError } from '../../core/http/HttpError.js';
 import { antiCsrf } from '../../core/http/middleware/antiCsrf.js';
 import { generateCaptcha } from '../../core/http/middleware/captcha.js';
 import { checkRateLimit } from '../../core/http/middleware/rateLimit.js';
+import {
+    signStepUpToken,
+    STEP_UP_COOKIE_NAME,
+    stepUpCookieOptions,
+} from '../../core/http/middleware/stepUpSession.js';
 import {
     createUserProtectedGate,
     createWebSessionActorGate,
@@ -60,6 +66,20 @@ const USERNAME_REGEX = /^\w{1,}$/;
 const USERNAME_MAX_LENGTH = 45;
 const FINGERPRINT_MAX_LENGTH = 128;
 const DISPATCH_ID_MAX_LENGTH = 128;
+// Default SMS send attempts before the card fallback opens.
+const DEFAULT_CARD_FALLBACK_ATTEMPTS = 2;
+// /send-confirm-phone route rate limit. Also caps the fallback's
+// `after_attempts`: requests past the route limit are rejected in middleware
+// and never reach the attempt counter, so a higher threshold could never be
+// crossed.
+const SEND_PHONE_RATE_LIMIT = 10;
+const SEND_PHONE_RATE_WINDOW_MS = 60 * 60_000;
+// Once the threshold is crossed the fallback stays open this long, so the
+// user can finish the card flow without racing the attempt counter's expiry.
+const CARD_FALLBACK_OPEN_TTL_SECONDS = 24 * 60 * 60;
+// How long a failed-SMS-send record stays readable by its error_id — long
+// enough to cover the typical support round-trip.
+const SMS_SEND_ERROR_TTL_SECONDS = 7 * 24 * 60 * 60;
 const RESERVED_USERNAMES = new Set([
     'admin',
     'administrator',
@@ -98,6 +118,67 @@ const RESERVED_USERNAMES = new Set([
  */
 @Controller('')
 export class AuthController extends PuterController {
+    @Post('/login/wait', {
+        subdomain: ['api'],
+        rateLimit: [
+            // A client will make a request to this every 10 seconds while waiting for the login to complete, so we allow a higher limit than the main /login endpoint.
+            { scope: 'login-wait', limit: 100, window: 15 * 60_000, key: 'ip' },
+        ],
+    })
+    async loginWait(req: Request, res: Response) {
+        const { session } = req.body;
+        // validate uuid to prevent ultra long key or listening on pubsub.login.*
+        if (!session || !validateUuid(session)) {
+            throw new HttpError(400, 'session is required.', {
+                legacyCode: 'bad_request',
+            });
+        }
+        const { resolve, promise } = Promise.withResolvers<void>();
+
+        let token: string | null = null;
+        const listener = (_key: string, value: { authtoken: string }) => {
+            token = value.authtoken;
+            resolve();
+        };
+        this.clients.event.on(`pubsub.login.${session}`, listener);
+
+        const timeout = new Promise<void>((resolve) =>
+            setTimeout(resolve, 10000),
+        );
+        await Promise.race([promise, timeout]);
+        this.clients.event.off(`pubsub.login.${session}`, listener);
+        if (!token) {
+            throw new HttpError(408, 'Request timeout.', {
+                legacyCode: 'request_timeout',
+            });
+        }
+
+        res.json({
+            auth_token: token,
+        });
+    }
+    @Post('/login/set', {
+        subdomain: ['api'],
+    })
+    async loginSet(req: Request, res: Response) {
+        const { session, auth_token } = req.body;
+        if (!session || !auth_token || !validateUuid(session)) {
+            throw new HttpError(400, 'session and auth_token are required.', {
+                legacyCode: 'bad_request',
+            });
+        }
+
+        this.clients.event.emit(
+            `pubsub.login.${session}`,
+            {
+                authtoken: auth_token,
+            },
+            {},
+        );
+
+        res.json({ success: true });
+    }
+
     // -- Login -------------------------------------------------------
 
     @Post('/login', {
@@ -510,6 +591,31 @@ export class AuthController extends PuterController {
             }
         }
 
+        // Signup-disabled gate. Runs before the duplicate checks so a
+        // disabled endpoint doesn't reveal which usernames or emails
+        // exist. Claiming a pre-existing placeholder row is still
+        // allowed, so permanent signups look the email up first.
+        if (this.config.disable_user_signup) {
+            let claimable = false;
+            if (!is_temp) {
+                const existing =
+                    (await this.stores.user.getByEmail(body.email)) ??
+                    (await this.stores.user.getByCleanEmail(
+                        cleanEmail(body.email),
+                    ));
+                claimable = Boolean(
+                    existing &&
+                    !existing.email_confirmed &&
+                    existing.password === null,
+                );
+            }
+            if (!claimable) {
+                throw new HttpError(403, 'User registration is disabled.', {
+                    legacyCode: 'signup_disabled',
+                });
+            }
+        }
+
         // Duplicate username check
         if (await this.stores.user.getByUsername(body.username)) {
             throw new HttpError(
@@ -863,6 +969,11 @@ export class AuthController extends PuterController {
         // a stale value would re-authenticate the next request.
         res.clearCookie(this.config.cookie_name ?? 'puter_token');
         res.clearCookie('puter_token_v2');
+        // Drop any step-up elevation too, so it can't reactivate on a shared
+        // machine.
+        res.clearCookie(STEP_UP_COOKIE_NAME, {
+            ...(this.config.domain ? { domain: this.config.domain } : {}),
+        });
 
         // Remove the session (fire-and-forget)
         if (req.token) {
@@ -1018,14 +1129,176 @@ export class AuthController extends PuterController {
 
     // -- Phone verification (SMS via Prelude) ------------------------
 
+    /**
+     * Build the error thrown when a verification SMS can't be sent (a delivery
+     * failure, or a refused/blocked send). Mints a short `error_id`, writes a
+     * single greppable line tying that id to the real reason (so support can
+     * look it up in CloudWatch with the id the user quotes), stores the same
+     * record in KV under `sms-send-error:<error_id>` for a week (the admin
+     * abuse page looks it up there without needing log access), and returns
+     * the `HttpError` with the id attached as `error_id` for the GUI to
+     * surface. The phone number is deliberately omitted from the log line and
+     * the KV record (PII); the user + country are enough to correlate.
+     */
+    private async smsSendError(
+        statusCode: number,
+        clientMessage: string,
+        reason: string,
+        ctx: {
+            userId?: number;
+            userUid?: string;
+            country?: string;
+            detail?: unknown;
+        },
+        options: HttpErrorOptions = {},
+    ): Promise<HttpError> {
+        const errorId = uuidv4();
+        const detail =
+            ctx.detail instanceof Error ? ctx.detail.message : ctx.detail;
+        console.warn(
+            `[send-confirm-phone] send_failed error_id=${errorId} ` +
+                `reason=${reason} status=${statusCode} ` +
+                `user_id=${ctx.userId ?? ''} user_uid=${ctx.userUid ?? ''} ` +
+                `country=${ctx.country ?? ''}` +
+                (detail ? ` detail=${JSON.stringify(String(detail))}` : ''),
+        );
+        // Best-effort: the record backs a support lookup, so a KV failure
+        // must never mask the error actually being reported.
+        try {
+            const now = Math.floor(Date.now() / 1000);
+            await this.stores.kv.set({
+                key: `sms-send-error:${errorId}`,
+                value: {
+                    reason,
+                    status: statusCode,
+                    user_id: ctx.userId ?? null,
+                    user_uid: ctx.userUid ?? null,
+                    country: ctx.country ?? null,
+                    detail: detail != null ? String(detail) : null,
+                    t: now,
+                },
+                expireAt: now + SMS_SEND_ERROR_TTL_SECONDS,
+            });
+        } catch (e) {
+            console.warn('[send-confirm-phone] error-record store failed:', e);
+        }
+        return new HttpError(statusCode, clientMessage, {
+            ...options,
+            fields: { ...options.fields, error_id: errorId },
+        });
+    }
+
+    // -- SMS-to-card fallback -----------------------------------------
+    //
+    // Once a user has made enough SMS send attempts in the rate-limit window
+    // without getting through, they can verify a card instead to clear the
+    // phone gate. Off unless config enables it.
+    //
+    // Two KV keys: a short-lived counter tied to the send rate-limit window
+    // triggers the fallback, and a longer-lived "open" flag holds eligibility
+    // once the threshold is crossed. The card endpoints check only the flag —
+    // deriving eligibility from the raw counter would let it expire while the
+    // user is mid-way through the card flow. Every KV failure fails closed
+    // (fallback unavailable), never open.
+
+    private cardFallbackConfig(): { enabled: boolean; afterAttempts: number } {
+        const cfg = this.config.phone_verification_card_fallback;
+        const afterAttempts = Math.min(
+            typeof cfg?.after_attempts === 'number' && cfg.after_attempts > 0
+                ? cfg.after_attempts
+                : DEFAULT_CARD_FALLBACK_ATTEMPTS,
+            SEND_PHONE_RATE_LIMIT,
+        );
+        return { enabled: Boolean(cfg?.enabled), afterAttempts };
+    }
+
+    private phoneAttemptsKey(userId: number): string {
+        return `phone-verify-attempts:${userId}`;
+    }
+
+    private cardFallbackFlagKey(userId: number): string {
+        return `card-fallback-open:${userId}`;
+    }
+
+    // TTL ties the counter to the send rate-limit window, so it resets with it.
+    private async bumpPhoneAttempts(userId: number): Promise<number> {
+        try {
+            const { res } = await this.stores.kv.incr({
+                key: this.phoneAttemptsKey(userId),
+                pathAndAmountMap: { attempts: 1 },
+                expireAt:
+                    Math.floor(Date.now() / 1000) +
+                    SEND_PHONE_RATE_WINDOW_MS / 1000,
+            });
+            const count = (res as { attempts?: number } | null)?.attempts;
+            return typeof count === 'number' ? count : 0;
+        } catch (e) {
+            console.warn('[send-confirm-phone] attempt-count bump failed:', e);
+            return 0;
+        }
+    }
+
+    /**
+     * Count a send attempt and, once the threshold is crossed, stamp the
+     * eligibility flag the card endpoints check. Returns whether the fallback
+     * is open so send responses (success or 429) can advertise it.
+     */
+    private async recordPhoneAttemptForFallback(user: {
+        id: number;
+        requires_phone_verification?: boolean | number | null;
+    }): Promise<boolean> {
+        const attempts = await this.bumpPhoneAttempts(user.id);
+        const { enabled, afterAttempts } = this.cardFallbackConfig();
+        const open =
+            enabled &&
+            Boolean(user.requires_phone_verification) &&
+            attempts >= afterAttempts;
+        if (open) {
+            try {
+                // Plain set, so each eligible attempt refreshes the window.
+                await this.stores.kv.set({
+                    key: this.cardFallbackFlagKey(user.id),
+                    value: true,
+                    expireAt:
+                        Math.floor(Date.now() / 1000) +
+                        CARD_FALLBACK_OPEN_TTL_SECONDS,
+                });
+            } catch (e) {
+                console.warn(
+                    '[send-confirm-phone] fallback flag stamp failed:',
+                    e,
+                );
+                return false;
+            }
+        }
+        return open;
+    }
+
+    private async isCardFallbackEligible(user: {
+        id: number;
+        requires_phone_verification?: boolean | number | null;
+    }): Promise<boolean> {
+        const { enabled } = this.cardFallbackConfig();
+        if (!enabled || !user.requires_phone_verification) return false;
+        try {
+            const { res } = await this.stores.kv.get({
+                key: this.cardFallbackFlagKey(user.id),
+            });
+            return res === true;
+        } catch (e) {
+            console.warn('[card-verification] fallback flag read failed:', e);
+            return false;
+        }
+    }
+
     @Post('/send-confirm-phone', {
         subdomain: ['api', ''],
         requireUserActor: true,
         allowUnconfirmed: true,
         rateLimit: {
             scope: 'send-confirm-phone',
-            limit: 10,
-            window: 60 * 60_000,
+            limit: SEND_PHONE_RATE_LIMIT,
+            window: SEND_PHONE_RATE_WINDOW_MS,
             key: 'user',
         },
     })
@@ -1042,9 +1315,13 @@ export class AuthController extends PuterController {
                 legacyCode: 'account_suspended',
             });
         if (!this.clients.prelude?.isConfigured())
-            throw new HttpError(503, 'Phone verification is unavailable.', {
-                legacyCode: 'service_unavailable' as never,
-            });
+            throw await this.smsSendError(
+                503,
+                'Phone verification is unavailable.',
+                'prelude_not_configured',
+                { userId: user.id, userUid: user.uuid },
+                { legacyCode: 'service_unavailable' as never },
+            );
 
         // Parse to E.164 (Prelude's required form + the stored form) and the
         // country, so we can apply the per-country cost cap.
@@ -1073,11 +1350,25 @@ export class AuthController extends PuterController {
         // (see PreludeClient / countries.ts). Avoids paying exorbitant per-SMS
         // rates in low-revenue, high-fraud geographies.
         if (!this.clients.prelude.isCountrySupported(parsed.country))
-            throw new HttpError(
+            throw await this.smsSendError(
                 400,
                 'Phone verification is not available for this country.',
+                'country_not_supported',
+                {
+                    userId: user.id,
+                    userUid: user.uuid,
+                    country: parsed.country,
+                },
                 { legacyCode: 'phone_country_not_supported' as never },
             );
+
+        // Counted before the abuse / Prelude checks so a blocked attempt still
+        // counts toward the fallback threshold.
+        const fallbackAvailable =
+            await this.recordPhoneAttemptForFallback(user);
+        const fallbackFields = fallbackAvailable
+            ? { card_fallback_available: true }
+            : {};
 
         // Abuse caps live ENTIRELY in a listening abuse extension, consulted
         // via `puter.phone-verification.check`. The backend ships no thresholds
@@ -1110,14 +1401,23 @@ export class AuthController extends PuterController {
         // its meaning lives in the extension (which sets it) and the GUI (which
         // displays it), so no abuse semantics leak into the OSS repo.
         if (abuseCheck.allowed === false)
-            throw new HttpError(
+            throw await this.smsSendError(
                 429,
                 'Phone verification is unavailable for this number right now.',
+                `not_allowed:${abuseCheck.reason ?? 'unspecified'}`,
+                {
+                    userId: user.id,
+                    userUid: user.uuid,
+                    country: parsed.country,
+                },
                 {
                     legacyCode: 'phone_verification_unavailable' as never,
-                    fields: abuseCheck.reason
-                        ? { reason: abuseCheck.reason }
-                        : {},
+                    fields: {
+                        ...fallbackFields,
+                        ...(abuseCheck.reason
+                            ? { reason: abuseCheck.reason }
+                            : {}),
+                    },
                 },
             );
 
@@ -1135,10 +1435,18 @@ export class AuthController extends PuterController {
                 expireAt: Math.floor(Date.now() / 1000) + 60 * 60,
             });
         } catch (e) {
-            console.warn('[send-confirm-phone] pending-store failed:', e);
-            throw new HttpError(503, 'Could not start phone verification.', {
-                legacyCode: 'service_unavailable' as never,
-            });
+            throw await this.smsSendError(
+                503,
+                'Could not start phone verification.',
+                'pending_store_failed',
+                {
+                    userId: user.id,
+                    userUid: user.uuid,
+                    country: parsed.country,
+                    detail: e,
+                },
+                { legacyCode: 'service_unavailable' as never },
+            );
         }
 
         const ip = req.ip || req.socket?.remoteAddress || undefined;
@@ -1146,6 +1454,10 @@ export class AuthController extends PuterController {
             typeof req.headers['user-agent'] === 'string'
                 ? req.headers['user-agent']
                 : undefined;
+        // First entry of Prelude's delivery sequence — where the code actually
+        // went. Returned to the client so it can point the user at the right
+        // app (e.g. "check WhatsApp" instead of "check your texts").
+        let deliveryChannel: string | undefined;
         try {
             const result = await this.clients.prelude.createVerification(
                 parsed.e164,
@@ -1156,23 +1468,41 @@ export class AuthController extends PuterController {
                     dispatch_id: dispatchId,
                 },
             );
+            deliveryChannel = result.channels?.[0];
             // Prelude rejected the attempt as abusive — surface as rate-limit.
             if (
                 result.status === 'blocked' ||
                 result.status === 'shadow_blocked'
             ) {
-                throw new HttpError(
+                throw await this.smsSendError(
                     429,
                     'Phone verification is temporarily unavailable for this number.',
-                    { legacyCode: 'too_many_requests' as never },
+                    `prelude_${result.status}`,
+                    {
+                        userId: user.id,
+                        userUid: user.uuid,
+                        country: parsed.country,
+                    },
+                    {
+                        legacyCode: 'too_many_requests' as never,
+                        fields: fallbackFields,
+                    },
                 );
             }
         } catch (e) {
             if (e instanceof HttpError) throw e;
-            console.warn('[send-confirm-phone] createVerification failed:', e);
-            throw new HttpError(502, 'Could not send verification code.', {
-                legacyCode: 'upstream_error' as never,
-            });
+            throw await this.smsSendError(
+                502,
+                'Could not send verification code.',
+                'prelude_request_failed',
+                {
+                    userId: user.id,
+                    userUid: user.uuid,
+                    country: parsed.country,
+                    detail: e,
+                },
+                { legacyCode: 'upstream_error' as never },
+            );
         }
 
         // Tell the abuse extension a code was actually sent, so it can bump its
@@ -1193,7 +1523,10 @@ export class AuthController extends PuterController {
         } catch {
             // ignore — best-effort velocity signal
         }
-        res.json({});
+        res.json({
+            ...fallbackFields,
+            ...(deliveryChannel ? { channel: deliveryChannel } : {}),
+        });
     }
 
     @Post('/confirm-phone', {
@@ -1344,11 +1677,14 @@ export class AuthController extends PuterController {
             throw new HttpError(403, 'Account suspended.', {
                 legacyCode: 'account_suspended',
             });
-        if (!user.requires_card_verification) {
+        // Phone normally comes first, but the fallback lets a phone-gated user
+        // in once they've exhausted SMS attempts.
+        const fallbackEligible = await this.isCardFallbackEligible(user);
+        if (!user.requires_card_verification && !fallbackEligible) {
             res.json({ card_verified: true });
             return;
         }
-        if (user.requires_phone_verification)
+        if (user.requires_phone_verification && !fallbackEligible)
             throw new HttpError(
                 409,
                 'Phone verification must be completed first.',
@@ -1396,6 +1732,16 @@ export class AuthController extends PuterController {
         // Kill switch: the extension reports the feature disabled — unstick
         // any user still carrying the flag instead of dead-ending them.
         if (setupEvent.enabled === false) {
+            // A fallback user is here BECAUSE SMS isn't working for them, and
+            // now the card path is off too — they stay phone-gated with no
+            // way through. Surface it; don't clear a gate with nothing
+            // verified.
+            if (fallbackEligible)
+                console.warn(
+                    '[card-verification/setup] card verification disabled;' +
+                        ` fallback-eligible user ${user.uuid} remains` +
+                        ' phone-gated with no working verification path',
+                );
             await this.stores.user.update(user.id, {
                 requires_card_verification: 0,
             });
@@ -1452,11 +1798,13 @@ export class AuthController extends PuterController {
             throw new HttpError(404, 'User not found.', {
                 legacyCode: 'not_found',
             });
-        if (!user.requires_card_verification) {
+        // Same fallback exception as setup: card may come before phone.
+        const fallbackEligible = await this.isCardFallbackEligible(user);
+        if (!user.requires_card_verification && !fallbackEligible) {
             res.json({ card_verified: true });
             return;
         }
-        if (user.requires_phone_verification)
+        if (user.requires_phone_verification && !fallbackEligible)
             throw new HttpError(
                 409,
                 'Phone verification must be completed first.',
@@ -1473,6 +1821,7 @@ export class AuthController extends PuterController {
             fingerprint: null as string | null,
             funding: null as string | null,
             country: null as string | null,
+            customer_id: null as string | null,
         };
         try {
             await this.clients.event?.emitAndWait(
@@ -1486,6 +1835,12 @@ export class AuthController extends PuterController {
 
         // Kill switch — same semantics as /card-verification/setup.
         if (confirmEvent.enabled === false) {
+            if (fallbackEligible)
+                console.warn(
+                    '[card-verification/confirm] card verification disabled;' +
+                        ` fallback-eligible user ${user.uuid} remains` +
+                        ' phone-gated with no working verification path',
+                );
             await this.stores.user.update(user.id, {
                 requires_card_verification: 0,
             });
@@ -1503,8 +1858,15 @@ export class AuthController extends PuterController {
             return;
         }
 
+        // A fallback card clears the phone gate too — the point of the
+        // fallback. `fallbackEligible &&` makes the invariant local instead
+        // of leaning on the 409 guard above: only a fallback user's card can
+        // ever clear a phone gate.
+        const clearedPhoneGate =
+            fallbackEligible && Boolean(user.requires_phone_verification);
         await this.stores.user.update(user.id, {
             requires_card_verification: 0,
+            ...(clearedPhoneGate ? { requires_phone_verification: 0 } : {}),
         });
 
         try {
@@ -1516,6 +1878,7 @@ export class AuthController extends PuterController {
                     fingerprint: confirmEvent.fingerprint,
                     funding: confirmEvent.funding,
                     country: confirmEvent.country,
+                    customer_id: confirmEvent.customer_id,
                 } as never,
                 {},
             );
@@ -1529,11 +1892,21 @@ export class AuthController extends PuterController {
                 'user.card_verified',
                 { original_client_socket_id },
             );
+            // The fallback cleared the phone gate too — tell phone-gate UIs.
+            if (clearedPhoneGate)
+                await this.services.socket?.send(
+                    { room: user.id },
+                    'user.phone_verified',
+                    { original_client_socket_id },
+                );
         } catch {
             // ignore — best-effort
         }
 
-        res.json({ card_verified: true });
+        res.json({
+            card_verified: true,
+            ...(clearedPhoneGate ? { phone_verified: true } : {}),
+        });
     }
 
     // -- Password recovery -------------------------------------------
@@ -2720,6 +3093,33 @@ export class AuthController extends PuterController {
 
         await Promise.all([userPermGrantPromise, missingFSPathPromise]);
 
+        try {
+            const a = app as {
+                id?: number;
+                uid?: string;
+                index_url?: string | null;
+                owner_user_id?: number | null;
+                name?: string | null;
+            };
+            this.clients.event?.emit(
+                'puter.app.authenticated' as never,
+                {
+                    app_uid,
+                    app: {
+                        id: a.id,
+                        uid: a.uid,
+                        index_url: a.index_url ?? null,
+                        owner_user_id: a.owner_user_id ?? null,
+                        name: a.name ?? null,
+                    },
+                    user_id: req.actor!.user?.id ?? null,
+                } as never,
+                {},
+            );
+        } catch {
+            // Fine if failed
+        }
+
         res.json({ token, app_uid });
     }
 
@@ -3156,13 +3556,9 @@ export class AuthController extends PuterController {
     @Get('/group/list', { subdomain: 'api', requireUserActor: true })
     async handleGroupList(req: Request, res: Response): Promise<void> {
         const userId = req.actor!.user.id!;
-        const groupStore = this.stores.group as unknown as {
-            listByOwner: (id: number) => Promise<unknown[]>;
-            listByMember: (id: number) => Promise<unknown[]>;
-        };
         const [owned, member] = await Promise.all([
-            groupStore.listByOwner(userId),
-            groupStore.listByMember(userId),
+            this.stores.group.listGroupsWithOwner(userId),
+            this.stores.group.listGroupsWithMember(userId),
         ]);
         res.json({
             owned_groups: owned,
@@ -3226,6 +3622,91 @@ export class AuthController extends PuterController {
         res.status(204).end();
     }
 
+    // -- Step-up ("elevation"), wired below --------------------------
+    //
+    // Mints the second-factor cookie for a session that re-proves identity: a
+    // fresh TOTP code when 2FA is enabled, otherwise the account password.
+    // Privileged endpoints require it on top of the session, so a leaked session
+    // alone can't exercise them. Accounts with neither credential (no password
+    // and 2FA disabled) can't elevate.
+
+    async handleElevate(req: Request, res: Response): Promise<void> {
+        const user = await this.stores.user.getById(req.actor!.user.id!, {
+            force: true,
+        });
+        if (!user)
+            throw new HttpError(404, 'User not found.', {
+                legacyCode: 'not_found',
+            });
+        if (user.suspended)
+            throw new HttpError(403, 'Account suspended.', {
+                legacyCode: 'account_suspended',
+            });
+
+        if (user.otp_enabled) {
+            const code = req.body?.code;
+            if (!code)
+                throw new HttpError(400, 'code is required.', {
+                    legacyCode: 'bad_request',
+                    fields: { factor: 'otp' },
+                });
+            if (
+                !verifyOtp(
+                    user.username,
+                    user.otp_secret as string,
+                    String(code),
+                )
+            )
+                throw new HttpError(401, 'Incorrect code.', {
+                    legacyCode: 'code_mismatch' as never,
+                    fields: { factor: 'otp' },
+                });
+        } else if (user.password) {
+            const password = req.body?.password;
+            if (!password || typeof password !== 'string')
+                throw new HttpError(400, 'Password is required.', {
+                    legacyCode: 'password_required',
+                    fields: { factor: 'password' },
+                });
+            const match = await bcrypt.compare(
+                password,
+                user.password as string,
+            );
+            if (!match)
+                throw new HttpError(401, 'Incorrect password.', {
+                    legacyCode: 'password_mismatch',
+                    fields: { factor: 'password' },
+                });
+        } else {
+            // Neither credential on file (e.g. an account that only ever
+            // authenticated through an external identity provider).
+            throw new HttpError(
+                403,
+                'This account has no credential to re-authenticate with. Set a password or enable two-factor authentication first.',
+                { legacyCode: 'elevation_unavailable' as never },
+            );
+        }
+
+        const token = signStepUpToken(this.services.token, user as never);
+        res.cookie(
+            STEP_UP_COOKIE_NAME,
+            token,
+            stepUpCookieOptions(this.config),
+        );
+
+        // A browser reads its elevation back from the httpOnly cookie and never
+        // needs the raw value; handing it to page JS would put the second factor
+        // within reach of an XSS. API clients have no cookie jar, so they get the
+        // token to send back as `x-puter-elevation`. Both paths proved the same
+        // password/TOTP — this only avoids needless exposure, it isn't a gate.
+        const cookieName = this.config.cookie_name ?? 'puter_token';
+        const usedSessionCookie =
+            !!req.token && req.token === req.cookies?.[cookieName];
+        res.json(
+            usedSessionCookie ? { elevated: true } : { elevated: true, token },
+        );
+    }
+
     // -- Delete own account (user-protected, wired below) ------------
     //
     // Purge S3 objects + fsentries first, then the user row. FK
@@ -3238,6 +3719,9 @@ export class AuthController extends PuterController {
         res.clearCookie(this.config.cookie_name ?? 'puter_token');
         res.clearCookie('puter_token_v2');
         res.clearCookie('puter_revalidation');
+        res.clearCookie(STEP_UP_COOKIE_NAME, {
+            ...(this.config.domain ? { domain: this.config.domain } : {}),
+        });
         await this.#cascadeDeleteUser(userId);
         res.json({ success: true });
     }
@@ -3382,6 +3866,37 @@ export class AuthController extends PuterController {
                 ],
             },
             (req, res) => this.handleDeleteOwnUser(req, res),
+        );
+
+        // Step-up. Served on the root origin (browser form posts same-origin)
+        // and on `api` (SDK/script clients, which have no cookie jar and send a
+        // bearer). Deliberately NOT cookie-gated: the password/TOTP in the body
+        // is the control — a stolen token alone can't satisfy it, and it's also
+        // what makes CSRF a non-issue. `requireUserActor` still keeps app and
+        // access-token actors out, so an access token can never mint an
+        // elevation for its issuer.
+        router.post(
+            '/auth/elevate',
+            {
+                subdomain: ['api', ''],
+                requireUserActor: true,
+                allowUnconfirmed: true,
+                rateLimit: [
+                    {
+                        scope: 'elevate',
+                        limit: 10,
+                        window: 15 * 60_000,
+                        key: 'user',
+                    },
+                    {
+                        scope: 'elevate-ip',
+                        limit: 40,
+                        window: 15 * 60_000,
+                        key: 'ip',
+                    },
+                ],
+            },
+            (req, res) => this.handleElevate(req, res),
         );
 
         const webSessionGate = createWebSessionActorGate();

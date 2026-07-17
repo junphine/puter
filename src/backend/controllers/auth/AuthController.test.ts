@@ -586,6 +586,24 @@ describe('AuthController.handleSignup', () => {
         );
     });
 
+    it('rejects brand-new temp signups when registration is disabled', async () => {
+        const authConfig = server.controllers.auth.config as {
+            disable_user_signup?: boolean;
+        };
+        const prev = authConfig.disable_user_signup;
+        authConfig.disable_user_signup = true;
+        try {
+            await expect(
+                controller.handleSignup(makeReq({ is_temp: true }), makeRes()),
+            ).rejects.toMatchObject({
+                statusCode: 403,
+                legacyCode: 'signup_disabled',
+            });
+        } finally {
+            authConfig.disable_user_signup = prev;
+        }
+    });
+
     it('emits puter.signup.success on successful signup', async () => {
         const baseline = heardSignupSuccess.length;
         const username = `s_${uniq()}`;
@@ -606,6 +624,90 @@ describe('AuthController.handleSignup', () => {
                 (evt) => (evt as { username?: string }).username === username,
             ),
         ).toBe(true);
+    });
+
+    it('still allows claiming a pseudo-user row when registration is disabled', async () => {
+        const authConfig = server.controllers.auth.config as {
+            disable_user_signup?: boolean;
+        };
+        const prev = authConfig.disable_user_signup;
+        authConfig.disable_user_signup = true;
+        try {
+            const targetEmail = `disabled_claim_${uniq()}@test.local`;
+            const placeholder = await server.stores.user.create({
+                username: `placeholder_${uniq()}`,
+                uuid: uuidv4(),
+                password: null,
+                email: targetEmail,
+                clean_email: targetEmail,
+                email_confirmed: 0,
+            } as never);
+
+            const res = makeRes();
+            await controller.handleSignup(
+                makeReq({
+                    username: `claim_${uniq()}`,
+                    email: targetEmail,
+                    password: 'correct-horse-battery',
+                }),
+                res,
+            );
+
+            expect(isCompleteLoginResponse(res.body)).toBe(true);
+            const claimed = await server.stores.user.getById(placeholder.id, {
+                force: true,
+            });
+            expect(claimed!.username).not.toBe(placeholder.username);
+        } finally {
+            authConfig.disable_user_signup = prev;
+        }
+    });
+
+    it('does not reveal existing usernames or emails when registration is disabled', async () => {
+        const username = `taken_${uniq()}`;
+        const email = `${username}@test.local`;
+        await controller.handleSignup(
+            makeReq({ username, email, password: 'correct-horse-battery' }),
+            makeRes(),
+        );
+
+        const authConfig = server.controllers.auth.config as {
+            disable_user_signup?: boolean;
+        };
+        const prev = authConfig.disable_user_signup;
+        authConfig.disable_user_signup = true;
+        try {
+            // Taken username → the generic 403, not the duplicate error.
+            await expect(
+                controller.handleSignup(
+                    makeReq({
+                        username,
+                        email: `fresh_${uniq()}@test.local`,
+                        password: 'correct-horse-battery',
+                    }),
+                    makeRes(),
+                ),
+            ).rejects.toMatchObject({
+                statusCode: 403,
+                legacyCode: 'signup_disabled',
+            });
+            // Taken (non-claimable) email → same generic 403.
+            await expect(
+                controller.handleSignup(
+                    makeReq({
+                        username: `fresh_${uniq()}`,
+                        email,
+                        password: 'correct-horse-battery',
+                    }),
+                    makeRes(),
+                ),
+            ).rejects.toMatchObject({
+                statusCode: 403,
+                legacyCode: 'signup_disabled',
+            });
+        } finally {
+            authConfig.disable_user_signup = prev;
+        }
     });
 });
 
@@ -1049,6 +1151,139 @@ describe('AuthController.handleLoginOtp + handleLoginRecoveryCode', () => {
             res2,
         );
         expect(res2.body).toEqual({ proceed: false });
+    });
+});
+
+// ── Step-up (elevation) ─────────────────────────────────────────────
+
+describe('AuthController.handleElevate', () => {
+    it('password account: correct password mints the elevation cookie', async () => {
+        const { actor } = await makeUserAndActor();
+        const res = makeRes();
+        await controller.handleElevate(
+            makeReq({ password: 'correct-horse-battery' }, { actor }),
+            res,
+        );
+        expect(res.body).toMatchObject({ elevated: true });
+        expect(res.cookies.puter_elevated).toBeDefined();
+        expect(res.cookies.puter_elevated.opts).toMatchObject({ httpOnly: true });
+
+        // The minted cookie satisfies verifyStepUpSession for this same user.
+        const { verifyStepUpSession } = await import(
+            '../../core/http/middleware/stepUpSession.js'
+        );
+        const ok = verifyStepUpSession(
+            {
+                cookies: { puter_elevated: res.cookies.puter_elevated.value },
+                actor: { user: { uuid: actor.user.uuid } },
+            } as never,
+            { tokenService: server.services.token },
+        );
+        expect(ok).toBe(true);
+    });
+
+    it('password account: wrong password → 401 password_mismatch', async () => {
+        const { actor } = await makeUserAndActor();
+        await expect(
+            controller.handleElevate(
+                makeReq({ password: 'nope' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 401,
+            legacyCode: 'password_mismatch',
+        });
+    });
+
+    it('2FA account: a live TOTP code elevates; a wrong code is rejected', async () => {
+        const { TOTP } = await import('otpauth');
+        const { createSecret } = await import(
+            '../../services/auth/OTPUtil.js'
+        );
+        const { user, actor } = await makeUserAndActor();
+        const { secret } = createSecret(user.username);
+        await server.stores.user.update(user.id, {
+            otp_enabled: 1,
+            otp_secret: secret,
+        });
+        // Reflect the enabled state on the actor the way the auth probe would.
+        const otpActor = {
+            user: { ...actor.user, otp_enabled: true },
+        } as never;
+
+        const totp = new TOTP({
+            issuer: 'puter.com',
+            label: user.username,
+            algorithm: 'SHA1',
+            digits: 6,
+            secret,
+        });
+
+        const res = makeRes();
+        await controller.handleElevate(
+            makeReq({ code: totp.generate() }, { actor: otpActor }),
+            res,
+        );
+        expect(res.body).toMatchObject({ elevated: true });
+        expect(res.cookies.puter_elevated).toBeDefined();
+
+        await expect(
+            controller.handleElevate(
+                makeReq({ code: '000000' }, { actor: otpActor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({ statusCode: 401 });
+    });
+
+    it('account with no password and 2FA off cannot elevate → 403', async () => {
+        const { user, actor } = await makeUserAndActor();
+        await server.stores.user.update(user.id, { password: null });
+        await expect(
+            controller.handleElevate(
+                makeReq({ password: 'anything' }, { actor }),
+                makeRes(),
+            ),
+        ).rejects.toMatchObject({
+            statusCode: 403,
+            legacyCode: 'elevation_unavailable',
+        });
+    });
+
+    it('API clients (no cookie) get the token back to send as a header', async () => {
+        const { actor } = await makeUserAndActor();
+        const res = makeRes();
+        await controller.handleElevate(
+            makeReq({ password: 'correct-horse-battery' }, { actor }),
+            res,
+        );
+        expect(typeof (res.body as { token?: string }).token).toBe('string');
+    });
+
+    it('browser sessions (cookie-authed) do NOT get the raw token in the body', async () => {
+        const { actor } = await makeUserAndActor();
+        const res = makeRes();
+        // Mimic the browser: the resolved token IS the session cookie value.
+        // Cookie name must match `config.cookie_name` (puter_auth_token).
+        const req = {
+            ...makeReq({ password: 'correct-horse-battery' }, { actor }),
+            token: 'session-cookie-value',
+            cookies: { puter_auth_token: 'session-cookie-value' },
+        };
+        await controller.handleElevate(req, res);
+        expect(res.body).toEqual({ elevated: true });
+        expect(res.cookies.puter_elevated).toBeDefined();
+    });
+
+    it('the elevation token is never honored as a main auth token', async () => {
+        const { user } = await makeUserAndActor();
+        const { signStepUpToken } = await import(
+            '../../core/http/middleware/stepUpSession.js'
+        );
+        const token = signStepUpToken(server.services.token, {
+            uuid: user.uuid,
+        });
+        const result = await server.services.auth.authenticate(token);
+        expect(result.actor).toBeUndefined();
     });
 });
 
@@ -1864,6 +2099,104 @@ describe('AuthController.handleSendConfirmPhone validation', () => {
         );
     });
 
+    it('attaches a support error_id to a Prelude block', async () => {
+        const { actor } = await makeUserAndActor();
+        await withPrelude(
+            stubPrelude({
+                createVerification: vi.fn(async () => ({ status: 'blocked' })),
+            }),
+            async () => {
+                await expect(
+                    controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({
+                    statusCode: 429,
+                    fields: { error_id: expect.any(String) },
+                });
+            },
+        );
+    });
+
+    it('attaches a support error_id when the Prelude request throws', async () => {
+        const { actor } = await makeUserAndActor();
+        await withPrelude(
+            stubPrelude({
+                createVerification: vi.fn(async () => {
+                    throw new Error('network down');
+                }),
+            }),
+            async () => {
+                await expect(
+                    controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({
+                    statusCode: 502,
+                    fields: { error_id: expect.any(String) },
+                });
+            },
+        );
+    });
+
+    it('persists the send failure to KV under the error_id with a 7-day expiry', async () => {
+        const { user, actor } = await makeUserAndActor();
+        const kvSet = vi.spyOn(server.stores.kv, 'set');
+        try {
+            await withPrelude(
+                stubPrelude({
+                    createVerification: vi.fn(async () => {
+                        throw new Error('network down');
+                    }),
+                }),
+                async () => {
+                    let thrown: HttpError | undefined;
+                    try {
+                        await controller.handleSendConfirmPhone(
+                            makeReq({ phone: '+14155550123' }, { actor }),
+                            makeRes(),
+                        );
+                    } catch (e) {
+                        thrown = e as HttpError;
+                    }
+                    const errorId = thrown!.fields!.error_id as string;
+
+                    const { res: record } = await server.stores.kv.get({
+                        key: `sms-send-error:${errorId}`,
+                    });
+                    expect(record).toMatchObject({
+                        reason: 'prelude_request_failed',
+                        status: 502,
+                        user_id: user.id,
+                        user_uid: user.uuid,
+                        detail: 'network down',
+                        t: expect.any(Number),
+                    });
+
+                    const errorSet = kvSet.mock.calls.find(([arg]) =>
+                        (arg as { key?: string }).key?.startsWith(
+                            'sms-send-error:',
+                        ),
+                    );
+                    const { expireAt } = errorSet![0] as {
+                        expireAt: number;
+                    };
+                    const nowSec = Math.floor(Date.now() / 1000);
+                    expect(expireAt).toBeGreaterThan(
+                        nowSec + 7 * 24 * 60 * 60 - 60,
+                    );
+                    expect(expireAt).toBeLessThanOrEqual(
+                        nowSec + 7 * 24 * 60 * 60,
+                    );
+                },
+            );
+        } finally {
+            kvSet.mockRestore();
+        }
+    });
+
     it('forwards ip, device fingerprint, and user-agent to Prelude as signals', async () => {
         const { actor } = await makeUserAndActor();
         const createVerification = vi.fn(async () => ({ status: 'success' }));
@@ -1901,6 +2234,38 @@ describe('AuthController.handleSendConfirmPhone validation', () => {
             ip: '203.0.113.7',
             device_id: undefined,
             user_agent: undefined,
+        });
+    });
+
+    it('returns the delivery channel Prelude picked so the client can point at the right app', async () => {
+        const { actor } = await makeUserAndActor();
+        await withPrelude(
+            stubPrelude({
+                createVerification: vi.fn(async () => ({
+                    status: 'success',
+                    channels: ['whatsapp', 'sms'],
+                })),
+            }),
+            async () => {
+                const res = makeRes();
+                await controller.handleSendConfirmPhone(
+                    makeReq({ phone: '+14155550123' }, { actor }),
+                    res,
+                );
+                expect(res.body).toMatchObject({ channel: 'whatsapp' });
+            },
+        );
+    });
+
+    it('omits `channel` when Prelude reports no delivery sequence', async () => {
+        const { actor } = await makeUserAndActor();
+        await withPrelude(stubPrelude(), async () => {
+            const res = makeRes();
+            await controller.handleSendConfirmPhone(
+                makeReq({ phone: '+14155550123' }, { actor }),
+                res,
+            );
+            expect(res.body).not.toHaveProperty('channel');
         });
     });
 });
@@ -2489,6 +2854,312 @@ describe('AuthController.handleCardVerificationConfirm', () => {
             force: true,
         });
         expect(after!.requires_card_verification).toBe(false);
+    });
+});
+
+describe('AuthController SMS → card fallback', () => {
+    const stubPrelude = (over: Record<string, unknown> = {}) => ({
+        isConfigured: () => true,
+        isCountrySupported: () => true,
+        defaultCountry: 'US',
+        createVerification: vi.fn(async () => ({ status: 'success' })),
+        ...over,
+    });
+    const withPrelude = async (
+        prelude: unknown,
+        fn: () => Promise<void>,
+    ): Promise<void> => {
+        const ctrl = controller as { clients: { prelude: unknown } };
+        const real = ctrl.clients.prelude;
+        ctrl.clients.prelude = prelude;
+        try {
+            await fn();
+        } finally {
+            ctrl.clients.prelude = real;
+        }
+    };
+    const withFallbackConfig = async (
+        value: unknown,
+        fn: () => Promise<void>,
+    ): Promise<void> => {
+        const cfg = (controller as { config: Record<string, unknown> }).config;
+        const prev = cfg.phone_verification_card_fallback;
+        cfg.phone_verification_card_fallback = value;
+        try {
+            await fn();
+        } finally {
+            cfg.phone_verification_card_fallback = prev;
+        }
+    };
+    // Drive the attempt counter directly so the threshold is deterministic
+    // (the handler keys it the same way: `phone-verify-attempts:<id>`).
+    const seedAttempts = (userId: number, attempts: number) =>
+        server.stores.kv.incr({
+            key: `phone-verify-attempts:${userId}`,
+            pathAndAmountMap: { attempts },
+        });
+    // Stamp the eligibility flag the card endpoints check, the same way a
+    // threshold-crossing send does (`card-fallback-open:<id>`).
+    const openFallback = (userId: number) =>
+        server.stores.kv.set({
+            key: `card-fallback-open:${userId}`,
+            value: true,
+        });
+
+    it('offers the fallback on send once the attempt threshold is reached', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+        });
+        // No after_attempts → exercises the default threshold of 2.
+        await withFallbackConfig({ enabled: true }, async () => {
+            await withPrelude(stubPrelude(), async () => {
+                const first = makeRes();
+                await controller.handleSendConfirmPhone(
+                    makeReq({ phone: '+14155550123' }, { actor }),
+                    first,
+                );
+                // First attempt is below the threshold — no offer yet.
+                expect(first.body).toEqual({});
+
+                const second = makeRes();
+                await controller.handleSendConfirmPhone(
+                    makeReq({ phone: '+14155550123' }, { actor }),
+                    second,
+                );
+                expect(second.body).toEqual({
+                    card_fallback_available: true,
+                });
+            });
+        });
+    });
+
+    it('never offers the fallback on send when disabled', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+        });
+        await withFallbackConfig(
+            { enabled: false, after_attempts: 1 },
+            async () => {
+                await withPrelude(stubPrelude(), async () => {
+                    const res = makeRes();
+                    await controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        res,
+                    );
+                    expect(res.body).toEqual({});
+                });
+            },
+        );
+    });
+
+    it('flags the fallback on a Prelude block once eligible', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+        });
+        await withFallbackConfig(
+            { enabled: true, after_attempts: 1 },
+            async () => {
+                await withPrelude(
+                    stubPrelude({
+                        createVerification: vi.fn(async () => ({
+                            status: 'blocked',
+                        })),
+                    }),
+                    async () => {
+                        await expect(
+                            controller.handleSendConfirmPhone(
+                                makeReq({ phone: '+14155550123' }, { actor }),
+                                makeRes(),
+                            ),
+                        ).rejects.toMatchObject({
+                            statusCode: 429,
+                            fields: { card_fallback_available: true },
+                        });
+                    },
+                );
+            },
+        );
+    });
+
+    it('lets card setup proceed past the phone gate once eligible', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        await openFallback(user.id);
+        await withFallbackConfig(
+            { enabled: true },
+            async () => {
+                const res = makeRes();
+                await withCardSetupOverride(
+                    (data) => {
+                        data.enabled = true;
+                        data.client_secret = 'seti_secret';
+                        data.publishable_key = 'pk_test';
+                    },
+                    () =>
+                        controller.handleCardVerificationSetup(
+                            makeReq({}, { actor }),
+                            res,
+                        ),
+                );
+                expect(res.body).toEqual({
+                    client_secret: 'seti_secret',
+                    publishable_key: 'pk_test',
+                });
+            },
+        );
+    });
+
+    it('still 409s card setup when no send has opened the fallback', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        // Counter above the threshold but no flag: eligibility is the flag a
+        // threshold-crossing send stamps, never the raw counter.
+        await seedAttempts(user.id, 5);
+        await withFallbackConfig(
+            { enabled: true, after_attempts: 3 },
+            async () => {
+                await expect(
+                    controller.handleCardVerificationSetup(
+                        makeReq({}, { actor }),
+                        makeRes(),
+                    ),
+                ).rejects.toMatchObject({ statusCode: 409 });
+            },
+        );
+    });
+
+    it('send crossing the threshold opens card setup end-to-end', async () => {
+        const { actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+            requires_phone_verification: 1,
+        });
+        await withFallbackConfig(
+            { enabled: true, after_attempts: 1 },
+            async () => {
+                await withPrelude(stubPrelude(), async () => {
+                    const sendRes = makeRes();
+                    await controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        sendRes,
+                    );
+                    expect(sendRes.body).toEqual({
+                        card_fallback_available: true,
+                    });
+                });
+                const res = makeRes();
+                await withCardSetupOverride(
+                    (data) => {
+                        data.enabled = true;
+                        data.client_secret = 'seti_secret';
+                        data.publishable_key = 'pk_test';
+                    },
+                    () =>
+                        controller.handleCardVerificationSetup(
+                            makeReq({}, { actor }),
+                            res,
+                        ),
+                );
+                expect(res.body).toEqual({
+                    client_secret: 'seti_secret',
+                    publishable_key: 'pk_test',
+                });
+            },
+        );
+    });
+
+    it('clamps after_attempts to the send route rate limit', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+        });
+        // 9 prior attempts + this send = 10, the route limit. A threshold of
+        // 50 could never be crossed, so it clamps down and the offer opens.
+        await seedAttempts(user.id, 9);
+        await withFallbackConfig(
+            { enabled: true, after_attempts: 50 },
+            async () => {
+                await withPrelude(stubPrelude(), async () => {
+                    const res = makeRes();
+                    await controller.handleSendConfirmPhone(
+                        makeReq({ phone: '+14155550123' }, { actor }),
+                        res,
+                    );
+                    expect(res.body).toEqual({
+                        card_fallback_available: true,
+                    });
+                });
+            },
+        );
+    });
+
+    it('clears BOTH gates when the fallback card verifies', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_card_verification: 1,
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        await openFallback(user.id);
+        await withFallbackConfig(
+            { enabled: true },
+            async () => {
+                const res = makeRes();
+                await withCardConfirmOverride(
+                    (data) => {
+                        data.enabled = true;
+                        data.verified = true;
+                    },
+                    () =>
+                        controller.handleCardVerificationConfirm(
+                            makeReq({ setup_intent_id: 'seti_1' }, { actor }),
+                            res,
+                        ),
+                );
+                expect(res.body).toMatchObject({
+                    card_verified: true,
+                    phone_verified: true,
+                });
+            },
+        );
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.requires_card_verification).toBe(false);
+        expect(after!.requires_phone_verification).toBe(false);
+    });
+
+    it('clears the phone gate via card even when card was not required', async () => {
+        const { user, actor } = await makeUserAndActor({
+            requires_phone_verification: 1,
+            phone: '+14155550123',
+        });
+        await openFallback(user.id);
+        await withFallbackConfig(
+            { enabled: true },
+            async () => {
+                const res = makeRes();
+                await withCardConfirmOverride(
+                    (data) => {
+                        data.enabled = true;
+                        data.verified = true;
+                    },
+                    () =>
+                        controller.handleCardVerificationConfirm(
+                            makeReq({ setup_intent_id: 'seti_1' }, { actor }),
+                            res,
+                        ),
+                );
+                expect(res.body).toMatchObject({ phone_verified: true });
+            },
+        );
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.requires_phone_verification).toBe(false);
     });
 });
 

@@ -19,6 +19,7 @@
 
 import { PuterService } from '../types';
 import type { SocketService } from '../socket/SocketService';
+import { kv } from '../../util/kvSingleton';
 
 /**
  * Periodic liveness monitor for the backend. Other services register
@@ -69,6 +70,17 @@ interface HealthStats {
 export interface HealthStatus {
     ok: boolean;
     failed?: string[];
+    degraded?: string[];
+}
+
+export interface GetStatusOptions {
+    /** Failing check names to drop entirely (healthy if all failures ignored). */
+    ignore?: string[];
+    /**
+     * Failing check names to demote to non-fatal `degraded`. They don't make
+     * `ok` false, but their presence signals partial health to the caller.
+     */
+    degrade?: string[];
 }
 
 export class ServerHealthService extends PuterService {
@@ -128,27 +140,32 @@ export class ServerHealthService extends PuterService {
     }
 
     /**
-     * Current health status. Results are cached in Redis for 5 seconds
-     * so a busy /healthcheck endpoint doesn't hammer the DB on every hit.
+     * Current health status of this node. Results are cached in-process
+     * (kv.js) for 5 seconds so a busy /healthcheck endpoint stays cheap.
+     * The cache is deliberately per-node — a load balancer polling
+     * /healthcheck must see the health of the exact node it hit, never
+     * a status shared with other nodes.
+     *
+     * `ignore` names failing states to disregard for this request only,
+     * letting an orchestrator poll `/healthcheck` while tolerating specific
+     * known-failing checks; when the remaining failures are all ignored the
+     * status collapses back to `{ ok: true }`. `degrade` instead demotes
+     * named failures to a non-fatal `degraded` list — `ok` stays true but
+     * the caller can see the partial state. Any failure name may be filtered
+     * this way, including the `draining` lifecycle state. The cached status
+     * is always the full, unfiltered set — filtering is applied per-request
+     * after the cache read so it never leaks across callers.
      */
-    async getStatus(): Promise<HealthStatus> {
-        if (this.#draining) return { ok: false, failed: ['draining'] };
+    async getStatus(opts: GetStatusOptions = {}): Promise<HealthStatus> {
+        const base = this.#draining
+            ? { ok: false, failed: ['draining'] }
+            : this.#getCachedStatus();
+        return this.#applyFilters(base, opts.ignore ?? [], opts.degrade ?? []);
+    }
 
-        try {
-            const cached = await this.clients.redis.get(STATUS_CACHE_KEY);
-            if (cached) {
-                try {
-                    return JSON.parse(cached) as HealthStatus;
-                } catch {
-                    // Cache in invalid state — fall through and overwrite.
-                }
-            }
-        } catch (e) {
-            console.warn(
-                '[server-health] status cache read failed:',
-                (e as Error).message,
-            );
-        }
+    #getCachedStatus(): HealthStatus {
+        const cached = kv.get(STATUS_CACHE_KEY) as HealthStatus | undefined;
+        if (cached) return cached;
 
         const failures = this.#collectFailures();
         const status: HealthStatus =
@@ -156,21 +173,34 @@ export class ServerHealthService extends PuterService {
                 ? { ok: true }
                 : { ok: false, failed: failures };
 
-        try {
-            await this.clients.redis.set(
-                STATUS_CACHE_KEY,
-                JSON.stringify(status),
-                'EX',
-                STATUS_CACHE_TTL_SECONDS,
-            );
-        } catch (e) {
-            console.warn(
-                '[server-health] status cache write failed:',
-                (e as Error).message,
-            );
-        }
-
+        kv.set(STATUS_CACHE_KEY, status, { EX: STATUS_CACHE_TTL_SECONDS });
         return status;
+    }
+
+    /**
+     * Reclassify a status against the per-request `ignore`/`degrade` sets.
+     * `ignore`d failures are dropped; `degrade`d failures move to a
+     * non-fatal `degraded` list; anything left stays a hard failure. `ok`
+     * is false only while hard failures remain. A healthy status is
+     * returned as-is.
+     */
+    #applyFilters(
+        status: HealthStatus,
+        ignore: string[],
+        degrade: string[],
+    ): HealthStatus {
+        if (status.ok || !status.failed) return status;
+
+        const remaining = status.failed.filter(
+            (name) => !ignore.includes(name),
+        );
+        const degraded = remaining.filter((name) => degrade.includes(name));
+        const failed = remaining.filter((name) => !degrade.includes(name));
+
+        const result: HealthStatus = { ok: failed.length === 0 };
+        if (failed.length > 0) result.failed = failed;
+        if (degraded.length > 0) result.degraded = degraded;
+        return result;
     }
 
     #registerDefaultChecks(): void {

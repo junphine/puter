@@ -121,9 +121,15 @@ export interface RouteOptions {
      * extras in this array. `true` means just `admin`/`system`; an array adds
      * to that pair (does not replace it). Implies `requireAuth`.
      *
-     * Does NOT imply `requireUserActor` — admin endpoints accept an admin's
-     * access-token or app-under-user actor. Combine with `requireUserActor`
-     * to restrict to browser sessions.
+     * Also requires a *root token* (an actor with no app anywhere in its
+     * token chain), so an admin acting through a third-party app can't reach
+     * the route. Pair with `allowedAppIds` to make an admin route reachable
+     * by specific apps: the combination admits a root token OR a token
+     * scoped to an allowed app.
+     *
+     * Does NOT imply `requireUserActor` — a root token still includes an
+     * admin's full-access personal access token, not only browser sessions.
+     * Combine with `requireUserActor` to restrict to browser sessions.
      */
     adminOnly?: boolean | string[];
 
@@ -210,8 +216,10 @@ export interface RouteOptions {
      * request identity.
      *
      * `key` controls how requests are bucketed:
-     *   - `'fingerprint'` (default) — IP + User-Agent hash. Safe for
-     *     shared IPs (offices, VPNs).
+     *   - `'fingerprint'` (default) — network hash (IP + headers),
+     *     refined by the client's device fingerprint when one was
+     *     supplied. Safe for shared IPs (offices, VPNs): each device
+     *     gets its own bucket instead of the whole network sharing one.
      *   - `'ip'` — bare IP address.
      *   - `'user'` — actor's user ID. Use for authenticated routes
      *     where you want per-account limits.

@@ -28,6 +28,7 @@ import {
 import type { UserRow } from '../../stores/user/UserStore';
 import type { LayerInstances } from '../../types';
 import { sessionCookieFlags } from '../../util/cookieFlags.js';
+import { Span } from '../../util/span.js';
 import type { puterServices } from '../index';
 import { PuterService } from '../types';
 import { FULL_API_ACCESS } from '../permission/consts';
@@ -143,6 +144,7 @@ export class AuthService extends PuterService {
         return { authId: decoded.auth_id };
     }
 
+    @Span('auth.authenticate')
     async authenticate(
         token: string,
         ctx: { ip?: string; userAgent?: string } = {},
@@ -1965,7 +1967,9 @@ export class AuthService extends PuterService {
     #buildUserActor(user: UserRow, session: SessionRow | null): Actor {
         return {
             user: this.#actorUserFromRow(user),
-            session: session ? { uid: session.uuid } : null,
+            session: session
+                ? { uid: session.uuid, kind: session.kind ?? null }
+                : null,
         };
     }
 
@@ -1980,7 +1984,9 @@ export class AuthService extends PuterService {
                 uid: app.uid,
                 id: app.id,
             },
-            session: session ? { uid: session.uuid } : null,
+            session: session
+                ? { uid: session.uuid, kind: session.kind ?? null }
+                : null,
         };
     }
 }

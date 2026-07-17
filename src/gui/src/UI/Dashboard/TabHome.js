@@ -28,8 +28,11 @@ function buildRecentAppsHTML() {
         // Show up to 6 recent apps (2 columns x 3 rows)
         const recentApps = window.launch_apps.recent.slice(0, 6);
         for (const app_info of recentApps) {
-            // if title, name and uuid are the same and index_url is set, then show the hostname of index_url
+            // External apps (not owned by a Puter user) can report an opaque
+            // app-… id as their title (uid === name === title); in that case show
+            // the hostname of index_url instead of the opaque app id.
             if (
+                app_info.external &&
                 app_info.name === app_info.title &&
                 app_info.name === app_info.uuid &&
                 app_info.index_url
@@ -178,14 +181,6 @@ const TabHome = {
         h += '</div>';
         h += '</div>';
 
-        // Desktop switch card (spans full width)
-        // h += '<div class="bento-card bento-desktop-switch">';
-        // h += '<div class="bento-desktop-switch-inner">';
-        // h += '<span class="bento-desktop-switch-text">Looking for Puter\'s desktop interface?</span>';
-        // h += '<button class="bento-desktop-switch-btn">Switch to Desktop</button>';
-        // h += '</div>';
-        // h += '</div>';
-
         // Usage card (spans full width on second row)
         h += '<div class="bento-card bento-usage">';
         h +=
@@ -207,6 +202,23 @@ const TabHome = {
         h += buildUsageHTML();
         h += '</div>';
         h += '</div>';
+
+        // Open Desktop card (spans full width, links to the desktop interface)
+        h += '<a href="/desktop" target="_blank" rel="noopener" class="bento-card bento-desktop allow-native-ctxmenu">';
+        h += '<div class="bento-card-fancy-icon bento-card-fancy-icon-desktop">';
+        h +=
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>';
+        h += '</div>';
+        h += '<div class="bento-card-fancy-text">';
+        h += `<h2>${i18n('open_desktop')}</h2>`;
+        h += '<span class="bento-card-fancy-subtitle">';
+        h +=
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>';
+        h += 'Switch to the desktop interface';
+        h += '</span>';
+        h += '</div>';
+        h += '<span class="bento-desktop-arrow">›</span>';
+        h += '</a>';
 
         h += '</div>';
         return h;
@@ -271,11 +283,6 @@ const TabHome = {
             },
         );
 
-        // Handle desktop switch button
-        $el_window.on('click', '.bento-desktop-switch-btn', function () {
-            window.location.href = '/';
-        });
-
         // Handle "Save Account" warning click
         $el_window.on('click', '.bento-save-account-warning', function (e) {
             e.preventDefault();
@@ -299,20 +306,21 @@ const TabHome = {
     },
 
     async loadRecentApps($el_window) {
-        if (!window.launch_apps?.recent?.length) {
-            try {
-                window.launch_apps = await $.ajax({
-                    url: `${window.api_origin}/get-launch-apps?icon_size=64`,
-                    type: 'GET',
-                    async: true,
-                    contentType: 'application/json',
-                    headers: {
-                        Authorization: `Bearer ${window.auth_token}`,
-                    },
-                });
-            } catch (e) {
-                console.error('Failed to load launch apps:', e);
-            }
+        // Always refetch: gating on an empty list froze "Recently used" for the
+        // whole session (apps launched after load never appeared). loadUsageData
+        // refreshes on the same activate/focus triggers, so this stays in step.
+        try {
+            window.launch_apps = await $.ajax({
+                url: `${window.api_origin}/get-launch-apps?icon_size=64`,
+                type: 'GET',
+                async: true,
+                contentType: 'application/json',
+                headers: {
+                    Authorization: `Bearer ${window.auth_token}`,
+                },
+            });
+        } catch (e) {
+            console.error('Failed to load launch apps:', e);
         }
         $el_window
             .find('.bento-recent-apps-container')
@@ -426,12 +434,14 @@ const TabHome = {
         try {
             const res = await puter.auth.getMonthlyUsage();
             let monthlyAllowance = res.allowanceInfo?.monthUsageAllowance;
-            let remaining = res.allowanceInfo?.remaining;
-            let totalUsage = monthlyAllowance - remaining;
-            let totalUsagePercentage = (
-                (totalUsage / monthlyAllowance) *
-                100
-            ).toFixed(0);
+            // Actual month-to-date spend. `allowanceInfo.remaining` folds
+            // purchased credits into the remaining pool, so `allowance -
+            // remaining` turns negative once a user has credits. Use the
+            // reported usage total instead.
+            let totalUsage = res.usage?.total ?? 0;
+            let totalUsagePercentage = monthlyAllowance
+                ? Math.min(100, (totalUsage / monthlyAllowance) * 100).toFixed(0)
+                : '0';
 
             $el_window
                 .find('.bento-resources-used')
