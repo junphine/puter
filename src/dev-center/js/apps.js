@@ -2116,7 +2116,7 @@ export function setRootDirTree (tree, items) {
     }
 }
 
-function hasRootIndexHtml (tree) {
+export function hasRootIndexHtml (tree) {
     // Check if index.html exists in the root
     if ( tree['index.html'] ) {
         return true;

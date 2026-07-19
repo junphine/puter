@@ -451,6 +451,7 @@ export async function toLegacyEntry(
     ) {
         const thumbnailEntry = {
             uuid: entry.uuid,
+            uri: entry.path,
             thumbnail: response.thumbnail as string,
         };
         try {

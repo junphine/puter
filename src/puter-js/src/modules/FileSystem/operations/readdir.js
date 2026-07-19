@@ -40,6 +40,9 @@ const readdir = async function (...args) {
         if ( options.path ) {
             cacheKey = `readdir:${ options.path}`;
         }
+        else if ( options.uid ) {
+            cacheKey = `readdir:${ options.uid}`;
+        }
 
         if ( options.consistency === 'eventual' ) {
             // Check cache

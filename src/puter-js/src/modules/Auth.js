@@ -48,7 +48,7 @@ class Auth {
         options = options || {};
 
         return new Promise((resolve, reject) => {
-            const signinsession = crypto.randomUUID();
+            const signinsession = utils.uuidv4();
             const msg_id = this.#messageID++;
             const url = `${puter.defaultGUIOrigin}/action/sign-in?embedded_in_popup=true&msg_id=${msg_id}${window.crossOriginIsolated ? `&cross_origin_isolated=true&signin_session=${signinsession}` : ''}${options.attempt_temp_user_creation ? '&attempt_temp_user_creation=true' : ''}`;
 

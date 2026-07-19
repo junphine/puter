@@ -1,20 +1,19 @@
-div[data-app="ai"][data-ispanel="1"] {
+div[data-app="ai"][data-is_panel="1"] {
     width: calc(100% - 52px) !important;   
-    z-index:4 !important;
+}
+
+div[data-app="ai"] {    
+    z-index:1 !important;
 }
 
 div[data-app="ai"] .window-body{
     background: transparent !important;
 }
 
-div[data-app="chat"][data-ispanel="1"] {
+div[data-app="chat"][data-is_panel="1"] {
     width: 1000px !important;
     height: 600px !important;
     right: 32px !important;
     top: 32px !important;
-    z-index:4 !important;
-}
-
-.btn-show-ai {
-    z-index:5;
+    z-index:5 !important;
 }

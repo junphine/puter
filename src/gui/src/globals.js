@@ -229,7 +229,7 @@ window.file_templates = [];
 window.locale = 'en';
 
 // the width of the panel
-window.PANEL_WIDTH = 400;
+window.PANEL_WIDTH = 40;
 
 // the transaction class
 window.Transaction = class {

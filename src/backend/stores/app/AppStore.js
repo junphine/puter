@@ -21,6 +21,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { PuterStore } from '../types';
 import { HttpError } from '../../core/http/HttpError.js';
 import { validateUrl } from '../../util/validation.js';
+import { DEFAULT_AGGREGATION_TEMPORALITY_SELECTOR } from '@opentelemetry/sdk-metrics/build/src/export/AggregationSelector';
 
 /**
  * Persistence + cache for the `apps` table.
@@ -549,7 +550,7 @@ export class AppStore extends PuterStore {
         );
         for (const row of rows) {
             const list = out.get(row.app_id);
-            if (list) list.push(row.type);
+            if (Array.isArray(list)) list.push(row.type);
         }
         return out;
     }

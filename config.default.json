@@ -25,6 +25,7 @@
     "storage_capacity": 104857600,
     "disable_user_signup": false,
     "strict_email_verification_required": false,
+    "use_bundled_gui": false,
     "gui_assets_root": "./src/gui",
     "gui_puterjs_bundle": "http://puter.srv.cn:4100/sdk/puter.dev.js",
     "puterjs_root": "./src/puter-js/dist",
@@ -32,6 +33,7 @@
         "dev-center": "./src/dev-center",
         "notepad": "./apps/notepad"
     },
+    "import_ts_extensions": true,
     "extensions": [
         "extensions"
     ],
@@ -43,7 +45,7 @@
         "user": "root",
         "password": "123456",
         "database": "puter",
-        "migrationPaths": ["./src/backend/clients/database/migrations/mysql"]
+        "_migrationPaths": ["./src/backend/clients/database/migrations/mysql"]
     },
     "dynamo": {
         "endpoint": "http://localhost:7890",

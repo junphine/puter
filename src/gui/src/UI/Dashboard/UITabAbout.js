@@ -107,6 +107,7 @@ export default {
 
         $el_window.find('.show-credits').on('click', function (e) {
             $('.credits').get(0).showModal();
+            return false;
         });
 
     },

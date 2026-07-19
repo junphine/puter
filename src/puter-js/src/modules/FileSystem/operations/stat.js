@@ -37,6 +37,9 @@ const stat = async function (...args) {
         if ( options.path ) {
             cacheKey = `item:${ options.path}`;
         }
+        else if ( options.uid ) {
+            cacheKey = `item:${ options.uid}`;
+        }
 
         if ( options.consistency === 'eventual' && !options.returnSubdomains && !options.returnPermissions && !options.returnVersions && !options.returnSize ) {
             // Check cache

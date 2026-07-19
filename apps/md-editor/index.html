@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Markdown Editor</title>
+<script src="http://puter.srv.cn:4100/sdk/puter.dev.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  :root{
+    --bg:#0f0f14;--surface:#1a1a24;--border:#2a2a3a;
+    --text:#e0e0e8;--text2:#8888a0;--accent:#6c8cff;
+    --accent-hover:#8aa4ff;--toolbar:#14141e;
+    --editor-bg:#12121c;--preview-bg:#16161f;
+    --gutter:#252535;--scrollbar:#333348;--scrollbar-hover:#4a4a68;
+  }
+  body{font-family:'SF Mono','Cascadia Code','Fira Code',monospace;background:var(--bg);color:var(--text);height:100vh;display:flex;flex-direction:column;overflow:hidden}
+  
+  /* Scrollbar */
+  ::-webkit-scrollbar{width:6px;height:6px}
+  ::-webkit-scrollbar-track{background:transparent}
+  ::-webkit-scrollbar-thumb{background:var(--scrollbar);border-radius:3px}
+  ::-webkit-scrollbar-thumb:hover{background:var(--scrollbar-hover)}
+
+  /* Toolbar */
+  .toolbar{display:flex;align-items:center;gap:8px;padding:8px 16px;background:var(--toolbar);border-bottom:1px solid var(--border);flex-shrink:0;min-height:48px}
+  .toolbar .logo{font-size:14px;font-weight:700;color:var(--accent);letter-spacing:0.5px;margin-right:8px;user-select:none}
+  .toolbar .filename{font-size:12px;color:var(--text2);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:auto}
+  .toolbar .filename.active{color:var(--text)}
+  
+  .btn{display:inline-flex;align-items:center;gap:6px;padding:6px 14px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text2);font-size:12px;font-family:inherit;cursor:pointer;transition:all .15s;white-space:nowrap}
+  .btn:hover{border-color:var(--accent);color:var(--text);background:rgba(108,140,255,.08)}
+  .btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .btn.primary:hover{background:var(--accent-hover);border-color:var(--accent-hover)}
+  .btn svg{width:14px;height:14px;fill:currentColor;flex-shrink:0}
+  .btn:disabled{opacity:.4;cursor:not-allowed;pointer-events:none}
+
+  /* Status */
+  .status-bar{display:flex;align-items:center;justify-content:space-between;padding:4px 16px;background:var(--toolbar);border-top:1px solid var(--border);font-size:11px;color:var(--text2);flex-shrink:0;min-height:24px}
+  .status-bar .left,.status-bar .right{display:flex;align-items:center;gap:12px}
+  .status-bar .dot{width:6px;height:6px;border-radius:50%;background:#44bb66;display:inline-block}
+  .status-bar .dot.saving{background:var(--accent);animation:pulse 1s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+  /* Main layout */
+  .main{display:flex;flex:1;overflow:hidden;position:relative}
+
+  /* Editor */
+  .editor-pane{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
+  .editor-pane textarea{flex:1;width:100%;padding:20px 24px;background:var(--editor-bg);color:var(--text);border:none;outline:none;font-family:'SF Mono','Cascadia Code','Fira Code',monospace;font-size:14px;line-height:1.7;resize:none;tab-size:2;white-space:pre-wrap;word-wrap:break-word}
+  .editor-pane textarea::placeholder{color:var(--text2)}
+  .editor-pane textarea:focus{box-shadow:inset 0 0 0 1px var(--accent)}
+
+  /* Divider */
+  .divider{width:4px;background:var(--border);cursor:col-resize;flex-shrink:0;transition:background .15s}
+  .divider:hover,.divider.active{background:var(--accent)}
+
+  /* Preview */
+  .preview-pane{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
+  .preview-header{padding:8px 16px;font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:1px;background:var(--preview-bg);border-bottom:1px solid var(--border);flex-shrink:0}
+  .preview-content{flex:1;padding:20px 28px;overflow-y:auto;background:var(--preview-bg);font-size:14px;line-height:1.8;color:var(--text)}
+
+  /* Markdown Preview Styles */
+  .preview-content h1,.preview-content h2,.preview-content h3,.preview-content h4,.preview-content h5,.preview-content h6{margin:1.2em 0 .5em;font-weight:600;color:#fff;line-height:1.3}
+  .preview-content h1{font-size:1.8em;padding-bottom:.3em;border-bottom:1px solid var(--border)}
+  .preview-content h2{font-size:1.4em;padding-bottom:.2em;border-bottom:1px solid var(--border)}
+  .preview-content h3{font-size:1.15em}
+  .preview-content p{margin:.6em 0}
+  .preview-content a{color:var(--accent);text-decoration:none}
+  .preview-content a:hover{text-decoration:underline}
+  .preview-content code{background:rgba(108,140,255,.1);color:var(--accent);padding:2px 6px;border-radius:4px;font-size:.9em}
+  .preview-content pre{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px;overflow-x:auto;margin:1em 0}
+  .preview-content pre code{background:none;padding:0;color:var(--text)}
+  .preview-content blockquote{border-left:3px solid var(--accent);padding:4px 16px;margin:1em 0;color:var(--text2);background:rgba(108,140,255,.04);border-radius:0 6px 6px 0}
+  .preview-content ul,.preview-content ol{padding-left:1.8em;margin:.6em 0}
+  .preview-content li{margin:.3em 0}
+  .preview-content table{border-collapse:collapse;width:100%;margin:1em 0}
+  .preview-content th,.preview-content td{border:1px solid var(--border);padding:8px 12px;text-align:left}
+  .preview-content th{background:var(--surface);font-weight:600}
+  .preview-content hr{border:none;border-top:1px solid var(--border);margin:1.5em 0}
+  .preview-content img{max-width:100%;border-radius:8px}
+  .preview-content .empty{color:var(--text2);font-style:italic;text-align:center;margin-top:40vh}
+
+  /* Toast */
+  .toast{position:fixed;bottom:40px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--surface);color:var(--text);border:1px solid var(--border);padding:10px 20px;border-radius:8px;font-size:12px;opacity:0;transition:all .25s;pointer-events:none;z-index:100;box-shadow:0 4px 20px rgba(0,0,0,.4)}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  .toast.error{border-color:#ff5555;color:#ff7777}
+
+  /* Responsive */
+  @media(max-width:768px){
+    .main{flex-direction:column}
+    .divider{width:auto;height:4px;cursor:row-resize}
+    .toolbar{flex-wrap:wrap;gap:6px}
+    .toolbar .filename{max-width:100%;order:10;width:100%}
+  }
+</style>
+</head>
+<body>
+
+<div class="toolbar">
+  <div class="logo">MD</div>
+  <div class="filename" id="filename">No file opened</div>
+  <button class="btn" id="btnNew" title="New file">
+    <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zm-1 2l5 5h-5V4zM8 17h8v-2H8v2zm0-4h8v-2H8v2z"/></svg>
+    New
+  </button>
+  <button class="btn" id="btnOpen" title="Open file">
+    <svg viewBox="0 0 24 24"><path d="M20 6h-8l-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2zm0 12H4V8h16v10z"/></svg>
+    Open
+  </button>
+  <button class="btn" id="btnBrowse" title="Browse files">
+    <svg viewBox="0 0 24 24"><path d="M3 5a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v1H3V5zm0 2h18v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7zm5 3a1 1 0 0 0 0 2h8a1 1 0 1 0 0-2H8z"/></svg>
+    Browse
+  </button>
+  <button class="btn primary" id="btnSave" title="Save file" disabled>
+    <svg viewBox="0 0 24 24"><path d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm-5 16a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm3-10H5V5h10v4z"/></svg>
+    Save
+  </button>
+</div>
+
+<div class="main">
+  <div class="editor-pane" id="editorPane">
+    <textarea id="editor" placeholder="# Start writing Markdown..." spellcheck="false"></textarea>
+  </div>
+  <div class="divider" id="divider"></div>
+  <div class="preview-pane" id="previewPane">
+    <div class="preview-header">Preview</div>
+    <div class="preview-content" id="preview"><div class="empty">Open a file or start typing to see preview</div></div>
+  </div>
+</div>
+
+<div class="status-bar">
+  <div class="left">
+    <span><span class="dot" id="statusDot"></span> Ready</span>
+    <span id="statusText"></span>
+  </div>
+  <div class="right">
+    <span id="charCount">0 chars</span>
+    <span id="lineCount">0 lines</span>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(function(){
+  const editor = document.getElementById('editor');
+  const preview = document.getElementById('preview');
+  const filename = document.getElementById('filename');
+  const btnNew = document.getElementById('btnNew');
+  const btnOpen = document.getElementById('btnOpen');
+  const btnBrowse = document.getElementById('btnBrowse');
+  const btnSave = document.getElementById('btnSave');
+  const toast = document.getElementById('toast');
+  const statusDot = document.getElementById('statusDot');
+  const statusText = document.getElementById('statusText');
+  const charCount = document.getElementById('charCount');
+  const lineCount = document.getElementById('lineCount');
+  const divider = document.getElementById('divider');
+  const editorPane = document.getElementById('editorPane');
+  const previewPane = document.getElementById('previewPane');
+
+  let currentFile = null;
+  let isDirty = false;
+  let lastContent = '';
+
+  // Configure marked
+  marked.setOptions({breaks:true,gfm:true});
+
+  function showToast(msg, isError=false){
+    toast.textContent = msg;
+    toast.className = 'toast show' + (isError ? ' error' : '');
+    clearTimeout(toast._t);
+    toast._t = setTimeout(()=> toast.className='toast', 2500);
+  }
+
+  function updatePreview(){
+    const md = editor.value;
+    if(!md.trim()){
+      preview.innerHTML = '<div class="empty">Open a file or start typing to see preview</div>';
+    } else {
+      preview.innerHTML = marked.parse(md);
+    }
+  }
+
+  function updateCounts(){
+    const v = editor.value;
+    charCount.textContent = v.length + ' chars';
+    lineCount.textContent = (v ? v.split('\n').length : 0) + ' lines';
+  }
+
+  function setDirty(){
+    if(!isDirty && editor.value !== lastContent){
+      isDirty = true;
+      filename.classList.add('active');
+      if(currentFile) filename.textContent = '* ' + currentFile.name;
+    }
+  }
+
+  function markClean(){
+    isDirty = false;
+    lastContent = editor.value;
+    if(currentFile) filename.textContent = currentFile.name;
+  }
+
+  function setFile(f){
+    currentFile = f;
+    filename.textContent = f.name;
+    filename.classList.add('active');
+    btnSave.disabled = false;
+    isDirty = false;
+  }
+
+  // Editor events
+  editor.addEventListener('input', ()=>{
+    updatePreview();
+    updateCounts();
+    setDirty();
+  });
+
+  editor.addEventListener('keydown', e=>{
+    if(e.key==='Tab'){
+      e.preventDefault();
+      const s=editor.selectionStart, end=editor.selectionEnd;
+      editor.value=editor.value.substring(0,s)+'  '+editor.value.substring(end);
+      editor.selectionStart=editor.selectionEnd=s+2;
+      editor.dispatchEvent(new Event('input'));
+    }
+    if((e.ctrlKey||e.metaKey)&&e.key==='s'){
+      e.preventDefault();
+      saveFile();
+    }
+  });
+
+  // New file
+  btnNew.addEventListener('click', async ()=>{
+    if(isDirty && !confirm('Unsaved changes will be lost. Continue?')) return;
+    try{
+      const resp = await puter.ui.prompt('New Markdown File','Enter file name (e.g. notes.md):');
+      if(!resp) return;
+      let name = resp.trim();
+      if(!name) return;
+      if(!name.endsWith('.md')) name += '.md';
+      await puter.fs.writeFile(name, '');
+      const entries = await puter.fs.readdir('/');
+      const entry = entries.find(e=> e.name===name);
+      if(entry){
+        currentFile = entry;
+        setFile(entry);
+        editor.value = '';
+        lastContent = '';
+        markClean();
+        updatePreview();
+        updateCounts();
+        statusText.textContent = 'Created: ' + name;
+        showToast('Created ' + name);
+      }
+    } catch(err){
+      if(err?.message !== 'The user closed the dialog.' && err?.message !== 'User cancelled'){
+        showToast('Failed to create file', true);
+        console.error(err);
+      }
+    }
+  });
+
+  // Open file via Puter file picker
+  btnOpen.addEventListener('click', async ()=>{
+    if(isDirty && !confirm('Unsaved changes will be lost. Continue?')) return;
+    try{
+      const f = await puter.fs.selectFile();
+      if(!f) return;
+      currentFile = f;
+      setFile(f);
+      const blob = await puter.fs.readFile(f);
+      const text = await blob.text();
+      editor.value = text;
+      lastContent = text;
+      markClean();
+      updatePreview();
+      updateCounts();
+      statusText.textContent = 'Opened: ' + f.name;
+      showToast('Opened ' + f.name);
+    } catch(err){
+      if(!err?.message?.includes('cancel') && !err?.message?.includes('closed')){
+        showToast('Failed to open file', true);
+        console.error(err);
+      }
+    }
+  });
+
+  // Browse files in Puter filesystem
+  btnBrowse.addEventListener('click', async ()=>{
+    if(isDirty && !confirm('Unsaved changes will be lost. Continue?')) return;
+    try{
+      const entries = await puter.fs.readdir('/');
+      const mdFiles = entries.filter(e => e.name.endsWith('.md') && e.is_dir === false);
+      if(mdFiles.length === 0){
+        showToast('No .md files found. Create one first!');
+        return;
+      }
+      const list = mdFiles.map((f,i)=> `${i+1}. ${f.name}`).join('\n');
+      const resp = await puter.ui.prompt('Browse .md Files','Select a file by number:\n\n' + list);
+      if(!resp) return;
+      const idx = parseInt(resp.trim()) - 1;
+      if(isNaN(idx) || idx < 0 || idx >= mdFiles.length){
+        showToast('Invalid selection', true);
+        return;
+      }
+      const f = mdFiles[idx];
+      currentFile = f;
+      setFile(f);
+      const blob = await puter.fs.readFile(f);
+      const text = await blob.text();
+      editor.value = text;
+      lastContent = text;
+      markClean();
+      updatePreview();
+      updateCounts();
+      statusText.textContent = 'Opened: ' + f.name;
+      showToast('Opened ' + f.name);
+    } catch(err){
+      if(!err?.message?.includes('cancel') && !err?.message?.includes('closed')){
+        showToast('Failed to browse files', true);
+        console.error(err);
+      }
+    }
+  });
+
+  // Save
+  async function saveFile(){
+    if(!currentFile){
+      showToast('No file to save. Create or open one first.', true);
+      return;
+    }
+    try{
+      statusDot.classList.add('saving');
+      statusText.textContent = 'Saving...';
+      await puter.fs.writeFile(currentFile, editor.value);
+      markClean();
+      statusDot.classList.remove('saving');
+      statusText.textContent = 'Saved at ' + new Date().toLocaleTimeString();
+      showToast('Saved ' + currentFile.name);
+    } catch(err){
+      statusDot.classList.remove('saving');
+      statusText.textContent = 'Save failed';
+      showToast('Failed to save: ' + (err.message||'Unknown error'), true);
+      console.error(err);
+    }
+  }
+  btnSave.addEventListener('click', saveFile);
+
+  // Resizable divider
+  let isDragging = false;
+  divider.addEventListener('mousedown', e=>{
+    isDragging = true;
+    divider.classList.add('active');
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', e=>{
+    if(!isDragging) return;
+    const mainRect = document.querySelector('.main').getBoundingClientRect();
+    const pct = ((e.clientX - mainRect.left) / mainRect.width) * 100;
+    const clamped = Math.max(20, Math.min(80, pct));
+    editorPane.style.flex = 'none';
+    editorPane.style.width = clamped + '%';
+    previewPane.style.flex = 'none';
+    previewPane.style.width = (100 - clamped) + '%';
+  });
+  document.addEventListener('mouseup', ()=>{
+    if(isDragging){
+      isDragging = false;
+      divider.classList.remove('active');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    }
+  });
+
+  // Before unload warning
+  window.addEventListener('beforeunload', e=>{
+    if(isDirty){ e.preventDefault(); e.returnValue=''; }
+  });
+
+  // Init
+  updatePreview();
+  updateCounts();
+})();
+</script>
+</body>
+</html>

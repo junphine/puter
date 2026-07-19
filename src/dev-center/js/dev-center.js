@@ -17,7 +17,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import init_apps,{generateDirTree,setRootDirTree} from './apps.js';
+import init_apps,{generateDirTree,setRootDirTree,hasRootIndexHtml} from './apps.js';
 import init_workers from './workers.js';
 import init_websites from './websites.js';
 

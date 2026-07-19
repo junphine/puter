@@ -39,6 +39,7 @@ const css_paths = [
     '/lib/jquery-ui-1.13.2/jquery-ui.min.css',
     '/css/style.css',
     '/css/dashboard.css',
+    '/css/theme.css',
 ];
 
 // Ordered list of JS scripts

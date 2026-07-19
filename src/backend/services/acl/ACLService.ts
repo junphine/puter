@@ -142,6 +142,13 @@ export class ACLService extends PuterService {
                 ) {
                     return true;
                 }
+                // add@byron
+                if (                    
+                    resource.path.startsWith(`/${username}/`)
+                ) {
+                    return true;
+                }
+                // end@
             }
         }
 

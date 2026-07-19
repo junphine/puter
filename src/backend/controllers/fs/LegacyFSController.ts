@@ -866,8 +866,8 @@ export class LegacyFSController extends PuterController {
         // types wrap in `{success, result: Blob}`. Clients (including the
         // GUI) expect the raw-Blob shape. Use `/fs/read` for type-aware
         // streaming.
-        if (options.realMime) {
-            res.setHeader('Content-Type', contentTypeFromMime(entry.name));
+        if (entry.name) {
+            res.setHeader('Content-Type', contentTypeFromMime(entry.name) || 'application/octet-stream');
         } else {
             res.setHeader('Content-Type', 'application/octet-stream');
         }
@@ -934,7 +934,7 @@ export class LegacyFSController extends PuterController {
             });
         }
 
-        req.actor = actor;
+        req.actor = actor || undefined;
         Context.set('actor', actor);
 
         // Forward back to regular read after setting actor
@@ -963,6 +963,7 @@ export class LegacyFSController extends PuterController {
 
         // Apps can only sign inside their AppData root.
         let appDataRoot: string | null = null;
+        let userDataRoot: string | null = null;
         if (isApp) {
             const username = (actor as { user?: { username?: string } }).user
                 ?.username;
@@ -972,6 +973,7 @@ export class LegacyFSController extends PuterController {
                     legacyCode: 'forbidden',
                 });
             appDataRoot = `/${username}/AppData/${appUid}`;
+            userDataRoot = `/${username}/`;
         }
 
         type SignedOrEmpty =
@@ -1016,7 +1018,11 @@ export class LegacyFSController extends PuterController {
                     ? entry.path === appDataRoot ||
                       entry.path.startsWith(`${appDataRoot}/`)
                     : true;
-                if (!withinAppRoot) {
+                // User-sandbox check
+                const withinUserRoot = userDataRoot
+                    ? entry.path.startsWith(userDataRoot)
+                    : false;
+                if (!withinAppRoot && !withinUserRoot) {
                     throw new HttpError(403, 'Forbidden', {
                         legacyCode: 'forbidden',
                     });

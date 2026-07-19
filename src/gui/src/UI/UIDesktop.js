@@ -1221,7 +1221,7 @@ async function UIDesktop (options) {
     ht += '</div>';
 
     // 'Show Desktop'
-    ht += `<a href="/" class="show-desktop-btn toolbar-btn antialiased hidden" target="_blank" title="${i18n('desktop_show_desktop')}">${i18n('desktop_show_desktop')} <img src="${window.icons['launch-white.svg']}" style="width: 10px; height: 10px; margin-left: 5px;"></a>`;
+    ht += `<a href="/desktop" class="show-desktop-btn toolbar-btn antialiased" title="${i18n('desktop_show_desktop')}"><img src="${window.icons['launch-white.svg']}" style="width: 17px; height: 17px;"></a>`;
 
 
     // do not show the fullscreen button on mobile devices since it's broken
@@ -2569,12 +2569,12 @@ window.toggleDesktopIcons = function () {
 };
 
 $(document).on('click', '.btn-show-ai', function () {
-    var $target = $('.window[data-app="ai"]');
+    var $target = $('.window[data-app="ai"][data-is_panel="1"]');
     if ($target.is(':visible')) {
         $target.makeWindowInvisible();        
-    } else {
+    } else {        
         $target.makeWindowVisible();
-    }    
+    }
 });
 
 export default UIDesktop;
