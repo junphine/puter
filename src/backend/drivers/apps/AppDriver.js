@@ -31,6 +31,12 @@ import {
 } from '../../util/appIcon.js';
 import { resolvePrivateLaunchAccess } from '../../util/privateLaunchAccess.js';
 import {
+    decodeCursor,
+    encodeCursor,
+    normalizeLimit,
+    normalizeOffset,
+} from '../../util/pagination.js';
+import {
     validateArrayOfStrings,
     validateBool,
     validateJsonObject,
@@ -241,17 +247,46 @@ export class AppDriver extends PuterDriver {
         return this.#toClient(app, actor, { ...params, stats });
     }
 
-    async select({ predicate, params = {} } = {}) {
+    async select(args = {}) {
+        const { predicate, params = {} } = args;
         const actor = this.#requireActor();
         this.#requireUserOrAppActor(actor);
 
+        const limit = normalizeLimit(args.limit, { cap: 5000 }) ?? 500;
+        const offset = normalizeOffset(args.offset);
+        const hasCursor = Object.prototype.hasOwnProperty.call(args, 'cursor');
+        const payload = decodeCursor(args.cursor);
+        if (payload && offset !== undefined) {
+            throw new HttpError(400, 'cursor and offset cannot be combined', {
+                legacyCode: 'bad_request',
+            });
+        }
+        const includeTotal = args.includeTotal === true;
+        const paginated = hasCursor || offset !== undefined || includeTotal;
+
         const filters = {};
         // predicate: ['user-can-edit'] → scope to owner
-        if (Array.isArray(predicate) && predicate[0] === 'user-can-edit') {
+        const ownerScoped =
+            Array.isArray(predicate) && predicate[0] === 'user-can-edit';
+        if (ownerScoped) {
             filters.ownerUserId = actor.user.id;
         }
 
-        const apps = await this.appStore.list(filters);
+        let apps = await this.appStore.list({
+            ...filters,
+            limit: paginated ? limit + 1 : limit,
+            offset,
+            afterId: payload?.id !== undefined ? Number(payload.id) : undefined,
+        });
+
+        let cursor;
+        if (paginated && apps.length > limit) {
+            apps = apps.slice(0, limit);
+            // The cursor tracks the last fetched row, not the last visible
+            // one, so rows hidden by the permission filter below aren't
+            // re-scanned on the next page.
+            cursor = encodeCursor({ id: Number(apps[apps.length - 1].id) });
+        }
 
         // Resolve protected-app visibility:
         //  1. Cheap local short-circuits (non-protected, self-app, owner).
@@ -302,7 +337,7 @@ export class AppDriver extends PuterDriver {
             ),
         ]);
 
-        return Promise.all(
+        const items = await Promise.all(
             visible.map((app) =>
                 this.#toClient(app, actor, {
                     ...params,
@@ -311,6 +346,22 @@ export class AppDriver extends PuterDriver {
                 }),
             ),
         );
+        if (!paginated) return items;
+
+        let total;
+        if (includeTotal) {
+            total = ownerScoped
+                ? await this.appStore.count({ ownerUserId: actor.user.id })
+                : await this.appStore.count({
+                      visibleToUserId: actor.user?.id ?? null,
+                  });
+        }
+
+        return {
+            items,
+            ...(cursor ? { cursor } : {}),
+            ...(total !== undefined ? { total } : {}),
+        };
     }
 
     async update({ uid, id, object } = {}) {
@@ -837,6 +888,23 @@ export class AppDriver extends PuterDriver {
         // Subdomain exists but belongs to someone other than the app owner —
         // it was reclaimed; launching would leak the token to the new owner.
         return subdomainOwnerId !== appOwnerId;
+    }
+
+    /**
+     * Public wrapper over the authoritative client serializer. Callers
+     * outside the driver (e.g. the homepage shell baking app metadata into
+     * the rendered GUI) must never embed a raw store row — it carries
+     * `owner_user_id`, admin flags, and the private `index_url`. This
+     * projects the safe field subset and applies the private-app
+     * `index_url` gate for `actor`, which may be null for an anonymous
+     * request.
+     *
+     * @param {Record<string, unknown>} app - raw app store row
+     * @param {any} [actor] - request actor, or null when anonymous
+     * @param {Record<string, unknown>} [params]
+     */
+    async toClientView(app, actor = null, params = {}) {
+        return this.#toClient(app, actor, params);
     }
 
     async #toClient(app, actor, params = {}) {

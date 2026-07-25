@@ -23,6 +23,7 @@ let usageTableSortState = {
     direction: 'desc', // default descending (highest cost first)
 };
 let usageTableData = []; // Store raw data for sorting
+let usageTableRendered = false; // A table (possibly empty) has rendered from a successful load
 let usageTableExpanded = false; // Track if table is showing all rows
 const USAGE_TABLE_INITIAL_ROWS = 10;
 
@@ -76,23 +77,17 @@ const TabUsage = {
             </div>`;
     },
     init: ($el_window) => {
-        // Upgrade / Manage Plan button (same logic as billing tab)
-        const $planBtn = $($el_window).find('.usage-plan-btn');
-        const hasSubscription = window.user?.subscription?.active;
-        if ( hasSubscription ) {
-            $planBtn.text('Manage Plan').addClass('manage').show();
-        } else {
-            $planBtn.text('Upgrade').addClass('upgrade').show();
-        }
-        $planBtn.on('click', (e) => {
+        setupPlanButton($el_window);
+        // Guard the click: UIUpgradeAccount only exists on hosted puter.com, and
+        // without the guard clicking would throw a TypeError.
+        $($el_window).find('.usage-plan-btn').on('click', (e) => {
             e.preventDefault();
-            (new window.UIUpgradeAccount()).open_as_window();
+            if ( typeof window.UIUpgradeAccount === 'function' ) {
+                (new window.UIUpgradeAccount()).open_as_window();
+            }
         });
 
-        update_usage_details($el_window);
-        $($el_window).find('.update-usage-details').on('click', function () {
-            update_usage_details($el_window);
-        });
+        refreshUsageDetails($el_window);
 
         // Click handler for sortable table headers
         $($el_window).on('click', '.driver-usage-details-content-table th[data-sort]', function () {
@@ -121,7 +116,58 @@ const TabUsage = {
             renderUsageTable();
         });
     },
+    // Refresh whenever the tab is (re)activated — otherwise the usage numbers
+    // stay frozen at page-load time for the whole session (there is no other
+    // refresh path), diverging from the Home cards which do refresh.
+    onActivate: ($el_window) => {
+        setupPlanButton($el_window);
+        refreshUsageDetails($el_window);
+    },
 };
+
+// init and the initial-route onActivate both fire when the dashboard opens
+// directly on this tab; share the in-flight refresh instead of issuing
+// duplicate request pairs.
+let usageRefreshPromise = null;
+function refreshUsageDetails ($el_window) {
+    if ( ! usageRefreshPromise ) {
+        usageRefreshPromise = update_usage_details($el_window).finally(() => {
+            usageRefreshPromise = null;
+        });
+    }
+    return usageRefreshPromise;
+}
+
+let planBtnRetryTimer = null;
+
+function setupPlanButton ($el_window, retryDelay = 250) {
+    const $planBtn = $($el_window).find('.usage-plan-btn');
+    clearTimeout(planBtnRetryTimer);
+    // UIUpgradeAccount is only present on hosted puter.com; on a self-hosted
+    // install the button has no working target, so hide it entirely rather
+    // than showing a dead control. Hosted deployments can attach it *after*
+    // the dashboard initializes, though — retry with decaying backoff so a
+    // load-order race can't hide the button from a subscriber. Give up after
+    // ~30s: a script that hasn't landed by then never will (self-hosted), and
+    // onActivate re-checks on every return to the tab anyway. The bound also
+    // releases the captured $el_window instead of pinning it forever.
+    if ( typeof window.UIUpgradeAccount !== 'function' ) {
+        $planBtn.hide();
+        if ( retryDelay <= 10000 ) {
+            planBtnRetryTimer = setTimeout(
+                () => setupPlanButton($el_window, retryDelay * 1.5),
+                retryDelay,
+            );
+        }
+        return;
+    }
+    const hasSubscription = window.user?.subscription?.active;
+    $planBtn
+        .text(hasSubscription ? 'Manage Plan' : 'Upgrade')
+        .toggleClass('manage', !!hasSubscription)
+        .toggleClass('upgrade', !hasSubscription)
+        .show();
+}
 
 function getSortIcon (column) {
     const isActive = usageTableSortState.column === column;
@@ -197,7 +243,7 @@ function renderUsageTable () {
     for ( const row of rowsToShow ) {
         h += `
         <tr>
-            <td>${row.resource}</td>
+            <td>${window.html_encode(row.resource.replaceAll('_dot_', '.'))}</td>
             <td>${row.formattedUnits}</td>
             <td>${row.formattedCost}</td>
         </tr>`;
@@ -225,24 +271,36 @@ function renderUsageTable () {
 }
 
 async function update_usage_details ($el_window) {
-    // Add spinning animation and record start time
-    const startTime = Date.now();
-    $($el_window).find('.update-usage-details-icon').css('animation', 'spin 1s linear infinite');
-
     const monthlyUsagePromise = puter.auth.getMonthlyUsage().then(res => {
-        let monthlyAllowance = res.allowanceInfo?.monthUsageAllowance;
-        // Actual month-to-date spend. `allowanceInfo.remaining` folds purchased
-        // credits into the remaining pool, so `allowance - remaining` turns
-        // negative as soon as a user has credits. Use the reported usage total.
-        let totalUsage = res.usage?.total ?? 0;
-        let totalUsagePercentage = monthlyAllowance ? Math.min(100, totalUsage / monthlyAllowance * 100).toFixed(0) : '0';
+        const monthlyAllowance = res.allowanceInfo?.monthUsageAllowance || 0;
+        // Actual month-to-date spend.
+        const totalUsage = res.usage?.total ?? 0;
+        // Purchased credits extend the monthly allowance. `remaining` is the
+        // server-netted pool (allowance-left + purchased-left, with any overage
+        // already charged to credits), so subtracting the allowance portion back
+        // out isolates the purchased-credit balance — no double-counting.
+        const remaining = res.allowanceInfo?.remaining ?? 0;
+        const remainingPurchased = Math.max(
+            0,
+            remaining - Math.max(0, monthlyAllowance - totalUsage),
+        );
+        // Capacity grows by whatever purchased credit is left; net usage (spend
+        // minus that credit) drives the percentage, so unused credit reads as a
+        // negative "usage" against the monthly allowance.
+        const capacity = monthlyAllowance + remainingPurchased;
+        const netUsage = totalUsage - remainingPurchased;
+        const rawPercentage = monthlyAllowance ? netUsage / monthlyAllowance * 100 : 0;
+        // Text may go negative (surplus credit) but never above 100%; the bar
+        // fill is clamped to [0, 100].
+        const displayPercentage = Math.round(Math.min(100, rawPercentage));
+        const barPercentage = Math.max(0, Math.min(100, rawPercentage));
 
         $('#total-usage').html(window.number_format(totalUsage / 100_000_000, { decimals: 2, prefix: '$' }));
-        $('#total-capacity').html(window.number_format(monthlyAllowance / 100_000_000, { decimals: 2, prefix: '$' }));
-        $('.usage-progbar-percent').html(`${totalUsagePercentage }%`);
+        $('#total-capacity').html(window.number_format(capacity / 100_000_000, { decimals: 2, prefix: '$' }));
+        $('.usage-progbar-percent').html(`${displayPercentage }%`);
         $('.usage-progbar').css({
-            width: `${totalUsagePercentage }%`,
-            'background-color': window.usage_bar_color(totalUsagePercentage),
+            width: `${barPercentage }%`,
+            'background-color': window.usage_bar_color(barPercentage),
         });
 
         // Store raw data for sorting
@@ -274,10 +332,24 @@ async function update_usage_details ($el_window) {
         }
 
         renderUsageTable();
+        usageTableRendered = true;
+    }).catch(err => {
+        console.error('Failed to load monthly usage:', err);
+        // Only show the failure note when nothing has rendered yet — a
+        // transient refresh error must not wipe a table the user is already
+        // looking at (mirrors the Apps grid's error handling). Track "has
+        // rendered", not data length: an account with zero usage renders a
+        // legitimately empty table.
+        if ( ! usageTableRendered ) {
+            $('.driver-usage-details-content').html(
+                '<p style="opacity:0.7; font-size:13px;">Usage details are unavailable right now.</p>',
+            );
+        }
     });
 
     const spacePromise = puter.fs.space().then(res => {
-        let usage_percentage = (res.used / res.capacity * 100).toFixed(0);
+        // Guard capacity 0 — otherwise 0/0 renders literally as "NaN%".
+        let usage_percentage = res.capacity ? (res.used / res.capacity * 100).toFixed(0) : '0';
         usage_percentage = usage_percentage > 100 ? 100 : usage_percentage;
 
         let general_used = res.used;
@@ -308,20 +380,12 @@ async function update_usage_details ($el_window) {
             width: `${host_usage_percentage }%`,
             'background-color': storageColor,
         });
+    }).catch(err => {
+        console.error('Failed to load storage usage:', err);
     });
 
     // Wait for both promises to complete
     await Promise.all([monthlyUsagePromise, spacePromise]);
-
-    // Ensure spinning continues for at least 1 second
-    const elapsed = Date.now() - startTime;
-    const minDuration = 1000; // 1 second
-    if ( elapsed < minDuration ) {
-        await new Promise(resolve => setTimeout(resolve, minDuration - elapsed));
-    }
-
-    // Remove spinning animation
-    $($el_window).find('.update-usage-details-icon').css('animation', '');
 }
 
 export default TabUsage;

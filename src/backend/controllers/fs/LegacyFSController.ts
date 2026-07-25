@@ -18,13 +18,18 @@
  */
 
 import Busboy from 'busboy';
-import type { Request, RequestHandler, Response } from 'express';
+import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import { contentType as contentTypeFromMime } from 'mime-types';
 import { posix as pathPosix } from 'node:path';
 import type { Actor } from '../../core/actor.js';
 import { effectiveActorApp, isAccessTokenActor } from '../../core/actor.js';
 import { Context } from '../../core/context.js';
 import { HttpError } from '../../core/http/HttpError.js';
+import {
+    assertNotSuspended,
+    assertVerifiedAccount,
+} from '../../core/http/middleware/gates.js';
+import { RouteOptions } from '../../core/http/index.js';
 import type { PuterRouter } from '../../core/http/PuterRouter.js';
 import type { ACLService } from '../../services/acl/ACLService.js';
 import type { SignedFile } from '../../util/fileSigning.js';
@@ -44,7 +49,6 @@ import {
     signingConfigFromAppConfig,
     toLegacyEntry,
 } from './legacyFsHelpers.js';
-import { RouteOptions } from '../../core/http/index.js';
 
 type RouterCache = Map<string, RequestHandler | null>;
 
@@ -312,6 +316,13 @@ export class LegacyFSController extends PuterController {
         const actor = this.#requireActor(req);
         const body = asRecord(req.body);
 
+        // Presence of `cursor` (null means "first page") or `includeTotal`
+        // opts into the paginated `{items, cursor?, total?}` envelope.
+        // Requests without pagination params keep the bare-array response.
+        const paginated =
+            Object.prototype.hasOwnProperty.call(body, 'cursor') ||
+            body.includeTotal === true;
+
         if (this.#isRootPathRef(body)) {
             const { listRootEntries } =
                 await import('../../services/fs/rootListing.js');
@@ -341,6 +352,15 @@ export class LegacyFSController extends PuterController {
                     }),
                 ),
             );
+            if (paginated) {
+                res.json({
+                    items: shaped,
+                    ...(body.includeTotal === true
+                        ? { total: shaped.length }
+                        : {}),
+                });
+                return;
+            }
             res.json(shaped);
             return;
         }
@@ -359,10 +379,37 @@ export class LegacyFSController extends PuterController {
             'list',
         );
 
-        const children = await this.services.fs.listDirectory(parent.uuid, {
-            sortBy: this.#parseSortBy(body),
-            sortOrder: this.#parseSortOrder(body),
-        });
+        const sortBy = this.#parseSortBy(body);
+        const sortOrder = this.#parseSortOrder(body);
+        const limit =
+            typeof body.limit === 'number' || typeof body.limit === 'string'
+                ? Number(body.limit)
+                : undefined;
+        const offset =
+            typeof body.offset === 'number' || typeof body.offset === 'string'
+                ? Number(body.offset)
+                : undefined;
+
+        let children;
+        let cursor: string | undefined;
+        if (paginated) {
+            const page = await this.services.fs.listDirectoryPage(parent.uuid, {
+                limit,
+                cursor:
+                    typeof body.cursor === 'string' ? body.cursor : undefined,
+                sortBy,
+                sortOrder,
+            });
+            children = page.entries;
+            cursor = page.cursor;
+        } else {
+            children = await this.services.fs.listDirectory(parent.uuid, {
+                limit: Number.isFinite(limit) ? limit : undefined,
+                offset: Number.isFinite(offset) ? offset : undefined,
+                sortBy,
+                sortOrder,
+            });
+        }
 
         const suggestions =
             await this.services.suggestedApps.getSuggestedAppsForEntries(
@@ -385,6 +432,19 @@ export class LegacyFSController extends PuterController {
                 toLegacyEntry(this.clients.event, c, { appsById }),
             ),
         );
+
+        if (paginated) {
+            const total =
+                body.includeTotal === true
+                    ? await this.services.fs.countDirectory(parent.uuid)
+                    : undefined;
+            res.json({
+                items: shaped,
+                ...(cursor ? { cursor } : {}),
+                ...(total !== undefined ? { total } : {}),
+            });
+            return;
+        }
         res.json(shaped);
     };
 
@@ -826,7 +886,12 @@ export class LegacyFSController extends PuterController {
         res.json(shaped);
     };
 
-    read = async (req: Request, res: Response, options = {}): Promise<void> => {
+    read = async (
+        req: Request,
+        res: Response,
+        _next?: NextFunction,
+        options: { realMime?: boolean } = {},
+    ) => {
         const actor = this.#requireActor(req);
         const query = asRecord(req.query);
 
@@ -866,8 +931,11 @@ export class LegacyFSController extends PuterController {
         // types wrap in `{success, result: Blob}`. Clients (including the
         // GUI) expect the raw-Blob shape. Use `/fs/read` for type-aware
         // streaming.
-        if (entry.name) {
-            res.setHeader('Content-Type', contentTypeFromMime(entry.name) || 'application/octet-stream');
+        if (options.realMime) {
+            res.setHeader(
+                'Content-Type',
+                contentTypeFromMime(entry.name) as string,
+            );
         } else {
             res.setHeader('Content-Type', 'application/octet-stream');
         }
@@ -934,11 +1002,17 @@ export class LegacyFSController extends PuterController {
             });
         }
 
-        req.actor = actor || undefined;
+        // This endpoint authenticates the token by hand and never runs the
+        // route gate chain, so the suspension and pending-verification checks
+        // that guard every other authenticated FS route have to run here.
+        assertNotSuspended(actor!.user);
+        assertVerifiedAccount(actor!.user);
+
+        req.actor = actor!;
         Context.set('actor', actor);
 
         // Forward back to regular read after setting actor
-        return this.read(req, res, { realMime: true });
+        return this.read(req, res, undefined, { realMime: true });
     };
 
     // -- Signed-URL + meta routes ----------------------------------------
@@ -1132,35 +1206,35 @@ export class LegacyFSController extends PuterController {
             );
         }
 
-        // ACL re-check: require an authenticated actor with write
-        // permission. A valid write signature alone is not sufficient —
-        // the caller must also pass ACL, preventing exploitation of
-        // leaked write URLs by read-only share recipients.
         const callerActor = this.#requireActor(req);
         if (operation === 'write') {
-            await assertAccess(
-                this.services.acl,
-                this.services.fs,
-                callerActor,
-                targetEntry.path,
-                'write',
-            );
-        }
-        if (operation === 'write') {
             const body = asRecord(req.body);
-            const parentEntry = targetEntry.isDir
-                ? targetEntry
-                : await this.#resolveParentOfEntry(targetEntry);
-            const name =
-                typeof body.name === 'string'
-                    ? body.name
-                    : targetEntry.isDir
-                      ? `upload-${Date.now()}`
-                      : targetEntry.name;
-            const targetPath =
-                parentEntry.path === '/'
-                    ? `/${name}`
-                    : `${parentEntry.path}/${name}`;
+            let targetPath: string;
+            if (targetEntry.isDir) {
+                const name =
+                    typeof body.name === 'string'
+                        ? body.name
+                        : `upload-${Date.now()}`;
+                targetPath =
+                    targetEntry.path === '/'
+                        ? `/${name}`
+                        : `${targetEntry.path}/${name}`;
+                await assertCanCreate(
+                    this.services.acl,
+                    this.services.fs,
+                    callerActor,
+                    targetPath,
+                );
+            } else {
+                targetPath = targetEntry.path;
+                await assertAccess(
+                    this.services.acl,
+                    this.services.fs,
+                    callerActor,
+                    targetPath,
+                    'write',
+                );
+            }
 
             // Parse multipart and pipe the first `file` part into fsService.write.
             const uploadResult = await this.#multipartWrite(
@@ -1658,14 +1732,6 @@ export class LegacyFSController extends PuterController {
         } catch {
             // Non-critical — GUI event failure must never break the HTTP response.
         }
-    }
-
-    async #resolveParentOfEntry(entry: { path: string; userId: number }) {
-        const parentPath = pathPosix.dirname(entry.path);
-        const parent = await resolveV1Selector(this.stores.fsEntry, {
-            path: parentPath,
-        });
-        return parent;
     }
 
     async #multipartWrite(
@@ -2239,7 +2305,7 @@ export class LegacyFSController extends PuterController {
     #parseSortBy(
         body: Record<string, unknown>,
     ): 'name' | 'modified' | 'type' | 'size' | null {
-        const raw = getString(body, 'sort_by');
+        const raw = getString(body, 'sortBy') || getString(body, 'sort_by');
         if (!raw) return null;
         const normalized = raw.toLowerCase();
         return (
@@ -2250,7 +2316,8 @@ export class LegacyFSController extends PuterController {
     }
 
     #parseSortOrder(body: Record<string, unknown>): 'asc' | 'desc' | null {
-        const raw = getString(body, 'sort_order');
+        const raw =
+            getString(body, 'sortOrder') || getString(body, 'sort_order');
         if (!raw) return null;
         const normalized = raw.toLowerCase();
         return (['asc', 'desc'] as const).find((v) => v === normalized) ?? null;

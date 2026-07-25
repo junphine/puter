@@ -1049,12 +1049,6 @@ window.show_save_account_notice_if_needed = function (message) {
     });
 };
 
-window.onpopstate = (event) => {
-    if ( event.state !== null && event.state.window_id !== null ) {
-        $(`.window[data-id="${event.state.window_id}"]`).focusWindow();
-    }
-};
-
 window.sort_items = (item_container, sort_by, sort_order) => {
     if ( sort_order !== 'asc' && sort_order !== 'desc' )
     {
@@ -1817,15 +1811,24 @@ window.move_items = async function (el_items, dest_path, is_undo = false) {
                 // skip next loop iteration because this iteration was successful
                 item_with_same_name_already_exists = false;
 
-                // update all shortcut_to_path
-                $(`.item[data-shortcut_to_path="${html_encode($(el_item).attr('data-path'))}" i]`).attr('data-shortcut_to_path', fsentry.path);
+                // update all shortcut_to_path — compare raw attribute values
+                // (item rows store paths unencoded, so an html_encode()d
+                // selector misses names containing & < > " ')
+                const moved_from_path_lc = String($(el_item).attr('data-path') || '').toLowerCase();
+                $('.item[data-shortcut_to_path]').filter(function () {
+                    return String($(this).attr('data-shortcut_to_path')).toLowerCase() === moved_from_path_lc;
+                }).attr('data-shortcut_to_path', fsentry.path);
 
                 // Remove all items with matching uids from their OLD location(s).
                 // Exclude any row already at the item's new path: a concurrent
                 // item.moved socket handler may have just created a row at the
                 // destination (e.g. the dashboard file view showing the target
                 // directory), and removing by uid alone would delete it too.
-                $(`.item[data-uid='${$(el_item).attr('data-uid')}']`).not(`[data-path="${html_encode(fsentry.path)}" i]`).fadeOut(150, function () {
+                // Raw case-insensitive compare, for the same reason as above.
+                const dest_item_path_lc = fsentry.path.toLowerCase();
+                $(`.item[data-uid='${$(el_item).attr('data-uid')}']`).not(function () {
+                    return String($(this).attr('data-path') || '').toLowerCase() === dest_item_path_lc;
+                }).fadeOut(150, function () {
                     // find all parent windows that contain this item
                     let parent_windows = $(`.item[data-uid='${$(el_item).attr('data-uid')}']`).closest('.window');
                     // remove this item
@@ -2169,6 +2172,71 @@ window.updateSubdomainsForItems = async function (fsentries, container) {
 };
 
 
+// This flow owns its own file input rather than borrowing the shell's
+// #upload-file-dialog. That element is shared, and on the dashboard the Files
+// tab assigns an onchange PROPERTY to it — which jQuery's unbind() cannot
+// remove — so a single selection used to fire both handlers and start two
+// concurrent uploads of the same files. When the two destinations coincided
+// (both default to Desktop) the signed batch writes raced and the loser failed
+// with "Entry already exists"; when they differed, the files also landed in
+// the Files tab's directory. A private input keeps the two flows independent.
+let el_upload_dialog_input = null;
+
+// Destination for the pending selection. Module-level rather than captured per
+// call because the input's change handler is bound once, and only one native
+// file dialog can be open at a time — matching the old behaviour, where
+// re-binding meant the most recent caller's target won.
+let upload_dialog_target_path = null;
+
+const get_upload_dialog_input = () => {
+    if ( el_upload_dialog_input?.isConnected ) {
+        return el_upload_dialog_input;
+    }
+
+    el_upload_dialog_input = document.createElement('input');
+    el_upload_dialog_input.type = 'file';
+    el_upload_dialog_input.name = 'file';
+    el_upload_dialog_input.multiple = true;
+    el_upload_dialog_input.style.display = 'none';
+    document.body.appendChild(el_upload_dialog_input);
+
+    el_upload_dialog_input.addEventListener('change', function () {
+        // Snapshot into an array before clearing: `value = ''` empties the live
+        // FileList in place, and upload_items consumes it asynchronously.
+        const files = Array.from(el_upload_dialog_input.files ?? []);
+        el_upload_dialog_input.value = '';
+        if ( files.length === 0 ) {
+            return;
+        }
+        try {
+            window.upload_items(files, upload_dialog_target_path);
+        }
+        catch ( err ) {
+            UIAlert(err.message ?? err);
+        }
+    });
+
+    return el_upload_dialog_input;
+};
+
+/**
+ *
+ * @param {*} el_target_container
+ * @param {*} target_path
+ */
+
+window.init_upload_using_file_dialog = function (el_target_container, target_path = null) {
+    upload_dialog_target_path = target_path === null
+        ? $(el_target_container).attr('data-path')
+        : path.resolve(target_path);
+
+    const el_input = get_upload_dialog_input();
+    // Clearing before opening lets the same file be picked twice in a row; an
+    // unchanged value fires no change event.
+    el_input.value = '';
+    el_input.click();
+};
+
 /**
  * Opens the file or folder picker (after a single "Upload here" entry) and uploads into target_path.
  * Browsers require separate inputs for multi-file vs directory tree; we ask once, then open the matching picker.
@@ -2226,7 +2294,7 @@ window.init_upload_using_dialog = async function (el_target_container, target_pa
  * @param {*} target_path
  */
 
-window.init_upload_using_file_dialog = function (el_target_container, target_path = null) {
+window.init_upload_using_file_dialog_old = function (el_target_container, target_path = null) {
     $('#upload-file-dialog').unbind('onchange');
     $('#upload-file-dialog').unbind('change');
     $('#upload-file-dialog').unbind('onChange');

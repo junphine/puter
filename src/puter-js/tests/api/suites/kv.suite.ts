@@ -95,15 +95,64 @@ export default suite('kv', {
         t.assert.equal(await t.puter.kv.get('kv-suite-expire-future'), 'fresh');
     },
 
+    'list with includeTotal reports the total for the pattern': async (t) => {
+        for (const k of [
+            'kv-suite-tot-a',
+            'kv-suite-tot-b',
+            'kv-suite-tot-c',
+        ]) {
+            await t.puter.kv.set(k, 1);
+        }
+        const page = (await t.puter.kv.list({
+            pattern: 'kv-suite-tot-*',
+            limit: 1,
+            includeTotal: true,
+        })) as { items: string[]; total?: number };
+        t.assert.equal(page.items.length, 1);
+        t.assert.equal(page.total, 3);
+    },
+
+    'list with offset skips ahead': async (t) => {
+        for (const k of [
+            'kv-suite-off-a',
+            'kv-suite-off-b',
+            'kv-suite-off-c',
+        ]) {
+            await t.puter.kv.set(k, 1);
+        }
+        const page = (await t.puter.kv.list({
+            pattern: 'kv-suite-off-*',
+            limit: 10,
+            offset: 1,
+        })) as { items: string[] };
+        t.assert.deepEqual(page.items, ['kv-suite-off-b', 'kv-suite-off-c']);
+    },
+
+    'list with fetchUntilFull fills the page': async (t) => {
+        for (const k of [
+            'kv-suite-fill-a',
+            'kv-suite-fill-b',
+            'kv-suite-fill-c',
+        ]) {
+            await t.puter.kv.set(k, 1);
+        }
+        const page = (await t.puter.kv.list({
+            pattern: 'kv-suite-fill-*',
+            limit: 3,
+            fetchUntilFull: true,
+        })) as { items: string[] };
+        t.assert.equal(page.items.length, 3);
+    },
+
     'list returns keys matching a prefix pattern': async (t) => {
         await t.puter.kv.set('kv-suite-list-a', 1);
         await t.puter.kv.set('kv-suite-list-b', 2);
         await t.puter.kv.set('kv-suite-unrelated', 3);
         const keys = await t.puter.kv.list('kv-suite-list-*');
-        t.assert.deepEqual(
-            [...keys].sort(),
-            ['kv-suite-list-a', 'kv-suite-list-b'],
-        );
+        t.assert.deepEqual([...keys].sort(), [
+            'kv-suite-list-a',
+            'kv-suite-list-b',
+        ]);
     },
 
     'list with returnValues returns key-value pairs': async (t) => {
@@ -125,10 +174,12 @@ export default suite('kv', {
     'set rejects an undefined key client-side': async (t) => {
         await t.assert.rejects(
             () =>
-                (t.puter.kv.set as (k: unknown, v: unknown) => Promise<unknown>)(
-                    undefined,
-                    'x',
-                ),
+                (
+                    t.puter.kv.set as (
+                        k: unknown,
+                        v: unknown,
+                    ) => Promise<unknown>
+                )(undefined, 'x'),
             'an undefined key should be rejected',
         );
     },
@@ -207,6 +258,45 @@ export default suite('kv', {
             'kv-suite-page-2',
             'kv-suite-page-3',
         ]);
+    },
+
+    'list with stream iterates pages via for await': async (t) => {
+        for (let i = 1; i <= 3; i++) {
+            await t.puter.kv.set(`kv-suite-stream-${i}`, `v${i}`);
+        }
+        const seen: string[] = [];
+        let pages = 0;
+        for await (const page of t.puter.kv.list({
+            pattern: 'kv-suite-stream-*',
+            limit: 2,
+            stream: true,
+        }) as AsyncIterable<{ items: string[]; cursor?: string }>) {
+            pages++;
+            t.assert.ok(page.items.length <= 2, 'stream pages respect limit');
+            seen.push(...page.items);
+        }
+        t.assert.ok(pages >= 2, 'stream should yield multiple pages');
+        t.assert.deepEqual(seen.sort(), [
+            'kv-suite-stream-1',
+            'kv-suite-stream-2',
+            'kv-suite-stream-3',
+        ]);
+    },
+
+    'list with stream rejects offset client-side': async (t) => {
+        let err: { code?: string } | undefined;
+        try {
+            t.puter.kv.list({ stream: true, offset: 1 } as never);
+        } catch (e) {
+            err = e as { code?: string };
+        }
+        t.assert.equal(err?.code, 'invalid_request');
+    },
+
+    'clear is an alias of flush and empties the store': async (t) => {
+        await t.puter.kv.set('kv-suite-clear-a', 1);
+        await t.puter.kv.clear();
+        t.assert.equal(await t.puter.kv.get('kv-suite-clear-a'), null);
     },
 
     'flush removes every key for the app': async (t) => {

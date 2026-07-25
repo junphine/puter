@@ -845,15 +845,43 @@ export class FSController extends PuterController {
             await this.services.suggestedApps.getSuggestedApps(entry);
 
         res.json({
-            ...entry,
+            ...this.#toClientEntry(entry),
             ...(subtreeSize !== undefined ? { size: subtreeSize } : {}),
         });
+    }
+
+    /**
+     * Strip backend-internal fields before returning an entry to a client.
+     * Storage location (bucket/region), the owner's numeric id, and the
+     * capability-token columns are never used by clients and must not leak to
+     * callers who only hold `see`/`list` on the entry — a share recipient, or
+     * (with public folders enabled) any authenticated user. The legacy read
+     * path already curates its output; this does the same for the v2 routes.
+     */
+    #toClientEntry(entry: object): Record<string, unknown> {
+        const clone: Record<string, unknown> = { ...entry };
+        for (const field of [
+            'bucket',
+            'bucketRegion',
+            'userId',
+            'publicToken',
+            'fileRequestToken',
+        ])
+            delete clone[field];
+        return clone;
     }
 
     @Post('/readdir', { subdomain: 'api', requireVerified: true })
     async readdirEntries(req: Request, res: Response) {
         const actor = this.#requireActor(req);
         const body = this.#toObjectRecord(req.body);
+
+        // Presence of `cursor` (null means "first page") or `includeTotal`
+        // opts into the paginated `{items, cursor?, total?}` envelope.
+        // Legacy limit/offset requests keep the bare-array response.
+        const paginated =
+            Object.prototype.hasOwnProperty.call(body, 'cursor') ||
+            body.includeTotal === true;
 
         if (this.#isRootPathRef(body)) {
             const { listRootEntries } =
@@ -873,7 +901,19 @@ export class FSController extends PuterController {
                     child.suggestedApps = rootSuggestions[index] ?? [];
                 }
             }
-            res.json(rootChildren);
+            const rootItems = rootChildren.map((child) =>
+                this.#toClientEntry(child),
+            );
+            if (paginated) {
+                res.json({
+                    items: rootItems,
+                    ...(body.includeTotal === true
+                        ? { total: rootItems.length }
+                        : {}),
+                });
+                return;
+            }
+            res.json(rootItems);
             return;
         }
 
@@ -888,19 +928,40 @@ export class FSController extends PuterController {
         const limit = this.#toNumberOrUndefined(body.limit);
         const offset = this.#toNumberOrUndefined(body.offset);
         const sortByRaw =
-            typeof body.sort_by === 'string'
-                ? body.sort_by.toLowerCase()
+            typeof (body.sortBy ?? body.sort_by) === 'string'
+                ? String(body.sortBy ?? body.sort_by).toLowerCase()
                 : undefined;
         const sortBy =
             (['name', 'modified', 'type', 'size'] as const).find(
                 (v) => v === sortByRaw,
             ) ?? null;
         const sortOrderRaw =
-            typeof body.sort_order === 'string'
-                ? body.sort_order.toLowerCase()
+            typeof (body.sortOrder ?? body.sort_order) === 'string'
+                ? String(body.sortOrder ?? body.sort_order).toLowerCase()
                 : undefined;
         const sortOrder =
             (['asc', 'desc'] as const).find((v) => v === sortOrderRaw) ?? null;
+
+        if (paginated) {
+            const page = await this.services.fs.listDirectoryPage(parent.uuid, {
+                limit,
+                cursor:
+                    typeof body.cursor === 'string' ? body.cursor : undefined,
+                sortBy,
+                sortOrder,
+            });
+            await this.#attachSuggestedApps(page.entries);
+            const total =
+                body.includeTotal === true
+                    ? await this.services.fs.countDirectory(parent.uuid)
+                    : undefined;
+            res.json({
+                items: page.entries.map((child) => this.#toClientEntry(child)),
+                ...(page.cursor ? { cursor: page.cursor } : {}),
+                ...(total !== undefined ? { total } : {}),
+            });
+            return;
+        }
 
         const children = await this.services.fs.listDirectory(parent.uuid, {
             limit,
@@ -908,19 +969,21 @@ export class FSController extends PuterController {
             sortBy,
             sortOrder,
         });
+        await this.#attachSuggestedApps(children);
+        res.json(children.map((child) => this.#toClientEntry(child)));
+    }
 
+    async #attachSuggestedApps(entries: FSEntry[]): Promise<void> {
         const suggestions =
             await this.services.suggestedApps.getSuggestedAppsForEntries(
-                children,
+                entries,
             );
-        for (let index = 0; index < children.length; index++) {
-            const child = children[index];
+        for (let index = 0; index < entries.length; index++) {
+            const child = entries[index];
             if (child) {
                 child.suggestedApps = suggestions[index] ?? [];
             }
         }
-
-        res.json(children);
     }
 
     @Post('/search', { subdomain: 'api', requireVerified: true })

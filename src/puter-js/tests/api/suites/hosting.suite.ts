@@ -65,6 +65,65 @@ export default suite('hosting', {
         );
     },
 
+    'list pages with cursors and reports totals': async (t) => {
+        const names = [
+            'hosting-suite-pg-a',
+            'hosting-suite-pg-b',
+            'hosting-suite-pg-c',
+        ];
+        for (const name of names) {
+            const dir = await makeSiteDir(t, `pg-${name.slice(-1)}`);
+            await t.puter.hosting.create(name, dir);
+        }
+
+        const seen: string[] = [];
+        let cursor: string | null | undefined = null;
+        do {
+            const page = (await t.puter.hosting.list({
+                limit: 2,
+                cursor,
+                includeTotal: true,
+            })) as {
+                items: Array<{ subdomain: string }>;
+                cursor?: string;
+                total?: number;
+            };
+            t.assert.ok(Array.isArray(page.items), 'page should carry items');
+            t.assert.ok(
+                (page.total ?? 0) >= names.length,
+                'total should count at least the created subdomains',
+            );
+            seen.push(...page.items.map((s) => s.subdomain));
+            cursor = page.cursor;
+        } while (cursor);
+        for (const name of names) {
+            t.assert.ok(seen.includes(name), `${name} should appear while paging`);
+        }
+    },
+
+    'list with stream iterates pages via for await': async (t) => {
+        const names = ['hosting-suite-st-a', 'hosting-suite-st-b', 'hosting-suite-st-c'];
+        for (const name of names) {
+            const dir = await makeSiteDir(t, `st-${name.slice(-1)}`);
+            await t.puter.hosting.create(name, dir);
+        }
+
+        const seen: string[] = [];
+        let pages = 0;
+        for await (const page of t.puter.hosting.list({ stream: true, limit: 2 }) as AsyncIterable<{
+            items: Array<{ subdomain: string }>;
+            cursor?: string;
+        }>) {
+            pages++;
+            t.assert.ok(page.items.length <= 2, 'stream pages respect limit');
+            seen.push(...page.items.map((s) => s.subdomain));
+        }
+        t.assert.ok(pages >= 2, 'stream should yield multiple pages');
+        for (const name of names) {
+            t.assert.ok(seen.includes(name), `${name} should appear while streaming`);
+        }
+    },
+
     'a subdomain serves its root directory': async (t) => {
         const dir = await makeSiteDir(
             t,
@@ -116,6 +175,17 @@ export default suite('hosting', {
                 ),
             'update pointing at a missing directory should reject',
         );
+    },
+
+    'create accepts a full host and stores just the subdomain label': async (t) => {
+        const dir = await makeSiteDir(t, 'fullhost');
+        const created = await t.puter.hosting.create('hostingsuitefull.puter.site', dir);
+        t.assert.equal(created.subdomain, 'hostingsuitefull');
+        // Retrievable by the bare label and by the full host (both normalize).
+        const byLabel = await t.puter.hosting.get('hostingsuitefull');
+        t.assert.equal(byLabel.subdomain, 'hostingsuitefull');
+        const byHost = await t.puter.hosting.get('hostingsuitefull.puter.com');
+        t.assert.equal(byHost.subdomain, 'hostingsuitefull');
     },
 
     'delete removes the subdomain': async (t) => {

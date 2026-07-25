@@ -1,25 +1,26 @@
 import kvjs from '@heyputer/kv.js';
 import APICallLogger from './lib/APICallLogger.js';
+import { fetchUrl } from './lib/networkUtils.js';
 import { isStoredTokenUsableForOrigin } from './lib/authTokenOrigin.js';
 import path from './lib/path.js';
 import localStorageMemory from './lib/polyfills/localStorage.js';
 import xhrshim from './lib/polyfills/xhrshim.js';
 import * as utils from './lib/utils.js';
-import AI from './modules/AI.js';
-import Apps from './modules/Apps.js';
+import { AI } from './modules/ai/index.js';
+import { Apps } from './modules/apps/index.js';
 import Auth from './modules/Auth.js';
 import { Debug } from './modules/Debug.js';
 import Drivers from './modules/Drivers.js';
 import Email from './modules/Email.js';
 import { PuterJSFileSystemModule } from './modules/FileSystem/index.js';
 import FSItem from './modules/FSItem.js';
-import Hosting from './modules/Hosting.js';
-import KV from './modules/KV.js';
+import { Hosting } from './modules/hosting/index.js';
+import { KV } from './modules/kv/index.js';
 import { PSocket } from './modules/networking/PSocket.js';
 import { PTLSSocket } from './modules/networking/PTLS.js';
 import { pFetch } from './modules/networking/requests.js';
-import OS from './modules/OS.js';
-import Perms from './modules/Perms.js';
+import { OS } from './modules/os/index.js';
+import { Perms } from './modules/perms/index.js';
 import PuterDialog from './modules/PuterDialog.js';
 import UI from './modules/UI.js';
 import Util from './modules/Util.js';
@@ -145,8 +146,9 @@ const puterInit = function () {
         onAuth;
 
         /**
-         * State object to keep track of the authentication request status.
-         * This is used to prevent multiple authentication popups from showing up by different parts of the app.
+         * State object to keep track of the authentication request status. This
+         * is used to prevent multiple authentication popups from showing up by
+         * different parts of the app.
          */
         puterAuthState = {
             isPromptOpen: false,
@@ -182,11 +184,12 @@ const puterInit = function () {
          * Puter.js Modules
          *
          * These are the modules you see on docs.puter.com; for example:
-         * - puter.fs
-         * - puter.kv
-         * - puter.ui
          *
-         * initSubmodules is called from the constructor of this class.
+         * - Puter.fs
+         * - Puter.kv
+         * - Puter.ui
+         *
+         * InitSubmodules is called from the constructor of this class.
          */
         initSubmodules = function () {
             // Util
@@ -666,12 +669,12 @@ const puterInit = function () {
             this.net = {
                 generateWispV1URL: async () => {
                     const { token: wispToken, server: wispServer } = await (
-                        await fetch(
+                        await fetchUrl(
                             `${this.APIOrigin}/wisp/relay-token/create`,
                             {
                                 method: 'POST',
+                                includePuterAuth: true,
                                 headers: {
-                                    Authorization: `Bearer ${this.authToken}`,
                                     'Content-Type': 'application/json',
                                 },
                                 body: JSON.stringify({}),
@@ -701,7 +704,9 @@ const puterInit = function () {
         async request_rao_() {
             await this.p_can_request_rao_;
 
-            if (this.env === 'gui') {
+            // Don't record an app open when running inside the Puter GUI, or
+            // when running as a Puter app (i.e. within an iframe in the GUI).
+            if (this.env === 'gui' || this.env === 'app') {
                 return;
             }
 
@@ -715,10 +720,10 @@ const puterInit = function () {
 
             let had_error = false;
             try {
-                const resp = await fetch(`${this.APIOrigin}/rao`, {
+                const resp = await fetchUrl(`${this.APIOrigin}/rao`, {
                     method: 'POST',
+                    includePuterAuth: true,
                     headers: {
-                        Authorization: `Bearer ${this.authToken}`,
                         Origin: location.origin, // This is ignored in the browser but needed for workers and nodejs
                     },
                 });
@@ -821,10 +826,11 @@ const puterInit = function () {
         /**
          * Decides whether a stored token may be attached to requests for the
          * current API origin.
-         *   - A bound token may only ever be replayed to the exact origin it
-         *     was minted against.
-         *   - An unbound (legacy) token is only honored against the default API
-         *     origin — never against a URL-supplied custom `puter.api_origin`.
+         *
+         * - A bound token may only ever be replayed to the exact origin it was
+         *   minted against.
+         * - An unbound (legacy) token is only honored against the default API
+         *   origin — never against a URL-supplied custom `puter.api_origin`.
          */
         _storedTokenUsableForCurrentOrigin = function (boundOrigin) {
             return isStoredTokenUsableForOrigin({
@@ -885,22 +891,24 @@ const puterInit = function () {
         };
 
         /**
-         * Reauth coordinator. Called by the network layer (lib/utils.js)
-         * when the backend returns
-         * `401 { code: 'reauth_required', reason, auth_id }`.
+         * Reauth coordinator. Called by the network layer (lib/utils.js) when
+         * the backend returns `401 { code: 'reauth_required', reason, auth_id
+         * }`.
          *
          * Behavior is environment-specific:
-         *   - `web` / `app`: clear the stored token, emit an event, and
-         *     drive the existing puter.com login popup. Returns a promise
-         *     that resolves when the user signs in (so callers can replay)
-         *     or rejects if reauth fails / is canceled.
-         *   - `gui`: no-op — the GUI environment renders its own modal
-         *     and host code is responsible for the flow.
-         *   - workers / nodejs: there's no UI surface to drive, so reject
-         *     with a structured error and let worker code react.
+         *
+         * - `web` / `app`: clear the stored token, emit an event, and drive the
+         *   existing puter.com login popup. Returns a promise that resolves
+         *   when the user signs in (so callers can replay) or rejects if reauth
+         *   fails / is canceled.
+         * - `gui`: no-op — the GUI environment renders its own modal and host
+         *   code is responsible for the flow.
+         * - Workers / nodejs: there's no UI surface to drive, so reject with a
+         *   structured error and let worker code react.
          *
          * Idempotent: parallel callers share a single in-flight promise.
-         * @param {{ reason?: string, auth_id?: string }} signal
+         *
+         * @param {{ reason?: string; auth_id?: string }} signal
          */
         triggerReauth = async function (signal = {}) {
             const { reason, auth_id } = signal;
@@ -1022,8 +1030,8 @@ const puterInit = function () {
         };
 
         /**
-         * Register a listener for SDK events. Used by host apps to react
-         * to `puter.auth.reauth_required`.
+         * Register a listener for SDK events. Used by host apps to react to
+         * `puter.auth.reauth_required`.
          */
         on = function (eventName, handler) {
             if (!this.eventHandlers[eventName])
@@ -1041,14 +1049,14 @@ const puterInit = function () {
 
         /**
          * Best-effort silent v1→v2 token migration via the backend
-         * `/auth/migrate-token` endpoint. Used at boot
-         * when only a legacy `puter.auth.token` is present; on success the
-         * v2 token is set via setAuthToken (which clears the v1 key).
+         * `/auth/migrate-token` endpoint. Used at boot when only a legacy
+         * `puter.auth.token` is present; on success the v2 token is set via
+         * setAuthToken (which clears the v1 key).
          *
-         * Returns true on successful migration, false otherwise.
-         * Failures fall through to the existing 401-reauth path: any
-         * subsequent API call against the v1 token will receive a
-         * `reauth_required` and route through triggerReauth.
+         * Returns true on successful migration, false otherwise. Failures fall
+         * through to the existing 401-reauth path: any subsequent API call
+         * against the v1 token will receive a `reauth_required` and route
+         * through triggerReauth.
          */
         _silentMigrateV1Token = async function (v1Token) {
             if (!v1Token) return false;
@@ -1062,7 +1070,7 @@ const puterInit = function () {
                 // everywhere else the JSON token response is all we need.
                 const sameOrigin =
                     globalThis.location?.origin === this.defaultGUIOrigin;
-                const resp = await fetch(
+                const resp = await fetchUrl(
                     `${this.defaultGUIOrigin}/auth/migrate-token`,
                     {
                         method: 'POST',
@@ -1070,7 +1078,7 @@ const puterInit = function () {
                             Authorization: `Bearer ${v1Token}`,
                             'Content-Type': 'application/json',
                         },
-                        credentials: sameOrigin ? 'include' : 'omit',
+                        withCredentials: sameOrigin,
                         body: JSON.stringify({}),
                     },
                 );
@@ -1112,13 +1120,16 @@ const puterInit = function () {
         };
 
         /**
-         * A function that generates a domain-safe name by combining a random adjective, a random noun, and a random number (between 0 and 9999).
-         * The result is returned as a string with components separated by hyphens.
-         * It is useful when you need to create unique identifiers that are also human-friendly.
+         * A function that generates a domain-safe name by combining a random
+         * adjective, a random noun, and a random number (between 0 and 9999).
+         * The result is returned as a string with components separated by
+         * hyphens. It is useful when you need to create unique identifiers that
+         * are also human-friendly.
          *
-         * @param {string} [separateWith='-'] - The character to use to separate the components of the generated name.
-         * @returns {string} A unique, hyphen-separated string comprising of an adjective, a noun, and a number.
-         *
+         * @param {string} [separateWith='-'] - The character to use to separate
+         *   the components of the generated name. Default is `'-'`
+         * @returns {string} A unique, hyphen-separated string comprising of an
+         *   adjective, a noun, and a number.
          */
         randName = function (separateWith = '-') {
             const first_adj = [
@@ -1342,6 +1353,7 @@ const puterInit = function () {
 
         /**
          * Configures API call logging settings
+         *
          * @param {Object} config - Configuration options for API call logging
          * @param {boolean} config.enabled - Enable/disable API call logging
          * @param {boolean} config.enabled - Enable/disable API call logging
@@ -1355,7 +1367,9 @@ const puterInit = function () {
 
         /**
          * Enables API call logging with optional configuration
-         * @param {Object} config - Optional configuration to apply when enabling
+         *
+         * @param {Object} config - Optional configuration to apply when
+         *   enabling
          */
         enableAPILogging = function (config = {}) {
             if (this.apiCallLogger) {
@@ -1364,9 +1378,7 @@ const puterInit = function () {
             return this;
         };
 
-        /**
-         * Disables API call logging
-         */
+        /** Disables API call logging */
         disableAPILogging = function () {
             if (this.apiCallLogger) {
                 this.apiCallLogger.disable();
@@ -1375,7 +1387,9 @@ const puterInit = function () {
         };
 
         /**
-         * Initializes network connectivity monitoring to purge cache when connection is lost
+         * Initializes network connectivity monitoring to purge cache when
+         * connection is lost
+         *
          * @private
          */
         initNetworkMonitoring = function () {
@@ -1424,8 +1438,9 @@ const puterInit = function () {
         };
 
         /**
-         * Prints a styled CTA in the browser console encouraging developers
-         * to publish their app on the Puter App Store.
+         * Prints a styled CTA in the browser console encouraging developers to
+         * publish their app on the Puter App Store.
+         *
          * @private
          */
         printDevCTA = function () {
@@ -1464,6 +1479,7 @@ const puterInit = function () {
          * loaded directly from the file:// protocol. Runs once on load (when
          * the DOM is ready) so the developer is told to use a web server
          * immediately, instead of only when an action triggers the auth flow.
+         *
          * @private
          */
         warnUnsupportedProtocol = function () {
@@ -1493,6 +1509,7 @@ const puterInit = function () {
 
         /**
          * Checks and updates the GUI FS cache for most-commonly used paths
+         *
          * @private
          */
         checkAndUpdateGUIFScache = function () {
@@ -1588,9 +1605,7 @@ globalThis.puter = puter;
 puter.runWhenPuterHappensCallbacks();
 
 puter.tools = [];
-/**
- * @type {{messageTarget: Window}}
- */
+/** @type {{ messageTarget: Window }} */
 const puterParent = puter.ui.parentApp();
 globalThis.puterParent = puterParent;
 if (puterParent) {
@@ -1609,7 +1624,18 @@ if (puterParent) {
             console.log('xecuting tools');
             /**
              * Puter tools format
-             * @type {[{exec: Function, function: {description: string, name: string, parameters: {properties: any, required: Array<string>}, type: string}}]}
+             *
+             * @type {[
+             *     {
+             *         exec: Function;
+             *         function: {
+             *             description: string;
+             *             name: string;
+             *             parameters: { properties: any; required: string[] };
+             *             type: string;
+             *         };
+             *     },
+             * ]}
              */
             const [tool] = puter.tools.filter(
                 (e) => e.function.name === event.toolName,

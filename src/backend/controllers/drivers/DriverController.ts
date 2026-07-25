@@ -3,18 +3,19 @@
  *
  * This file is part of Puter.
  *
- * Puter is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published
- * by the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
+ * Puter is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU Affero General Public License as published by the Free
+ * Software Foundation, either version 3 of the License, or (at your option) any
+ * later version.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+ * details.
  *
  * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ * along with this program. If not, see
+ * [https://www.gnu.org/licenses/](https://www.gnu.org/licenses/).
  */
 
 import type { Request, Response } from 'express';
@@ -22,6 +23,7 @@ import { actorUid } from '../../core/actor.js';
 import { Context } from '../../core/context.js';
 import { Controller } from '../../core/http/decorators.js';
 import { HttpError, isHttpError } from '../../core/http/HttpError.js';
+import { assertNotUserSession } from '../../core/http/middleware/gates.js';
 import {
     acquireDriverConcurrent,
     checkDriverRateLimit,
@@ -30,6 +32,7 @@ import type { PuterRouter } from '../../core/http/PuterRouter.js';
 import type { DriverMeta } from '../../drivers/meta.js';
 import {
     isDriverStreamResult,
+    resolveCallableMethods,
     resolveDriverMeta,
     resolveDriverMethodConcurrent,
     resolveDriverMethodRateLimit,
@@ -114,15 +117,23 @@ const translateProviderError = (err: unknown): unknown => {
 
 @Controller('/drivers')
 export class DriverController extends PuterController {
-    /** iface → Map<driverName, driverInstance> */
+    /** Iface → Map<driverName, driverInstance> */
     #drivers = new Map<string, Map<string, DriverInstance>>();
-    /** iface → default driver name */
+    /** Iface → default driver name */
     #defaults = new Map<string, string>();
     /**
-     * driver instance → resolved meta. Cached so the per-call rate-limit
-     * lookup doesn't have to walk prototype chains on every request.
+     * Driver instance → resolved meta. Cached so the per-call rate-limit lookup
+     * doesn't have to walk prototype chains on every request.
      */
     #meta = new WeakMap<DriverInstance, DriverMeta>();
+    /**
+     * Driver instance → the set of method names callable via `/drivers/call`.
+     * Resolved once at registration (server startup) via
+     * `resolveCallableMethods`; the request path only does a `Set.has` lookup.
+     * This is what stops framework/lifecycle methods (`onServerStart`, etc.)
+     * and `Object.prototype` members from being invoked by remote callers.
+     */
+    #callableMethods = new WeakMap<DriverInstance, Set<string>>();
 
     constructor(...args: ConstructorParameters<typeof PuterController>) {
         super(...args);
@@ -201,14 +212,19 @@ export class DriverController extends PuterController {
             );
         }
 
-        const fn = driver[method];
-        if (typeof fn !== 'function') {
+        // Only methods in the pre-resolved callable set are dispatchable.
+        // This excludes framework/lifecycle hooks (onServerStart, etc.),
+        // inherited base methods, and Object.prototype members, none of
+        // which are part of any interface's RPC contract.
+        const callable = this.#callableMethods.get(driver);
+        if (!callable?.has(method)) {
             throw new HttpError(
                 404,
                 `Method '${method}' not found on driver '${ifaceName}'`,
                 { legacyCode: 'not_found' },
             );
         }
+        const fn = driver[method];
 
         // Resolve the concrete driver name for permission keys, falling
         // back through prototype metadata → instance field → requested name.
@@ -218,6 +234,20 @@ export class DriverController extends PuterController {
                 .__driverName ??
             requestedDriver ??
             'unknown';
+
+        const driverMeta = this.#meta.get(driver);
+
+        // Drivers flagged `noUserSession` refuse the bare
+        // account-session ("root") token: callers must present an app or
+        // worker token, or an API token minted from the dashboard. This is
+        // the per-driver counterpart of the `noUserSession` route option —
+        // `/drivers/call` is one shared route, so the flag has to live on
+        // the driver rather than in `RouteOptions`. Checked before the
+        // permission scan so a session-token caller always gets the
+        // credential-shape message, not a permission error.
+        if (driverMeta?.noUserSession) {
+            assertNotUserSession(req.actor);
+        }
 
         if (req.actor) {
             const permService = this.services.permission as unknown as
@@ -257,7 +287,6 @@ export class DriverController extends PuterController {
         // — we hook `res.finish` / `res.close` for that so streamed
         // responses hold their slot until the stream drains, and aborted
         // requests still give the slot back.
-        const driverMeta = this.#meta.get(driver);
         const rateLimitSpec = resolveDriverMethodRateLimit(
             driverMeta?.rateLimit,
             method,
@@ -499,6 +528,11 @@ export class DriverController extends PuterController {
         // Cache the resolved meta so the request hot-path can read the
         // per-method rate-limit spec without re-walking the prototype.
         this.#meta.set(instance, meta);
+        // Resolve the callable RPC surface once, at startup. The request
+        // path checks membership against this set instead of reflecting on
+        // the live instance, so lifecycle hooks / inherited framework
+        // methods can never be dispatched.
+        this.#callableMethods.set(instance, resolveCallableMethods(instance));
         // Register each alias pointing at the same instance. Legacy puter-js
         // calls that pass a provider id in the `driver` slot (e.g. the TTS
         // module sends `aws-polly` / `openai-tts` / `elevenlabs-tts` instead

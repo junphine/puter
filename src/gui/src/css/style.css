@@ -125,8 +125,14 @@ body {
     background: no-repeat center center fixed;
     background-position: center;
     background-size: cover;
-    background-color: #3d4c74;
+    background-color: #ffffff;
     overflow: hidden;
+}
+
+@media (prefers-color-scheme: dark) {
+    body {
+        background-color: #1e1e1e;
+    }
 }
 
 .embedded-in-3rd-party-website, .embedded-in-popup {
@@ -1719,7 +1725,8 @@ span.header-sort-icon img {
     display: none;
 }
 
-.context-menu-item .contextmenu-label {
+.context-menu-item .contextmenu-label,
+.context-menu-item .contextmenu-label-active {
     height: 12px;
 }
 
@@ -2120,6 +2127,12 @@ label {
 
 .signup-blocked-content a:hover {
     text-decoration: underline;
+}
+
+.oidc-btn {
+    font-size: 14px;
+    color: #393939;
+    background: transparent;
 }
 
 .error {

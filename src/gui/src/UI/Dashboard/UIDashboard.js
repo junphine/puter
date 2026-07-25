@@ -49,6 +49,11 @@ async function UIDashboard (options) {
     // eslint-disable-next-line no-unused-vars
     options = options ?? {};
 
+    // Mark dashboard mode on <body> so window chrome can adapt — e.g. app
+    // windows keep their minimize button even though fullpage-mode hides it.
+    $('body').addClass('dashboard-mode');
+
+
     const svc_dashboard = globalThis.services.get('dashboard');
     const ext_tabs = svc_dashboard.get_tabs();
 
@@ -58,21 +63,29 @@ async function UIDashboard (options) {
     // Dispatch 'dashboard-will-open' event to allow extensions to add tabs
     window.dispatchEvent(new CustomEvent('dashboard-will-open', { detail: { tabs } }));
 
+    // True if the untrusted route tab id (from the URL hash) names a real tab.
+    // The routing paths below ignore unknown ids outright — this also keeps a
+    // crafted hash (e.g. one containing a quote) from being interpolated into
+    // a jQuery selector, which throws and would otherwise leave the
+    // dashboard's event handlers unbound.
+    const isKnownTabId = tab => tabs.some(t => t !== '-' && t.id === tab);
+
     // Tab to render active on open. Apps is the default (root URL / no hash);
     // Home is reached via #home. Fall back to Apps for an unknown/absent route.
     const routeTab = window.dashboard_initial_route?.tab;
-    const initialTabId = tabs.some(t => t !== '-' && t.id === routeTab)
-        ? routeTab
-        : 'apps';
+    const initialTabId = isKnownTabId(routeTab) ? routeTab : 'apps';
 
     let h = '';
 
     h += '<div class="dashboard">';
 
         // Mobile sidebar toggle
-        h += '<button class="dashboard-sidebar-toggle">';
+        h += '<button class="dashboard-sidebar-toggle" aria-label="Open menu" aria-expanded="false">';
             h += '<span></span><span></span><span></span>';
         h += '</button>';
+
+        // Scrim behind the mobile drawer; tap closes it
+        h += '<div class="dashboard-sidebar-scrim"></div>';
 
         // Sidebar
         h += '<div class="dashboard-sidebar hide-scrollbar">';
@@ -83,6 +96,10 @@ async function UIDashboard (options) {
                     h += `<img class="sidebar-toggle-close" src="${window.icons['sidebar-close.svg']}">`;
                     h += `<img class="sidebar-toggle-open" src="${window.icons['sidebar-open.svg']}">`;
                 h += '</button>';
+                // Mobile-only close button (the collapse toggle is desktop-only)
+                h += '<button class="dashboard-sidebar-close" aria-label="Close menu">';
+                    h += '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>';
+                h += '</button>';
             h += '</div>';
             // Navigation items container
             h += '<div class="dashboard-sidebar-nav">';
@@ -92,9 +109,8 @@ async function UIDashboard (options) {
                     h += '<hr class="dashboard-sidebar-separator">';
                     continue;
                 }
-                const isActive = i === 0 ? ' active' : '';
-                const tabHash = tab.id === 'home' ? '' : `#${tab.id}`;
-                const tabHref = tabHash || window.location.pathname;
+                const isActive = tab.id === initialTabId ? ' active' : '';
+                const tabHref = `#${tab.id}`;                
                 if(tab.icon && (tab.icon.endsWith('.svg') || tab.icon.endsWith('.png'))){
                    tab.icon = `<img src="${window.icons[tab.icon]}" height="18px" width="18px" />`;
                 }
@@ -120,7 +136,7 @@ async function UIDashboard (options) {
         for ( let i = 0; i < tabs.length; i++ ) {
             const tab = tabs[i];
             if ( tab === '-' || tab === '_') continue;
-            const isActive = i === 0 ? ' active' : '';
+            const isActive = tab.id === initialTabId ? ' active' : '';
             h += `<div class="dashboard-section dashboard-section-${tab.id}${isActive}" data-section="${tab.id}">`;
             h += tab.html();
             h += '</div>';
@@ -265,8 +281,18 @@ async function UIDashboard (options) {
         // the freshly-added row instead of the stale one.
         const old_path = resp.old_path ?? resp.from_path;
         if ( old_path ) {
-            $(`.item[data-path='${html_encode(old_path)}']`).fadeOut(150, function () {
+            // Narrow by uid first when the payload carries one (uids are
+            // UUIDs, safe to interpolate into a selector) — a full-DOM scan
+            // per socket event is O(rows) on the hot path. The uid matches
+            // both the old and new rows, so still compare data-path (raw
+            // value, compared rather than interpolated so quotes/special
+            // characters in names can't break it) to pick the stale one.
+            const $candidates = resp.uid ? $(`.item[data-uid='${resp.uid}']`) : $('.item');
+            $candidates.filter(function () {
+                return $(this).attr('data-path') === old_path;
+            }).fadeOut(150, function () {
                 $(this).remove();
+                window.dashboard_object?.updateFooterStats?.();
             });
         }
 
@@ -280,8 +306,18 @@ async function UIDashboard (options) {
         if ( item.original_client_socket_id === window.socket.id ) return;
         if ( item.descendants_only ) return;
 
-        $(`.item[data-path='${html_encode(item.path)}']`).fadeOut(150, function () {
+        // Match by uid when present (O(1) attribute selector; uids are UUIDs,
+        // safe to interpolate) and fall back to a path scan for minimal
+        // payloads — a removed item has exactly one row either way.
+        const $rows = item.uid
+            ? $(`.item[data-uid='${item.uid}']`)
+            : $('.item').filter(function () {
+                return $(this).attr('data-path') === item.path;
+            });
+        $rows.fadeOut(150, function () {
             $(this).remove();
+            // Keep the footer item count / total size in sync with the removal.
+            window.dashboard_object?.updateFooterStats?.();
         });
     });
 
@@ -291,9 +327,9 @@ async function UIDashboard (options) {
         const $el = $(`.item[data-uid='${item.uid}']`);
         if ( $el.length === 0 ) return;
 
-        // Update data attributes
-        $el.attr('data-name', html_encode(item.name));
-        $el.attr('data-path', html_encode(item.path));
+        // Update data attributes (raw values — .attr() stores literally)
+        $el.attr('data-name', item.name);
+        $el.attr('data-path', item.path);
 
         // Update displayed name
         $el.find('.item-name').text(item.name);
@@ -306,24 +342,11 @@ async function UIDashboard (options) {
         const $el = $(`.item[data-uid='${item.uid}']`);
         if ( $el.length === 0 ) return;
 
-        // Update data attributes
-        $el.attr('data-name', html_encode(item.name));
-        $el.attr('data-path', html_encode(item.path));
-        $el.attr('data-size', item.size);
-        $el.attr('data-modified', item.modified);
-        $el.attr('data-type', html_encode(item.type));
-
-        // Update displayed name
-        $el.find('.item-name').text(item.name);
-        $el.find('.item-name-editor').val(item.name);
-
-        if (
-            window.dashboard_object?.currentView === 'grid'
-            && typeof item.thumbnail === 'string'
-            && item.thumbnail.length > 0
-        ) {
-            $el.find('.item-icon img').attr('src', item.thumbnail);
-        }
+        // Delegate to the shared row updater (defined in TabFiles.init) so
+        // this handler can't drift from renderItem's conventions — an inline
+        // copy here once showed trashed items' raw UID instead of their
+        // original name.
+        window.UIDashboardFileItemUpdate?.($el, item);
     });
 
     window.socket.on('item.added', async (item) => {
@@ -339,8 +362,9 @@ async function UIDashboard (options) {
     if ( window.dashboard_initial_route ) {
         const route = window.dashboard_initial_route;
 
-        // Activate the correct tab if not home
-        if ( route.tab && route.tab !== 'home' ) {
+        // Activate the correct tab if not home. An unknown tab id stays on
+        // the Apps default rendered above rather than being redirected.
+        if ( route.tab && route.tab !== 'home' && isKnownTabId(route.tab) ) {
             const tabId = route.tab;
             const $targetTab = $el_window.find(`.dashboard-sidebar-item[data-section="${tabId}"]`);
 
@@ -365,8 +389,25 @@ async function UIDashboard (options) {
 
     // Handle browser back/forward navigation
     // This handler is called for both hashchange (manual hash changes) and popstate (back/forward)
+    // A single back/forward fires BOTH popstate and hashchange; track the last
+    // handled URL so the second event doesn't run onActivate (and its fetches) again.
+    let lastHandledHref = window.location.href;
     const handleRouteChange = () => {
+        if ( window.location.href === lastHandledHref ) return;
+        // A traversal INTO an /app/<name> entry belongs to an open app
+        // window (UIWindow's popstate handler restores/minimizes it), not
+        // tab routing. lastHandledHref deliberately keeps the dashboard URL
+        // underneath: traversing back out of the app returns to exactly
+        // that URL and the equality check above skips re-routing (the
+        // dashboard never actually left).
+        if ( window.location.pathname.startsWith('/app/') ) return;
+        lastHandledHref = window.location.href;
         const route = window.parseDashboardRoute();
+        // Ignore unknown tab ids entirely (a stale bookmark hash, an in-page
+        // anchor): switching the user to another tab out from under them was
+        // never the behavior, and the early return also keeps untrusted
+        // hashes out of the selectors below.
+        if ( ! isKnownTabId(route.tab) ) return;
         const tab = route.tab;
         const filePath = route.path;
 
@@ -437,22 +478,111 @@ async function UIDashboard (options) {
         document.querySelector('.dashboard-content').classList.add(section);
 
         // Reflect the current tab in the hash. Root (no hash) defaults to Apps,
-        // but selecting any tab — including Apps — shows its #tab.
-        history.pushState(null, '', `#${section}`);
+        // but selecting any tab — including Apps — shows its #tab. Only push a
+        // new history entry when the hash actually changes, so re-clicking the
+        // current tab doesn't stack duplicate entries that make Back a no-op.
+        if ( window.location.hash !== `#${section}` ) {
+            history.pushState(null, '', `#${section}`);
+            lastHandledHref = window.location.href;
+        }
 
         // Scroll content area to top
         $el_window.find('.dashboard-content').scrollTop(0);
 
         // Close sidebar on mobile after selection
-        $el_window.find('.dashboard-sidebar').removeClass('open');
-        $el_window.find('.dashboard-sidebar-toggle').removeClass('open');
+        setMobileSidebar(false);
     });
 
-    // Mobile toggle handler
+    // =========================================================================
+    // Mobile drawer
+    // The sidebar becomes a modal drawer below 768px: scrim behind it, close
+    // button in its header, Escape and swipe-left dismiss it. One helper keeps
+    // the drawer, scrim, and toggle (incl. aria-expanded) in sync.
+    // =========================================================================
+    const $sidebar = $el_window.find('.dashboard-sidebar');
+    const $scrim = $el_window.find('.dashboard-sidebar-scrim');
+    const $sidebar_toggle = $el_window.find('.dashboard-sidebar-toggle');
+    const setMobileSidebar = (open) => {
+        $sidebar.toggleClass('open', open);
+        $scrim.toggleClass('open', open);
+        $sidebar_toggle.toggleClass('open', open).attr('aria-expanded', open ? 'true' : 'false');
+    };
+
     $el_window.on('click', '.dashboard-sidebar-toggle', function () {
-        $(this).toggleClass('open');
-        $el_window.find('.dashboard-sidebar').toggleClass('open');
+        setMobileSidebar(!$sidebar.hasClass('open'));
     });
+
+    $el_window.on('click', '.dashboard-sidebar-close, .dashboard-sidebar-scrim', function () {
+        setMobileSidebar(false);
+    });
+
+    $(document).on('keydown.dashboard-mobile-sidebar', function (e) {
+        if ( e.key === 'Escape' && $sidebar.hasClass('open') ) {
+            setMobileSidebar(false);
+        }
+    });
+
+    // Swipe-to-close: the drawer tracks a leftward drag 1:1 (scrim fading in
+    // step), then commits past 35% width or a quick flick, else snaps back.
+    // Transitions are suspended during the drag (.dragging) so releasing
+    // animates from the finger's last position, not from fully-open.
+    {
+        const sidebar = $sidebar[0];
+        const scrim = $scrim[0];
+        let startX = 0, startY = 0, dx = 0, lastX = 0, lastT = 0, velocity = 0;
+        let tracking = false, axis = null;
+
+        sidebar.addEventListener('touchstart', (e) => {
+            if ( ! sidebar.classList.contains('open') ) return;
+            const t = e.touches[0];
+            startX = lastX = t.clientX;
+            startY = t.clientY;
+            lastT = e.timeStamp;
+            dx = 0; velocity = 0; axis = null;
+            tracking = true;
+        }, { passive: true });
+
+        sidebar.addEventListener('touchmove', (e) => {
+            if ( ! tracking ) return;
+            const t = e.touches[0];
+            const moveX = t.clientX - startX;
+            const moveY = t.clientY - startY;
+            // Lock to an axis on the first meaningful movement so vertical
+            // scrolling inside the drawer never drags it sideways.
+            if ( axis === null && (Math.abs(moveX) > 8 || Math.abs(moveY) > 8) ) {
+                axis = Math.abs(moveX) > Math.abs(moveY) ? 'x' : 'y';
+                if ( axis === 'x' ) {
+                    sidebar.classList.add('dragging');
+                    scrim.classList.add('dragging');
+                }
+            }
+            if ( axis !== 'x' ) return;
+            dx = Math.min(0, moveX);
+            const dt = e.timeStamp - lastT;
+            if ( dt > 0 ) velocity = (t.clientX - lastX) / dt;
+            lastX = t.clientX;
+            lastT = e.timeStamp;
+            sidebar.style.transform = `translateX(${dx}px)`;
+            scrim.style.opacity = Math.max(0, 1 + dx / sidebar.offsetWidth);
+        }, { passive: true });
+
+        const endDrag = () => {
+            if ( ! tracking ) return;
+            tracking = false;
+            const shouldClose = axis === 'x'
+                && (dx < -sidebar.offsetWidth * 0.35 || velocity < -0.4);
+            // Re-enable transitions and drop inline styles in the same frame
+            // as the class change so the drawer animates from where it is.
+            sidebar.classList.remove('dragging');
+            scrim.classList.remove('dragging');
+            sidebar.style.transform = '';
+            scrim.style.opacity = '';
+            if ( shouldClose ) setMobileSidebar(false);
+            axis = null; dx = 0;
+        };
+        sidebar.addEventListener('touchend', endDrag);
+        sidebar.addEventListener('touchcancel', endDrag);
+    }
 
     // Desktop sidebar collapse toggle
     $el_window.on('click', '.dashboard-sidebar-collapse-toggle', function () {
@@ -481,9 +611,8 @@ async function UIDashboard (options) {
     $el_window.on('mousedown touchstart', function (e) {
         if ( !$(e.target).closest('.dashboard-sidebar').length
             && !$(e.target).closest('.dashboard-sidebar-toggle').length
-            && $el_window.find('.dashboard-sidebar').hasClass('open') ) {
-            $el_window.find('.dashboard-sidebar').removeClass('open');
-            $el_window.find('.dashboard-sidebar-toggle').removeClass('open');
+            && $sidebar.hasClass('open') ) {
+            setMobileSidebar(false);
         }
     });
 

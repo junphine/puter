@@ -60,6 +60,65 @@ export default suite('apps', {
         );
     },
 
+    'list pages with cursors and reports totals': async (t) => {
+        const names = ['apps-suite-pg-a', 'apps-suite-pg-b', 'apps-suite-pg-c'];
+        for (const name of names) {
+            await t.puter.apps.create(name, `https://example.com/${name}`);
+        }
+
+        const firstPage = (await t.puter.apps.list({
+            limit: 2,
+            cursor: null,
+            includeTotal: true,
+        })) as {
+            items: Array<{ name: string }>;
+            cursor?: string;
+            total?: number;
+        };
+        t.assert.ok(Array.isArray(firstPage.items), 'items should be an array');
+        t.assert.ok(firstPage.items.length <= 2, 'page respects limit');
+        t.assert.ok(
+            (firstPage.total ?? 0) >= names.length,
+            'total should count at least the created apps',
+        );
+
+        const seen: string[] = [];
+        let cursor: string | null | undefined = null;
+        do {
+            const page = (await t.puter.apps.list({ limit: 2, cursor })) as {
+                items: Array<{ name: string }>;
+                cursor?: string;
+            };
+            seen.push(...page.items.map((a) => a.name));
+            cursor = page.cursor;
+        } while (cursor);
+        for (const name of names) {
+            t.assert.ok(seen.includes(name), `${name} should appear while paging`);
+        }
+    },
+
+    'list with stream iterates pages via for await': async (t) => {
+        const names = ['apps-suite-st-a', 'apps-suite-st-b', 'apps-suite-st-c'];
+        for (const name of names) {
+            await t.puter.apps.create(name, `https://example.com/${name}`);
+        }
+
+        const seen: string[] = [];
+        let pages = 0;
+        for await (const page of t.puter.apps.list({ stream: true, limit: 2 }) as AsyncIterable<{
+            items: Array<{ name: string }>;
+            cursor?: string;
+        }>) {
+            pages++;
+            t.assert.ok(page.items.length <= 2, 'stream pages respect limit');
+            seen.push(...page.items.map((a) => a.name));
+        }
+        t.assert.ok(pages >= 2, 'stream should yield multiple pages');
+        for (const name of names) {
+            t.assert.ok(seen.includes(name), `${name} should appear while streaming`);
+        }
+    },
+
     'update changes the index URL': async (t) => {
         await t.puter.apps.create(
             'apps-suite-update',
@@ -125,5 +184,45 @@ export default suite('apps', {
             profile && typeof profile === 'object',
             'developer profile should be an object',
         );
+    },
+
+    'create validates client-side with a backward-compatible error shape': async (t) => {
+        let err: { code?: string; success?: boolean; error?: { code?: string; message?: string } } | undefined;
+        try {
+            await t.puter.apps.create({ indexURL: 'https://example.com/no-name' } as never);
+        } catch (e) {
+            err = e as typeof err;
+        }
+        // The backward-compatible data contract: top-level message/code plus
+        // the legacy nested shape. (`instanceof Error` is covered in the
+        // single-realm unit test — it isn't reliable across the prebuilt-bundle
+        // boundary the browser fixture loads the SDK through.)
+        t.assert.equal(typeof err?.message, 'string');
+        t.assert.equal(err?.code, 'invalid_request');
+        t.assert.equal(err?.success, false);
+        t.assert.equal(err?.error?.code, 'invalid_request');
+        t.assert.equal(err?.error?.message, 'Name is required');
+    },
+
+    'create rejects a missing index URL before any network call': async (t) => {
+        let err: { error?: { message?: string } } | undefined;
+        try {
+            await (t.puter.apps.create as (n: string) => Promise<unknown>)('apps-suite-name-only');
+        } catch (e) {
+            err = e as typeof err;
+        }
+        t.assert.equal(err?.error?.message, 'Index URL is required');
+    },
+
+    'create remaps camelCase options to the stored app fields': async (t) => {
+        await t.puter.apps.create({
+            name: 'apps-suite-remap',
+            indexURL: 'https://example.com/remap',
+            filetypeAssociations: ['.txt', 'image/png'],
+            maximizeOnStart: true,
+        });
+        const fetched = await t.puter.apps.get('apps-suite-remap');
+        t.assert.deepEqual(fetched.filetype_associations, ['.txt', 'image/png']);
+        t.assert.equal(Boolean(fetched.maximize_on_start), true);
     },
 });

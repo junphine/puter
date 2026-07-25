@@ -1,4 +1,4 @@
-import { suite } from '../harness/types.ts';
+import { suite, type TestContext } from '../harness/types.ts';
 
 /**
  * These tests run keyless: the backend always registers the fake-chat
@@ -6,6 +6,18 @@ import { suite } from '../harness/types.ts';
  * plumbing — including streaming — is testable without provider keys.
  * Real-provider smoke tests are separate and capability-gated.
  */
+
+/**
+ * The `/puterai/*` wire routes still require a delegated credential, so
+ * these tests authenticate the way a programmatic caller would — with the
+ * full-access API token. (The drivers themselves also take a plain session
+ * token; that path has its own test below.) The harness re-issues the
+ * session token to shared SDK instances between tests, so no restore is
+ * needed here.
+ */
+const useApiToken = (t: TestContext): void => {
+    t.puter.setAuthToken(t.env.users.user.apiToken);
+};
 
 const textOf = (result: {
     message?: { content?: unknown };
@@ -24,6 +36,7 @@ const textOf = (result: {
 
 export default suite('ai', {
     'chat with the fake model returns a message': async (t) => {
+        useApiToken(t);
         const result = await t.puter.ai.chat('Hello there', {
             model: 'fake',
         });
@@ -33,6 +46,7 @@ export default suite('ai', {
     },
 
     'chat accepts a messages array': async (t) => {
+        useApiToken(t);
         const result = await t.puter.ai.chat(
             [
                 { role: 'system', content: 'You are a test fixture.' },
@@ -43,7 +57,35 @@ export default suite('ai', {
         t.assert.ok(textOf(result).length > 0, 'message should contain text');
     },
 
+    'chat accepts the vision form with a media argument': async (t) => {
+        useApiToken(t);
+        // 1x1 transparent PNG — a data URI keeps the test keyless and
+        // avoids any backend media fetching.
+        const pixel =
+            'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+        const result = await t.puter.ai.chat('What is in this image?', pixel, {
+            model: 'fake',
+        });
+        t.assert.ok(result.message, 'vision form should carry a message');
+        t.assert.ok(textOf(result).length > 0, 'message should contain text');
+    },
+
+    'chat accepts messages with content parts': async (t) => {
+        useApiToken(t);
+        const result = await t.puter.ai.chat(
+            [
+                {
+                    role: 'user',
+                    content: [{ type: 'text', text: 'Describe the weather.' }],
+                },
+            ],
+            { model: 'fake' },
+        );
+        t.assert.ok(textOf(result).length > 0, 'message should contain text');
+    },
+
     'chat with stream true yields text parts': async (t) => {
+        useApiToken(t);
         const stream = await t.puter.ai.chat('Stream this', {
             model: 'fake',
             stream: true,
@@ -56,6 +98,7 @@ export default suite('ai', {
     },
 
     'chat with the costly model reports token usage': async (t) => {
+        useApiToken(t);
         const result = await t.puter.ai.chat(
             'Count the tokens of this prompt please',
             { model: 'costly' },
@@ -75,6 +118,7 @@ export default suite('ai', {
     },
 
     'chat with an unknown model rejects': async (t) => {
+        useApiToken(t);
         await t.assert.rejects(
             () =>
                 t.puter.ai.chat('Hello', {
@@ -85,6 +129,7 @@ export default suite('ai', {
     },
 
     'listModels hides the internal test models': async (t) => {
+        useApiToken(t);
         // The public models endpoint deliberately filters fake/costly/abuse.
         const models = await t.puter.ai.listModels();
         t.assert.ok(Array.isArray(models), 'listModels should return an array');
@@ -98,6 +143,7 @@ export default suite('ai', {
     },
 
     'the models driver method reports the fake models': async (t) => {
+        useApiToken(t);
         const resp = await t.puter.drivers.call(
             'puter-chat-completion',
             'ai-chat',
@@ -112,6 +158,7 @@ export default suite('ai', {
     },
 
     'listModelProviders returns an array without fake-chat': async (t) => {
+        useApiToken(t);
         const providers = await t.puter.ai.listModelProviders();
         t.assert.ok(Array.isArray(providers), 'should return an array');
         t.assert.ok(
@@ -121,6 +168,7 @@ export default suite('ai', {
     },
 
     'every model reported by the driver carries an id': async (t) => {
+        useApiToken(t);
         // The public listModels endpoint is empty without provider keys, so
         // assert the shape against the driver-level list (always populated
         // with the fake models).
@@ -140,5 +188,111 @@ export default suite('ai', {
                 `every model entry should expose an id, got ${JSON.stringify(model)}`,
             );
         }
+    },
+
+    'a bare session token can call the AI driver': async (t) => {
+        // No useApiToken here — privileged ("godmode") apps run on the
+        // user's own account session token, so the driver has to accept
+        // it. The `/puterai/*` wire routes still don't (see below).
+        const res = await fetch(`${t.env.apiOrigin}/drivers/call`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${t.env.users.user.token}`,
+                Origin: t.env.apiOrigin,
+            },
+            body: JSON.stringify({
+                interface: 'puter-chat-completion',
+                method: 'complete',
+                args: {
+                    messages: [{ role: 'user', content: 'hi' }],
+                    model: 'fake',
+                },
+            }),
+        });
+        const body = JSON.stringify(await res.json());
+        t.assert.equal(
+            res.status,
+            200,
+            `session token should reach the driver, got ${res.status}: ${body}`,
+        );
+        t.assert.ok(
+            !body.includes('app_or_api_token_required'),
+            `session token must not be rejected by credential shape, got ${body}`,
+        );
+    },
+
+    'a worker token can call the AI driver': async (t) => {
+        // Workers are never treated as root tokens. This uses a REAL
+        // user-scoped worker session token (minted the same way an
+        // app-less worker deployment mints one), so the whole middleware
+        // path is exercised: JWT → session row (kind='worker') → actor →
+        // driver. Calling the driver's `models` method keeps this free of
+        // any AI inference.
+        const res = await fetch(`${t.env.apiOrigin}/drivers/call`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${t.env.users.user.workerToken}`,
+                Origin: t.env.apiOrigin,
+            },
+            body: JSON.stringify({
+                interface: 'puter-chat-completion',
+                method: 'models',
+                args: {},
+            }),
+        });
+        const body = JSON.stringify(await res.json());
+        t.assert.ok(
+            !body.includes('app_or_api_token_required'),
+            `worker token must not be treated as a root token, got ${body}`,
+        );
+        t.assert.equal(
+            res.status,
+            200,
+            `worker token should reach the driver, got ${res.status}: ${body}`,
+        );
+        t.assert.ok(
+            body.includes('fake'),
+            'the driver should answer the worker with its model list',
+        );
+    },
+
+    'the OpenAI wire route rejects session tokens but accepts an API token': async (t) => {
+        const call = (token: string) =>
+            fetch(`${t.env.apiOrigin}/puterai/openai/v1/chat/completions`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${token}`,
+                    Origin: t.env.apiOrigin,
+                },
+                body: JSON.stringify({
+                    model: 'fake',
+                    provider: 'fake-chat',
+                    messages: [{ role: 'user', content: 'hi' }],
+                }),
+            });
+
+        const sessionRes = await call(t.env.users.user.token);
+        t.assert.equal(
+            sessionRes.status,
+            403,
+            'the wire route should reject a session token',
+        );
+        const sessionBody = JSON.stringify(await sessionRes.json());
+        t.assert.ok(
+            sessionBody.includes('app_or_api_token_required'),
+            `rejection should carry app_or_api_token_required, got ${sessionBody}`,
+        );
+
+        const apiRes = await call(t.env.users.user.apiToken);
+        t.assert.equal(
+            apiRes.status,
+            200,
+            `the wire route should accept the API token, got ${apiRes.status}: ${await apiRes
+                .clone()
+                .text()}`,
+        );
     },
 });

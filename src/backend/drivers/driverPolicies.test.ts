@@ -150,6 +150,24 @@ describe.each([
     it('points at the shared AI_CONCURRENT constant', () => {
         expect(m.concurrent).toBe(AI_CONCURRENT);
     });
+
+    it('accepts bare account-session ("root") tokens', () => {
+        // Privileged ("godmode") apps run on the user's own session token
+        // rather than an app token, so the AI drivers can't distinguish
+        // them from a browser session and have to admit both.
+        expect(m.noUserSession).toBe(false);
+    });
+});
+
+describe('non-AI drivers — session tokens stay allowed', () => {
+    it.each([
+        ['KVStoreDriver', () => new KVStoreDriver(...fake())],
+        ['AppDriver', () => new AppDriver(...fake())],
+        ['SubdomainDriver', () => new SubdomainDriver(...fake())],
+        ['NotificationDriver', () => new NotificationDriver(...fake())],
+    ])('%s does not set noUserSession', (_name, build) => {
+        expect(meta(build()).noUserSession).toBe(false);
+    });
 });
 
 // ── Iface coordination cross-check ──────────────────────────────────

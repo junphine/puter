@@ -1,4 +1,10 @@
+// FROZEN pre-restructure copy of the KV module (extracted from git history),
+// used only by modules/kv/equivalence.test.js to prove the restructured
+// module is wire-compatible. Not part of the SDK bundle. Delete this file and
+// the equivalence test together once the baseline is no longer useful.
+/* eslint-disable */
 import * as utils from '../lib/utils.js';
+import { fetchUrl } from '../lib/networkUtils.js';
 
 const createDeferred = () => {
     let resolve;
@@ -54,7 +60,7 @@ class KV {
         (async () => {
             await this.gui_cache_init.promise;
             this.gui_cache_init = null;
-            const resp = await fetch(`${this.APIOrigin}/drivers/call`, {
+            const resp = await fetchUrl(`${this.APIOrigin}/drivers/call`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'text/plain;actually=json',
@@ -592,6 +598,15 @@ class KV {
             }
             if ( input.cursor !== undefined ) {
                 options.cursor = input.cursor;
+            }
+            if ( input.offset !== undefined ) {
+                options.offset = input.offset;
+            }
+            if ( input.includeTotal !== undefined ) {
+                options.includeTotal = input.includeTotal;
+            }
+            if ( input.fetchUntilFull !== undefined ) {
+                options.fetchUntilFull = input.fetchUntilFull;
             }
         } else {
             if ( isObject(args[1]) ) {

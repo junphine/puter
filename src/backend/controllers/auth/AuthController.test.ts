@@ -1724,9 +1724,49 @@ describe('AuthController.handleGetUserAppToken + handleCheckApp', () => {
         );
         const body = res.body as { token: string; app_uid: string };
         expect(body.app_uid).toMatch(/^app-/);
-        // A bootstrap app row was created for that origin.
+        // A bootstrap app row was created for that origin. External
+        // origins have no hosted subdomain, so no owner is stamped.
         const bootstrapped = await server.stores.app.getByUid(body.app_uid);
         expect(bootstrapped).toBeTruthy();
+        expect(bootstrapped?.owner_user_id ?? null).toBeNull();
+    });
+
+    it('stamps the hosted-subdomain owner as the bootstrap app creator', async () => {
+        // Test config inherits `static_hosting_domain: site.puter.localhost`
+        // from config.default.json. The subdomain belongs to a different
+        // user than the visitor minting the token — the app must be owned
+        // by the site owner, not the visitor.
+        const ownerName = `so_${uuidv4().slice(0, 8)}`;
+        await controller.handleSignup(
+            makeReq({
+                username: ownerName,
+                email: `${ownerName}@test.local`,
+                password: 'correct-horse-battery',
+            }),
+            makeRes(),
+        );
+        const owner = await server.stores.user.getByUsername(ownerName);
+        expect(owner!.id).not.toBe(user.id);
+        const subdomain = `sd-${uuidv4().slice(0, 8)}`;
+        await server.stores.subdomain.create({
+            userId: owner!.id,
+            subdomain,
+        });
+
+        const res = makeRes();
+        await inCtx(actor, () =>
+            controller.handleGetUserAppToken(
+                makeReq(
+                    { origin: `https://${subdomain}.site.puter.localhost` },
+                    { actor },
+                ),
+                res,
+            ),
+        );
+        const body = res.body as { token: string; app_uid: string };
+        const bootstrapped = await server.stores.app.getByUid(body.app_uid);
+        expect(bootstrapped).toBeTruthy();
+        expect(bootstrapped?.owner_user_id).toBe(owner!.id);
     });
 });
 
@@ -3220,6 +3260,29 @@ describe('AuthController.handleConfirmEmail', () => {
             email_confirmed: true,
             original_client_socket_id: 's',
         });
+    });
+
+    it('rejects "null" as a code when no confirmation code is stored', async () => {
+        const { user, actor } = await makeUserAndActor();
+        // A row with no stored code must never be confirmable: String(null)
+        // would otherwise equal a submitted "null" and confirm the email.
+        await server.stores.user.update(user.id, { email_confirm_code: null });
+        const res = makeRes();
+        await controller.handleConfirmEmail(
+            makeReq(
+                { code: 'null', original_client_socket_id: 's' },
+                { actor },
+            ),
+            res,
+        );
+        expect(res.body).toEqual({
+            email_confirmed: false,
+            original_client_socket_id: 's',
+        });
+        const after = await server.stores.user.getById(user.id, {
+            force: true,
+        });
+        expect(after!.email_confirmed).toBeFalsy();
     });
 });
 
